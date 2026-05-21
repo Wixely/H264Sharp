@@ -71,6 +71,10 @@ public sealed class Macroblock
     public int[] MvL0XBlock { get; } = new int[16];
     public int[] MvL0YBlock { get; } = new int[16];
 
+    /// <summary>Per-4x4-block L0 motion vector difference (X), used as CABAC neighbor context for mvd parsing.</summary>
+    public int[] MvdL0XBlock { get; } = new int[16];
+    public int[] MvdL0YBlock { get; } = new int[16];
+
     /// <summary>RefIdx per 8x8 quadrant (raster scan: 0=TL, 1=TR, 2=BL, 3=BR).
     /// For mb_type 0/1/2 the refIdx is per partition; we replicate to per-quadrant.</summary>
     public int[] RefIdxL08x8 { get; } = new int[4];

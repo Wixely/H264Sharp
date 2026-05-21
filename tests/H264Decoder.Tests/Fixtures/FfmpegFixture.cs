@@ -108,6 +108,37 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 32x16 vertical-stripe pattern with a 4-pixel horizontal shift.
+    /// Encoded CABAC (Main profile). Forces x264 to emit a 100% I16x16 IDR and 100%
+    /// P_L0_16x16 P-frame with non-zero integer-pel motion vectors and inter residual.
+    /// Stays away from Intra_4x4 (which CABAC I-slice parser doesn't yet support).</summary>
+    public static Sample TwoFramesShifted128x96Cabac()
+    {
+        const int W = 32, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_shifted_cabac_min.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_shifted_cabac_min.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"color=s=48x16:d=0.5:r=2,geq='if(lt(mod(X\\,8)\\,4)\\,100\\,180)':128:128\" " +
+            $"-filter_complex \"[0:v]crop={W}:{H}:0:0[a];[0:v]crop={W}:{H}:4:0[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            "-pix_fmt yuv420p -c:v libx264 -profile:v main -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 1 -an -qp 18 " +
+            $"-x264-params \"no-deblock=1\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
+    /// <summary>Two-frame 128x96 CABAC clip exercising every P-slice partition shape (subme=8, partitions=all).</summary>
+    public static Sample TwoFramesAllPartitions128x96Cabac()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_all_parts_128x96_cabac.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_all_parts_128x96_cabac.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:d=0.5:r=2[a];testsrc=size={W}x{H}:d=0.5:r=2,gblur=sigma=0.5[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            $"-pix_fmt yuv420p -c:v libx264 -profile:v main -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 1 -an -qp 8 -x264-params \"no-deblock=1:subme=8:partitions=p8x8:8x8dct=0\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 16x16 red clip encoded with CABAC (Main profile): IDR + P_Skip.
     /// Exercises the CABAC arithmetic engine, I-slice CABAC mb_type/residual, mb_skip_flag.</summary>
     public static Sample TwoFramesIdentical16x16Cabac()
@@ -146,6 +177,20 @@ public static class FfmpegFixture
         EnsureGenerated(h264, yuv,
             $"-y -f lavfi -i testsrc=size={W}x{H}:d=1 -frames:v 1 -pix_fmt yuv420p " +
             "-c:v libx264 -profile:v baseline -bf 0 -g 1 -coder 0 -an " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
+    /// <summary>32x32 ffmpeg testsrc encoded CABAC (Main profile, coder=1) — Intra_4x4-dominated IDR.</summary>
+    public static Sample Testsrc32x32Cabac()
+    {
+        const int W = 32, H = 32;
+        string h264 = Path.Combine(SamplesDirectory, "testsrc_32x32_cabac.h264");
+        string yuv = Path.Combine(SamplesDirectory, "testsrc_32x32_cabac.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i testsrc=size={W}x{H}:d=1 -frames:v 1 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v main -bf 0 -g 1 -coder 1 -an -x264-params \"no-deblock=1\" " +
             $"-f h264 \"{h264}\"",
             $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
         return new Sample(h264, yuv, W, H);

@@ -527,9 +527,23 @@ public static class MacroblockParser
         }
     }
 
-    private static int QuadrantOf(int bx, int by) => (bx >> 1) + (by >> 1) * 2;
+    internal static int QuadrantOf(int bx, int by) => (bx >> 1) + (by >> 1) * 2;
 
-    private static void FillBlockMvs(Macroblock mb, int bx0, int by0, int bw, int bh, int mvX, int mvY)
+    internal static void ReplicateRefIdxAcross16x16PartitionsPublic(int rawMbType, int[] partRefIdx, int[] perQuadrant)
+        => ReplicateRefIdxAcross16x16Partitions(rawMbType, partRefIdx, perQuadrant);
+
+    internal static void FillBlockMvds(Macroblock mb, int bx0, int by0, int bw, int bh, int mvdX, int mvdY)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+            {
+                int idx = _spatialToRaster[by * 4 + bx];
+                mb.MvdL0XBlock[idx] = mvdX;
+                mb.MvdL0YBlock[idx] = mvdY;
+            }
+    }
+
+    internal static void FillBlockMvs(Macroblock mb, int bx0, int by0, int bw, int bh, int mvX, int mvY)
     {
         for (int by = by0; by < by0 + bh; by++)
             for (int bx = bx0; bx < bx0 + bw; bx++)
@@ -541,7 +555,7 @@ public static class MacroblockParser
     }
 
     /// <summary>Compute the L0 MV prediction for a partition at (bx, by) of size (bwBlocks, bhBlocks) in 4x4-block units.</summary>
-    private static (int X, int Y) PredictMvForPartition(
+    internal static (int X, int Y) PredictMvForPartition(
         Macroblock cur, int rawMbType, int partIdx,
         int bx, int by, int bwBlocks, int bhBlocks, int curRefIdx,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
@@ -592,12 +606,17 @@ public static class MacroblockParser
         return (Median3(aX, bX, cX), Median3(aY, bY, cY));
     }
 
-    private readonly struct MvNeighbor
+    internal readonly struct MvNeighbor
     {
         public readonly bool Avail;
         public readonly int MvX, MvY, RefIdx;
         public MvNeighbor(bool a, int x, int y, int r) { Avail = a; MvX = x; MvY = y; RefIdx = r; }
     }
+
+    internal static MvNeighbor GetMvNeighborPublic(
+        int bx, int by, Macroblock cur,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        => GetMvNeighbor(bx, by, cur, leftMb, topMb, topRightMb, topLeftMb);
 
     private static MvNeighbor GetMvNeighbor(
         int bx, int by, Macroblock cur,

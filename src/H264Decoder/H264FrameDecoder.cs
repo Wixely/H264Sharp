@@ -309,8 +309,13 @@ public sealed class H264FrameDecoder
             }
             else
             {
-                throw new NotSupportedException(
-                    "CABAC: non-skip P macroblock syntax not yet implemented (Tier 3 P.B)");
+                // P-slice non-skip MB.
+                Macroblock mb = CabacSliceP.ParseMb(cabac, header,
+                    leftMb, topMb, topRightMb, topLeftMb, addr,
+                    ref qpY, ref prevMbQpDeltaState);
+                mbs[addr] = mb;
+                MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
             }
 
             addr++;

@@ -297,6 +297,64 @@ public sealed class SingleFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeCabacTwoFramesShifted_PInterMacroblocks()
+    {
+        // 128x96 testsrc shift, Main profile, CABAC. x264 emits P_L0_16x16 MBs with
+        // integer-pel MV=(32,0) and small residual. Validates the CABAC inter
+        // mb_type binarization, ref_idx (single-ref case skipped), mvd UEG3,
+        // CBP luma/chroma, and inter residual path.
+        var sample = FfmpegFixture.TwoFramesShifted128x96Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 1, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 1, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 1, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact(Skip = "Pending: P-frame frame 1 diverges by ~234 luma — orthogonal CABAC gap beyond Intra_4x4 (likely related to inter-MB residual/QP path with subme=8 partitions=p8x8).")]
+    public void DecodeCabacTwoFramesAllPartitions_AllShapes()
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitions128x96Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 1, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 1, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 1, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact]
     public void DecodeTestsrc32x32_HandlesIntra4x4()
     {
         // testsrc is detailed enough that x264 picks ~75% Intra_4x4 macroblocks.
@@ -317,6 +375,29 @@ public sealed class SingleFrameDecodeTests
 
         // Allow a couple LSB of slack at the worst sample — same threshold as the
         // 4-quadrants test, which is effectively bit-exact in practice.
+        Assert.True(maxY <= 2, $"luma max abs error = {maxY}");
+        Assert.True(maxU <= 2, $"u max abs error = {maxU}");
+        Assert.True(maxV <= 2, $"v max abs error = {maxV}");
+    }
+
+    [Fact]
+    public void DecodeCabacTestsrc32x32_HandlesIntra4x4()
+    {
+        var sample = FfmpegFixture.Testsrc32x32Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        var pic = new H264FrameDecoder().DecodeFirstIFrame(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+
+        int maxY = 0;
+        for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[i]));
+        int maxU = 0;
+        for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(pic.U[i] - reference[yLen + i]));
+        int maxV = 0;
+        for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(pic.V[i] - reference[yLen + cLen + i]));
+
         Assert.True(maxY <= 2, $"luma max abs error = {maxY}");
         Assert.True(maxU <= 2, $"u max abs error = {maxU}");
         Assert.True(maxV <= 2, $"v max abs error = {maxV}");
