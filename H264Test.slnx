@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/H264Decoder.Cli/H264Decoder.Cli.csproj" />
+    <Project Path="src/H264Decoder/H264Decoder.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/H264Decoder.Tests/H264Decoder.Tests.csproj" />
+  </Folder>
+</Solution>
