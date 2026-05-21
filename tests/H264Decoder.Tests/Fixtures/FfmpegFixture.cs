@@ -92,6 +92,22 @@ public static class FfmpegFixture
         return new Sample(mp4, yuv, W, H);
     }
 
+    /// <summary>Three-frame 64x48 testsrc clip encoded with --refs 3 so the
+    /// last P-frame's slice header signals num_ref_idx_l0_active_minus1=1 and
+    /// the decoder must select between two reference pictures via ref_idx_l0.</summary>
+    public static Sample ThreeFramesMultiRef64x48()
+    {
+        const int W = 64, H = 48;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_multiref_64x48.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_multiref_64x48.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i testsrc=size={W}x{H}:d=1.5:r=2 -frames:v 3 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v baseline -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 0 -an -qp 18 -x264-params \"no-deblock=1:ref=3\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 3 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 16x16 red clip: I-frame + identical P-frame (all P_Skip).</summary>
     public static Sample TwoFramesIdentical16x16()
     {

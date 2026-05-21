@@ -14,6 +14,9 @@ public sealed class DecodedPicture
     public byte[] U { get; }
     public byte[] V { get; }
 
+    /// <summary>frame_num of the slice that produced this picture (for DPB ordering).</summary>
+    public int FrameNum { get; set; }
+
     public DecodedPicture(int width, int height)
     {
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)

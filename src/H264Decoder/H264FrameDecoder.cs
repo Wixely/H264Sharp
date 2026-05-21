@@ -60,7 +60,8 @@ public sealed class H264FrameDecoder
     {
         SequenceParameterSet? sps = null;
         PictureParameterSet? pps = null;
-        DecodedPicture? referencePicture = null;
+        // DPB: short-term reference pictures, newest first (index 0 = most recent).
+        var dpb = new List<DecodedPicture>();
         var outputs = new List<DecodedPicture>();
 
         foreach (var n in nals)
@@ -79,11 +80,19 @@ public sealed class H264FrameDecoder
                     {
                         throw new InvalidDataException("slice encountered before SPS/PPS");
                     }
-                    DecodedPicture pic = DecodeSlice(n, sps, pps, referencePicture);
+                    if (n.NalUnitType == NalUnitType.SliceIdr)
+                    {
+                        // IDR clears the DPB (per spec §8.2.5.1).
+                        dpb.Clear();
+                    }
+                    DecodedPicture pic = DecodeSlice(n, sps, pps, dpb);
                     outputs.Add(pic);
                     if (n.NalRefIdc != 0)
                     {
-                        referencePicture = pic;
+                        // Sliding window: insert at front, evict oldest if over capacity.
+                        dpb.Insert(0, pic);
+                        int maxRefs = (int)Math.Max(1u, sps.MaxNumRefFrames);
+                        while (dpb.Count > maxRefs) dpb.RemoveAt(dpb.Count - 1);
                     }
                     break;
             }
@@ -95,19 +104,27 @@ public sealed class H264FrameDecoder
 
     private DecodedPicture DecodeSlice(
         NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps,
-        DecodedPicture? referencePicture)
+        List<DecodedPicture> dpb)
     {
         var header = SliceHeader.Parse(nal.Rbsp.Span, nal, sps, pps);
 
         bool isPSlice = header.SliceType == SliceType.P;
-        if (isPSlice && referencePicture is null)
+        if (isPSlice && dpb.Count == 0)
         {
-            throw new InvalidDataException("P-slice with no reference picture");
+            throw new InvalidDataException("P-slice with empty DPB");
         }
+
+        // Build the active L0 reference picture list for this slice: take the first
+        // num_ref_idx_l0_active_minus1+1 entries of the DPB (which is newest-first).
+        // We do not honour ref_pic_list_modification — typical x264 default ordering.
+        int numActiveRefs = (int)(header.NumRefIdxL0ActiveMinus1 + 1);
+        var refPicListL0 = isPSlice
+            ? dpb.Take(Math.Min(numActiveRefs, dpb.Count)).ToList()
+            : new List<DecodedPicture>();
 
         int width = (int)sps.CroppedWidth;
         int height = (int)sps.CroppedHeight;
-        var picture = new DecodedPicture(width, height);
+        var picture = new DecodedPicture(width, height) { FrameNum = (int)header.FrameNum };
 
         var reader = new BitReader(nal.Rbsp.Span);
         SkipSliceHeader(ref reader, nal, sps, pps);
@@ -146,7 +163,7 @@ public sealed class H264FrameDecoder
                 Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
                 mbs[addr] = skipMb;
                 MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, referencePicture);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
                 mbSkipRun--;
                 addr++;
                 continue;
@@ -158,7 +175,7 @@ public sealed class H264FrameDecoder
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, referencePicture);
+                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
 
             addr++;
 
@@ -185,28 +202,6 @@ public sealed class H264FrameDecoder
 
         LastMacroblocks = mbs;
         return picture;
-    }
-
-    /// <summary>Copy 16x16 luma + 8x8 chroma block from reference picture into output picture at MB position.</summary>
-    private static void CopySkipMacroblockFromReference(
-        DecodedPicture dst, DecodedPicture src, int mbX, int mbY)
-    {
-        int yStride = dst.Width;
-        int yX = mbX * 16, yY = mbY * 16;
-        for (int row = 0; row < 16; row++)
-        {
-            Array.Copy(src.Y, (yY + row) * yStride + yX,
-                       dst.Y, (yY + row) * yStride + yX, 16);
-        }
-        int cStride = dst.ChromaWidth;
-        int cX = mbX * 8, cY = mbY * 8;
-        for (int row = 0; row < 8; row++)
-        {
-            Array.Copy(src.U, (cY + row) * cStride + cX,
-                       dst.U, (cY + row) * cStride + cX, 8);
-            Array.Copy(src.V, (cY + row) * cStride + cX,
-                       dst.V, (cY + row) * cStride + cX, 8);
-        }
     }
 
     /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.</summary>

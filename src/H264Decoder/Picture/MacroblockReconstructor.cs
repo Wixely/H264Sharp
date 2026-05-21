@@ -35,7 +35,7 @@ internal static class MacroblockReconstructor
         Macroblock? leftMb,
         Macroblock? topMb,
         Macroblock? topRightMb,
-        DecodedPicture? referencePicture = null)
+        IReadOnlyList<DecodedPicture>? refPicListL0 = null)
     {
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
         {
@@ -47,9 +47,9 @@ internal static class MacroblockReconstructor
         }
         else if (mb.Type.PredMode == MbPartPredMode.PredL0)
         {
-            if (referencePicture is null)
-                throw new InvalidOperationException("PredL0 reconstruction requires a reference picture");
-            ReconstructLumaInterP16x16(mb, picture, referencePicture, mbX, mbY);
+            if (refPicListL0 is null || refPicListL0.Count == 0)
+                throw new InvalidOperationException("PredL0 reconstruction requires a non-empty L0 reference list");
+            ReconstructLumaInterP16x16(mb, picture, refPicListL0, mbX, mbY);
         }
         else
         {
@@ -59,9 +59,9 @@ internal static class MacroblockReconstructor
         int qPc = ChromaQp(mb.QpY, chromaQpIndexOffset);
         if (mb.Type.PredMode == MbPartPredMode.PredL0)
         {
-            if (referencePicture is null)
-                throw new InvalidOperationException("PredL0 chroma reconstruction requires a reference picture");
-            ReconstructChromaInter(mb, picture, referencePicture, mbX, mbY, qPc);
+            if (refPicListL0 is null || refPicListL0.Count == 0)
+                throw new InvalidOperationException("PredL0 chroma reconstruction requires a non-empty L0 reference list");
+            ReconstructChromaInter(mb, picture, refPicListL0, mbX, mbY, qPc);
         }
         else
         {
@@ -334,7 +334,7 @@ internal static class MacroblockReconstructor
 
     // ---------------- Luma (PredL0, all P partition shapes) ----------------
     private static void ReconstructLumaInterP16x16(
-        Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY)
+        Macroblock mb, DecodedPicture picture, IReadOnlyList<DecodedPicture> refPicListL0, int mbX, int mbY)
     {
         // Build the 16x16 prediction by running MC for each motion partition.
         Span<byte> predBlock = stackalloc byte[256];
@@ -343,6 +343,8 @@ internal static class MacroblockReconstructor
         {
             int n = part.Width * part.Height;
             Span<byte> partOut = partPred[..n];
+            int refIdx = part.RefIdxL0 < refPicListL0.Count ? part.RefIdxL0 : 0;
+            var refPic = refPicListL0[refIdx];
             MotionCompensation.LumaPredict(
                 refPic.Y, refPic.Width, refPic.Height,
                 mbX * 16 + part.X, mbY * 16 + part.Y,
@@ -405,7 +407,7 @@ internal static class MacroblockReconstructor
 
     /// <summary>Reconstruct chroma for an inter MB. Chroma MV is derived from luma MV.</summary>
     private static void ReconstructChromaInter(
-        Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY, int qPc)
+        Macroblock mb, DecodedPicture picture, IReadOnlyList<DecodedPicture> refPicListL0, int mbX, int mbY, int qPc)
     {
         Span<byte> predBlock = stackalloc byte[64];
         Span<byte> partPred = stackalloc byte[64];
@@ -415,12 +417,14 @@ internal static class MacroblockReconstructor
 
         for (int comp = 0; comp < 2; comp++)
         {
-            byte[] refPlane = comp == 0 ? refPic.U : refPic.V;
             byte[] plane = comp == 0 ? picture.U : picture.V;
             int stride = picture.ChromaWidth;
             // For each motion partition, do chroma MC on the corresponding 8x8 region scaled to half size.
             foreach (var part in mb.InterPartitions)
             {
+                int refIdx = part.RefIdxL0 < refPicListL0.Count ? part.RefIdxL0 : 0;
+                var refPic = refPicListL0[refIdx];
+                byte[] refPlane = comp == 0 ? refPic.U : refPic.V;
                 int cx = part.X / 2;
                 int cy = part.Y / 2;
                 int cw = part.Width / 2;
