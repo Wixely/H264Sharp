@@ -1,0 +1,99 @@
+namespace H264Decoder.Bitstream;
+
+/// <summary>
+/// Bit-level reader over an RBSP. Position is measured in bits from the start of the buffer.
+/// </summary>
+public ref struct BitReader
+{
+    private readonly ReadOnlySpan<byte> _data;
+    private int _bitPos;
+
+    public BitReader(ReadOnlySpan<byte> data)
+    {
+        _data = data;
+        _bitPos = 0;
+    }
+
+    public int BitPosition => _bitPos;
+    public int TotalBits => _data.Length * 8;
+    public int BitsRemaining => TotalBits - _bitPos;
+    public bool EndOfStream => _bitPos >= TotalBits;
+
+    public uint ReadBit()
+    {
+        if (_bitPos >= TotalBits)
+        {
+            throw new InvalidDataException("BitReader: read past end of RBSP");
+        }
+        int byteIndex = _bitPos >> 3;
+        int bitInByte = 7 - (_bitPos & 7);
+        _bitPos++;
+        return (uint)((_data[byteIndex] >> bitInByte) & 1);
+    }
+
+    public uint ReadBits(int n)
+    {
+        if ((uint)n > 32u)
+        {
+            throw new ArgumentOutOfRangeException(nameof(n), "ReadBits supports up to 32 bits");
+        }
+        uint result = 0;
+        for (int i = 0; i < n; i++)
+        {
+            result = (result << 1) | ReadBit();
+        }
+        return result;
+    }
+
+    public void ByteAlign()
+    {
+        int rem = _bitPos & 7;
+        if (rem != 0)
+        {
+            _bitPos += 8 - rem;
+        }
+    }
+
+    /// <summary>
+    /// Implements the normative more_rbsp_data() check (spec §7.2).
+    /// Returns false if the only remaining bits are the rbsp_trailing_bits
+    /// (a single 1 bit followed by 0-7 zero bits to byte-align).
+    /// </summary>
+    public bool MoreRbspData()
+    {
+        if (EndOfStream)
+        {
+            return false;
+        }
+
+        // Save state, peek forward, restore.
+        int saved = _bitPos;
+        try
+        {
+            // The next set bit must be the rbsp_stop_one_bit and it must lie within
+            // the current byte's remaining bits — otherwise there is more data.
+            int bitInByte = saved & 7;
+            int bitsLeftInByte = 8 - bitInByte;
+            // If the next bit is 0, there is definitely more data (stop bit would be 1).
+            if (ReadBit() == 0)
+            {
+                return true;
+            }
+            // The next bit was 1. If all remaining bits in the buffer are 0, that
+            // 1 was the stop bit. Otherwise there is more data.
+            while (!EndOfStream)
+            {
+                if (ReadBit() != 0)
+                {
+                    return true;
+                }
+            }
+            _ = bitsLeftInByte;
+            return false;
+        }
+        finally
+        {
+            _bitPos = saved;
+        }
+    }
+}
