@@ -48,13 +48,35 @@ internal static class MacroblockReconstructor
     private static void ReconstructLumaIntra16x16(
         Macroblock mb, DecodedPicture picture, int mbX, int mbY)
     {
-        // No neighbors yet (single-MB picture). All availability false.
+        // Gather luma neighbor samples from the already-decoded picture.
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[16];
+        bool topAvail = mbY > 0;
+        bool leftAvail = mbX > 0;
+        bool topLeftAvail = topAvail && leftAvail;
+        byte topLeft = 0;
+        if (topAvail)
+        {
+            int srcY = mbY * 16 - 1;
+            int srcX0 = mbX * 16;
+            for (int i = 0; i < 16; i++) top[i] = picture.Y[srcY * picture.Width + srcX0 + i];
+        }
+        if (leftAvail)
+        {
+            int srcX = mbX * 16 - 1;
+            int srcY0 = mbY * 16;
+            for (int i = 0; i < 16; i++) left[i] = picture.Y[(srcY0 + i) * picture.Width + srcX];
+        }
+        if (topLeftAvail)
+        {
+            topLeft = picture.Y[(mbY * 16 - 1) * picture.Width + (mbX * 16 - 1)];
+        }
+
         Span<byte> predBlock = stackalloc byte[256];
         IntraPrediction.PredictIntra16x16(
             mb.Type.I16x16PredMode,
-            top: [], topAvail: false,
-            left: [], leftAvail: false,
-            topLeft: 0, topLeftAvail: false,
+            top, topAvail, left, leftAvail,
+            topLeft, topLeftAvail,
             predBlock);
 
         // Inverse-Hadamard + dequant the DC luma block.
@@ -125,13 +147,36 @@ internal static class MacroblockReconstructor
         Span<int> coeffsScan = stackalloc int[16];
         Span<int> coeffsRaster = stackalloc int[16];
 
+        Span<byte> top8 = stackalloc byte[8];
+        Span<byte> left8 = stackalloc byte[8];
+        bool topAvail = mbY > 0;
+        bool leftAvail = mbX > 0;
+        bool topLeftAvail = topAvail && leftAvail;
+
         for (int comp = 0; comp < 2; comp++)
         {
+            byte[] plane = comp == 0 ? picture.U : picture.V;
+            int stride = picture.ChromaWidth;
+            if (topAvail)
+            {
+                int srcY = mbY * 8 - 1;
+                int srcX0 = mbX * 8;
+                for (int i = 0; i < 8; i++) top8[i] = plane[srcY * stride + srcX0 + i];
+            }
+            if (leftAvail)
+            {
+                int srcX = mbX * 8 - 1;
+                int srcY0 = mbY * 8;
+                for (int i = 0; i < 8; i++) left8[i] = plane[(srcY0 + i) * stride + srcX];
+            }
+            byte topLeft = topLeftAvail
+                ? plane[(mbY * 8 - 1) * stride + (mbX * 8 - 1)]
+                : (byte)0;
+
             IntraPrediction.PredictChroma8x8(
                 mb.ChromaPredMode,
-                top: [], topAvail: false,
-                left: [], leftAvail: false,
-                topLeft: 0, topLeftAvail: false,
+                top8, topAvail, left8, leftAvail,
+                topLeft, topLeftAvail,
                 predBlock);
 
             // Chroma DC: 4 values in [TL, TR, BL, BR] order (raster).
@@ -173,8 +218,6 @@ internal static class MacroblockReconstructor
 
                 int px0 = mbX * 8 + subX * 4;
                 int py0 = mbY * 8 + subY * 4;
-                byte[] plane = comp == 0 ? picture.U : picture.V;
-                int stride = picture.ChromaWidth;
                 for (int yy = 0; yy < 4; yy++)
                     for (int xx = 0; xx < 4; xx++)
                     {

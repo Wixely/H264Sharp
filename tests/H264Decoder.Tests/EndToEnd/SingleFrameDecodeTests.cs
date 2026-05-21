@@ -50,4 +50,39 @@ public sealed class SingleFrameDecodeTests
         Assert.InRange(pUsum / cLen, rUsum / cLen - 2, rUsum / cLen + 2);
         Assert.InRange(pVsum / cLen, rVsum / cLen - 2, rVsum / cLen + 2);
     }
+
+    [Fact]
+    public void DecodeFourQuadrants32x32_ShapeCheckOnly()
+    {
+        var sample = FfmpegFixture.FourQuadrants32x32();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        var pic = new H264FrameDecoder().DecodeFirstIFrame(stream);
+        Assert.Equal(sample.Width, pic.Width);
+        Assert.Equal(sample.Height, pic.Height);
+    }
+
+    [Fact]
+    public void DecodeFourQuadrants32x32_MatchesFfmpegMeans()
+    {
+        var sample = FfmpegFixture.FourQuadrants32x32();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        var pic = new H264FrameDecoder().DecodeFirstIFrame(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+
+        long pY = 0; for (int i = 0; i < yLen; i++) pY += pic.Y[i];
+        long rY = 0; for (int i = 0; i < yLen; i++) rY += reference[i];
+        long pU = 0; for (int i = 0; i < cLen; i++) pU += pic.U[i];
+        long rU = 0; for (int i = 0; i < cLen; i++) rU += reference[yLen + i];
+        long pV = 0; for (int i = 0; i < cLen; i++) pV += pic.V[i];
+        long rV = 0; for (int i = 0; i < cLen; i++) rV += reference[yLen + cLen + i];
+
+        // Without deblocking, edges between MBs will be slightly off.
+        // Average error should still be within a few units per channel.
+        Assert.InRange(pY / yLen, rY / yLen - 5, rY / yLen + 5);
+        Assert.InRange(pU / cLen, rU / cLen - 5, rU / cLen + 5);
+        Assert.InRange(pV / cLen, rV / cLen - 5, rV / cLen + 5);
+    }
 }
