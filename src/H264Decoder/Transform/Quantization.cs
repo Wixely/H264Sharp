@@ -39,20 +39,26 @@ internal static class Quantization
     }
 
     /// <summary>
-    /// Intra_16x16 luma DC dequantization (spec §8.5.10): scale 16 DC values after inverse Hadamard.
+    /// Intra_16x16 luma DC dequantization (spec §8.5.10). After inverse Hadamard,
+    /// each value is scaled to the DC coefficient that should be placed at position (0,0)
+    /// of the corresponding 4x4 luma block before the inverse 4x4 transform.
+    /// Formula matches OpenH264's WelsLumaDcDequantIdct:
+    ///   dcY = (f * LevelScale * 2^(qP/6 + 4) + 32) >> 6
+    /// equivalent to (f * (LevelScale &lt;&lt; 4) + 32) &gt;&gt; 6 with the qP/6 shift folded in.
     /// </summary>
     public static void DequantLumaDc(Span<int> dc, int qP)
     {
         int v = LevelScale4x4(qP, 0, 0);
-        if (qP >= 36)
+        int qShift = qP / 6;
+        if (qShift >= 2)
         {
-            int shift = qP / 6 - 6;
+            int shift = qShift - 2;
             for (int i = 0; i < 16; i++) dc[i] = dc[i] * v << shift;
         }
         else
         {
-            int shift = 6 - qP / 6;
-            int half = 1 << (shift - 1);
+            int shift = 2 - qShift;       // 1 or 2
+            int half = 1 << (shift - 1);  // 1 or 2
             for (int i = 0; i < 16; i++) dc[i] = (dc[i] * v + half) >> shift;
         }
     }
