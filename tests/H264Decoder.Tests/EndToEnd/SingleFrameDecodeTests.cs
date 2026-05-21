@@ -87,6 +87,35 @@ public sealed class SingleFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeTwoFramesFractionalMv_PSubpelMotionCompensation()
+    {
+        // 128x96 testsrc with frame-2 light blur. x264 picks ~29 P_L0_16x16 MBs with
+        // fractional-pel MVs, exercising all 16 luma sub-pel positions and chroma 1/8-pel.
+        var sample = FfmpegFixture.TwoFramesFractionalMv128x96();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 1, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 1, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 1, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact]
     public void DecodeTwoFramesShifted_PMotionCompensation()
     {
         // 128x96 testsrc, frame 2 horizontally shifted by 8 pixels. x264 emits a mix of

@@ -336,17 +336,12 @@ internal static class MacroblockReconstructor
     private static void ReconstructLumaInterP16x16(
         Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY)
     {
-        // MV is in 1/4 pixel units. Integer-pel only at this stage.
-        if ((mb.MvL0X & 3) != 0 || (mb.MvL0Y & 3) != 0)
-        {
-            throw new NotSupportedException(
-                $"sub-pel luma MC not yet implemented (MV=({mb.MvL0X}, {mb.MvL0Y}) in 1/4-pel units)");
-        }
-        int dx = mb.MvL0X >> 2;
-        int dy = mb.MvL0Y >> 2;
-
         Span<byte> predBlock = stackalloc byte[256];
-        CopyLumaWithEdgeReplication(refPic, mbX * 16 + dx, mbY * 16 + dy, predBlock);
+        MotionCompensation.LumaPredict(
+            refPic.Y, refPic.Width, refPic.Height,
+            mbX * 16, mbY * 16,
+            mb.MvL0X, mb.MvL0Y,
+            16, 16, predBlock);
 
         // Now add residual per 4x4 block (CBP-gated, full 16-coeff blocks).
         Span<int> coeffsScan = stackalloc int[16];
@@ -402,9 +397,6 @@ internal static class MacroblockReconstructor
     private static void ReconstructChromaInter(
         Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY, int qPc)
     {
-        int cdx = mb.MvL0X >> 3;
-        int cdy = mb.MvL0Y >> 3;
-
         Span<byte> predBlock = stackalloc byte[64];
         Span<int> dc = stackalloc int[4];
         Span<int> coeffsScan = stackalloc int[16];
@@ -415,10 +407,11 @@ internal static class MacroblockReconstructor
             byte[] refPlane = comp == 0 ? refPic.U : refPic.V;
             byte[] plane = comp == 0 ? picture.U : picture.V;
             int stride = picture.ChromaWidth;
-            int srcXBase = mbX * 8 + cdx;
-            int srcYBase = mbY * 8 + cdy;
-            CopyChromaWithEdgeReplication(refPlane, refPic.ChromaWidth, refPic.ChromaHeight,
-                                          srcXBase, srcYBase, predBlock);
+            MotionCompensation.ChromaPredict(
+                refPlane, refPic.ChromaWidth, refPic.ChromaHeight,
+                mbX * 8, mbY * 8,
+                mb.MvL0X, mb.MvL0Y,
+                8, 8, predBlock);
 
             dc.Clear();
             if ((mb.CbpChroma & 3) != 0)

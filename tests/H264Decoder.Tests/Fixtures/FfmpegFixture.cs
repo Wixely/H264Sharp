@@ -48,6 +48,22 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 128x96 testsrc with frame-2 light blur — forces x264 (qp=18,
+    /// subme=7, partitions=none) to pick fractional-pel MVs across many of its
+    /// P_L0_16x16 macroblocks. Exercises all 16 luma sub-pel positions and chroma
+    /// 1/8-pel bilinear.</summary>
+    public static Sample TwoFramesFractionalMv128x96()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_subpel_128x96.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_subpel_128x96.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:d=0.5:r=2[a];testsrc=size={W}x{H}:d=0.5:r=2,smartblur=lr=1.5[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            $"-pix_fmt yuv420p -c:v libx264 -profile:v baseline -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 0 -an -qp 18 -x264-params \"no-deblock=1:partitions=none:subme=7\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 16x16 red clip: I-frame + identical P-frame (all P_Skip).</summary>
     public static Sample TwoFramesIdentical16x16()
     {
