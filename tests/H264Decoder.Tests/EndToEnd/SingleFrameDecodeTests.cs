@@ -62,7 +62,7 @@ public sealed class SingleFrameDecodeTests
     }
 
     [Fact]
-    public void DecodeFourQuadrants32x32_MatchesFfmpegMeans()
+    public void DecodeFourQuadrants32x32_BitExactPerSampleAgainstFfmpeg()
     {
         var sample = FfmpegFixture.FourQuadrants32x32();
         byte[] stream = File.ReadAllBytes(sample.H264Path);
@@ -72,17 +72,17 @@ public sealed class SingleFrameDecodeTests
         int yLen = sample.Width * sample.Height;
         int cLen = yLen / 4;
 
-        long pY = 0; for (int i = 0; i < yLen; i++) pY += pic.Y[i];
-        long rY = 0; for (int i = 0; i < yLen; i++) rY += reference[i];
-        long pU = 0; for (int i = 0; i < cLen; i++) pU += pic.U[i];
-        long rU = 0; for (int i = 0; i < cLen; i++) rU += reference[yLen + i];
-        long pV = 0; for (int i = 0; i < cLen; i++) pV += pic.V[i];
-        long rV = 0; for (int i = 0; i < cLen; i++) rV += reference[yLen + cLen + i];
+        // Per-sample max absolute error — with deblocking the boundaries should
+        // be very close. Allow ±2 LSB across the whole plane.
+        int maxY = 0;
+        for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[i]));
+        int maxU = 0;
+        for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(pic.U[i] - reference[yLen + i]));
+        int maxV = 0;
+        for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(pic.V[i] - reference[yLen + cLen + i]));
 
-        // Without deblocking, edges between MBs will be slightly off.
-        // Average error should still be within a few units per channel.
-        Assert.InRange(pY / yLen, rY / yLen - 5, rY / yLen + 5);
-        Assert.InRange(pU / cLen, rU / cLen - 5, rU / cLen + 5);
-        Assert.InRange(pV / cLen, rV / cLen - 5, rV / cLen + 5);
+        Assert.True(maxY <= 2, $"luma max abs error = {maxY}");
+        Assert.True(maxU <= 2, $"u max abs error = {maxU}");
+        Assert.True(maxV <= 2, $"v max abs error = {maxV}");
     }
 }

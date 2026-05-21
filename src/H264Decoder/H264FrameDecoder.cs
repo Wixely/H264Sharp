@@ -1,4 +1,5 @@
 using H264Decoder.Bitstream;
+using H264Decoder.Loop;
 using H264Decoder.Picture;
 using H264Decoder.Syntax;
 
@@ -67,6 +68,16 @@ public sealed class H264FrameDecoder
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY, pps.ChromaQpIndexOffset);
+        }
+
+        if (header.DisableDeblockingFilterIdc != 1)
+        {
+            bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
+            DeblockingFilter.Apply(picture, mbs, mbsPerRow,
+                pps.ChromaQpIndexOffset,
+                header.SliceAlphaC0OffsetDiv2 * 2,
+                header.SliceBetaOffsetDiv2 * 2,
+                filterMbEdges);
         }
 
         return picture;
