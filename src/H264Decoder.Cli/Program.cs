@@ -3,7 +3,7 @@ using H264Decoder.Picture;
 
 if (args.Length != 2)
 {
-    Console.Error.WriteLine("Usage: H264Decoder.Cli <in.h264> <out.yuv>");
+    Console.Error.WriteLine("Usage: H264Decoder.Cli <in.h264> <out.yuv|out.png>");
     return 1;
 }
 
@@ -29,10 +29,20 @@ catch (Exception ex)
     return 3;
 }
 
-using (var fs = File.Create(outPath))
+if (outPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
 {
-    Yuv420Frame.Write(pic, fs);
+    byte[] rgb = YuvToRgb.Convert(pic);
+    byte[] png = PngEncoder.EncodeRgb(pic.Width, pic.Height, rgb);
+    File.WriteAllBytes(outPath, png);
+    Console.Error.WriteLine($"decoded {pic.Width}x{pic.Height} -> {outPath} ({png.Length} bytes PNG)");
+}
+else
+{
+    using (var fs = File.Create(outPath))
+    {
+        Yuv420Frame.Write(pic, fs);
+    }
+    Console.Error.WriteLine($"decoded {pic.Width}x{pic.Height} YUV 4:2:0 -> {outPath} ({new FileInfo(outPath).Length} bytes)");
 }
 
-Console.Error.WriteLine($"decoded {pic.Width}x{pic.Height} YUV 4:2:0 -> {outPath} ({new FileInfo(outPath).Length} bytes)");
 return 0;
