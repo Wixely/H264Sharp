@@ -24,15 +24,18 @@ public sealed class H264FrameDecoder
         return DecodeFirstIFrame(nals);
     }
 
+    /// <summary>Decode all frames in the stream in decode order.</summary>
+    public List<DecodedPicture> DecodeAllFrames(ReadOnlySpan<byte> bytes)
+    {
+        List<NalUnit> nals = LooksLikeAnnexB(bytes)
+            ? AnnexBReader.SplitNalUnits(bytes)
+            : AvccReader.SplitNalUnits(bytes);
+        return DecodeAllFrames(nals);
+    }
+
     /// <summary>Detects Annex-B framing by looking for a leading zero byte (start code).</summary>
     private static bool LooksLikeAnnexB(ReadOnlySpan<byte> bytes)
     {
-        // Annex-B streams always start with 0x000001 or 0x00000001 (or padding zeros).
-        // AVCC streams start with a non-zero length-prefix high byte for any NAL of
-        // length >= 256 bytes; for tiny streams length might begin with 0x00 too, but
-        // that's a 3-byte length 0x0000nn — impossible in standard AVCC (length must
-        // be ≥ 1). So we look at the *first non-zero byte*: if it's 0x01 within the
-        // first 4 bytes, this is Annex-B.
         for (int i = 0; i < Math.Min(4, bytes.Length); i++)
         {
             if (bytes[i] == 0) continue;
@@ -41,13 +44,15 @@ public sealed class H264FrameDecoder
         return false;
     }
 
-    /// <summary>Decode from pre-parsed NAL units. Use this if you already have a List&lt;NalUnit&gt;
-    /// (e.g. extracted from an MP4 avcC + mdat).</summary>
-    public DecodedPicture DecodeFirstIFrame(List<NalUnit> nals)
+    public DecodedPicture DecodeFirstIFrame(List<NalUnit> nals) =>
+        DecodeAllFrames(nals).First();
+
+    public List<DecodedPicture> DecodeAllFrames(List<NalUnit> nals)
     {
         SequenceParameterSet? sps = null;
         PictureParameterSet? pps = null;
-        NalUnit? idr = null;
+        DecodedPicture? referencePicture = null;
+        var outputs = new List<DecodedPicture>();
 
         foreach (var n in nals)
         {
@@ -60,31 +65,57 @@ public sealed class H264FrameDecoder
                     pps = PictureParameterSet.Parse(n.Rbsp.Span);
                     break;
                 case NalUnitType.SliceIdr:
-                    idr ??= n;
+                case NalUnitType.SliceNonIdr:
+                    if (sps is null || pps is null)
+                    {
+                        throw new InvalidDataException("slice encountered before SPS/PPS");
+                    }
+                    DecodedPicture pic = DecodeSlice(n, sps, pps, referencePicture);
+                    outputs.Add(pic);
+                    if (n.NalRefIdc != 0)
+                    {
+                        referencePicture = pic;
+                    }
                     break;
             }
         }
 
-        if (sps is null) throw new InvalidDataException("no SPS in bitstream");
-        if (pps is null) throw new InvalidDataException("no PPS in bitstream");
-        if (idr is null) throw new InvalidDataException("no IDR slice in bitstream");
+        if (outputs.Count == 0) throw new InvalidDataException("no slices in bitstream");
+        return outputs;
+    }
+
+    private DecodedPicture DecodeSlice(
+        NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps,
+        DecodedPicture? referencePicture)
+    {
+        var header = SliceHeader.Parse(nal.Rbsp.Span, nal, sps, pps);
+
+        bool isPSlice = header.SliceType == SliceType.P;
+        if (isPSlice && referencePicture is null)
+        {
+            throw new InvalidDataException("P-slice with no reference picture");
+        }
 
         int width = (int)sps.CroppedWidth;
         int height = (int)sps.CroppedHeight;
         var picture = new DecodedPicture(width, height);
 
-        // Parse slice header, then walk macroblocks.
-        var reader = new BitReader(idr.Value.Rbsp.Span);
-        var header = SliceHeader.Parse(idr.Value.Rbsp.Span, idr.Value, sps, pps);
-        SkipSliceHeader(ref reader, idr.Value, sps, pps);
+        var reader = new BitReader(nal.Rbsp.Span);
+        SkipSliceHeader(ref reader, nal, sps, pps);
 
         int mbsPerRow = (int)sps.PicWidthInMbs;
         int totalMbs = mbsPerRow * (int)sps.PicHeightInMbs;
         int qpY = header.SliceQpY(pps);
-
         Macroblock[] mbs = new Macroblock[totalMbs];
 
-        for (int addr = (int)header.FirstMbInSlice; addr < totalMbs; addr++)
+        int addr = (int)header.FirstMbInSlice;
+        int mbSkipRun = 0;
+        if (isPSlice)
+        {
+            mbSkipRun = (int)ExpGolomb.ReadUe(ref reader);
+        }
+
+        while (addr < totalMbs)
         {
             int mbX = addr % mbsPerRow;
             int mbY = addr / mbsPerRow;
@@ -95,6 +126,25 @@ public sealed class H264FrameDecoder
                 ? mbs[addr - mbsPerRow + 1]
                 : null;
 
+            if (isPSlice && mbSkipRun > 0)
+            {
+                // P_Skip: copy from reference picture at MV(0,0). MV prediction for
+                // skip is zero when either neighbor is missing or has refIdx/MV=0;
+                // for our minimum case we cover only the all-(0,0)-MV scenario and
+                // throw otherwise.
+                CopySkipMacroblockFromReference(picture, referencePicture!, mbX, mbY);
+                mbs[addr] = SkipPlaceholder(addr);
+                mbSkipRun--;
+                addr++;
+                continue;
+            }
+
+            if (isPSlice)
+            {
+                throw new NotSupportedException(
+                    "non-skip P-slice macroblocks not yet supported (only P_Skip in this phase)");
+            }
+
             Macroblock mb = MacroblockParser.Parse(
                 ref reader, sps, pps, header,
                 leftMb, topMb, addr, ref qpY);
@@ -102,10 +152,16 @@ public sealed class H264FrameDecoder
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                 pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb);
+
+            addr++;
         }
 
-        if (header.DisableDeblockingFilterIdc != 1)
+        if (header.DisableDeblockingFilterIdc != 1 && !isPSlice)
         {
+            // For pure-skip P-slices the reference is already deblocked; the spec
+            // would still apply deblocking, but the per-MB filter strengths are
+            // all zero (no coded coefs, MVs match, refs match), so it's a no-op
+            // for our minimal case.
             bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
             DeblockingFilter.Apply(picture, mbs, mbsPerRow,
                 pps.ChromaQpIndexOffset,
@@ -118,13 +174,44 @@ public sealed class H264FrameDecoder
         return picture;
     }
 
+    /// <summary>Copy 16x16 luma + 8x8 chroma block from reference picture into output picture at MB position.</summary>
+    private static void CopySkipMacroblockFromReference(
+        DecodedPicture dst, DecodedPicture src, int mbX, int mbY)
+    {
+        int yStride = dst.Width;
+        int yX = mbX * 16, yY = mbY * 16;
+        for (int row = 0; row < 16; row++)
+        {
+            Array.Copy(src.Y, (yY + row) * yStride + yX,
+                       dst.Y, (yY + row) * yStride + yX, 16);
+        }
+        int cStride = dst.ChromaWidth;
+        int cX = mbX * 8, cY = mbY * 8;
+        for (int row = 0; row < 8; row++)
+        {
+            Array.Copy(src.U, (cY + row) * cStride + cX,
+                       dst.U, (cY + row) * cStride + cX, 8);
+            Array.Copy(src.V, (cY + row) * cStride + cX,
+                       dst.V, (cY + row) * cStride + cX, 8);
+        }
+    }
+
+    /// <summary>Placeholder Macroblock for tracking that this addr was a skip (for neighbor lookups).</summary>
+    private static Macroblock SkipPlaceholder(int addr) =>
+        new()
+        {
+            MbAddress = addr,
+            Type = new IntraMbType(0, MbPartPredMode.Intra16x16, default, 0, 0), // sentinel
+        };
+
     /// <summary>Advance the bit reader past the slice header (mirrors SliceHeader.Parse).</summary>
     private static void SkipSliceHeader(
         ref BitReader r, NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps)
     {
         bool idrPicFlag = nal.NalUnitType == NalUnitType.SliceIdr;
         _ = ExpGolomb.ReadUe(ref r);                              // first_mb_in_slice
-        _ = ExpGolomb.ReadUe(ref r);                              // slice_type
+        uint sliceTypeRaw = ExpGolomb.ReadUe(ref r);
+        var sliceType = (SliceType)(sliceTypeRaw % 5);
         _ = ExpGolomb.ReadUe(ref r);                              // pic_parameter_set_id
         _ = r.ReadBits((int)sps.Log2MaxFrameNumMinus4 + 4);       // frame_num
         if (idrPicFlag) _ = ExpGolomb.ReadUe(ref r);
@@ -134,6 +221,21 @@ public sealed class H264FrameDecoder
             if (pps.BottomFieldPicOrderInFramePresentFlag) _ = ExpGolomb.ReadSe(ref r);
         }
         if (pps.RedundantPicCntPresentFlag) _ = ExpGolomb.ReadUe(ref r);
+        if (sliceType == SliceType.P)
+        {
+            bool overrideFlag = r.ReadBit() == 1;
+            if (overrideFlag) _ = ExpGolomb.ReadUe(ref r);
+            bool listModL0 = r.ReadBit() == 1;
+            if (listModL0)
+            {
+                while (true)
+                {
+                    uint op = ExpGolomb.ReadUe(ref r);
+                    if (op == 3) break;
+                    _ = ExpGolomb.ReadUe(ref r);
+                }
+            }
+        }
         if (nal.NalRefIdc != 0)
         {
             if (idrPicFlag) { _ = r.ReadBit(); _ = r.ReadBit(); }

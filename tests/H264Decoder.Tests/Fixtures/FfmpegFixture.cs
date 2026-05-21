@@ -33,6 +33,20 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 16x16 red clip: I-frame + identical P-frame (all P_Skip).</summary>
+    public static Sample TwoFramesIdentical16x16()
+    {
+        const int W = 16, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_red_16x16.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_red_16x16.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i color=c=red:s={W}x{H}:d=1:r=2 -frames:v 2 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v baseline -bf 0 -keyint_min 99 -g 99 -coder 0 -an " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>32x32 ffmpeg testsrc — forces x264 to pick mostly Intra_4x4 (textured).</summary>
     public static Sample Testsrc32x32()
     {

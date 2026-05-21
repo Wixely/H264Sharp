@@ -36,6 +36,10 @@ public sealed class SliceHeader
     public required int SliceAlphaC0OffsetDiv2 { get; init; }
     public required int SliceBetaOffsetDiv2 { get; init; }
 
+    // P-slice fields
+    public uint NumRefIdxL0ActiveMinus1 { get; init; }
+    public bool NumRefIdxActiveOverrideFlag { get; init; }
+
     public int SliceQpY(PictureParameterSet pps) => 26 + pps.PicInitQpMinus26 + SliceQpDelta;
 
     public static SliceHeader Parse(
@@ -54,9 +58,9 @@ public sealed class SliceHeader
             throw new InvalidDataException($"slice_type {sliceTypeRaw} out of range");
         }
         var sliceType = (SliceType)(sliceTypeRaw % 5);
-        if (sliceType != SliceType.I)
+        if (sliceType != SliceType.I && sliceType != SliceType.P)
         {
-            throw new NotSupportedException($"slice_type {sliceType} not supported (I-slice only)");
+            throw new NotSupportedException($"slice_type {sliceType} not supported (I/P only)");
         }
         bool allSame = sliceTypeRaw >= 5;
         uint ppsId = ExpGolomb.ReadUe(ref r);
@@ -92,9 +96,30 @@ public sealed class SliceHeader
             _ = ExpGolomb.ReadUe(ref r); // redundant_pic_cnt
         }
 
-        // No direct_spatial_mv_pred_flag (B), no num_ref_idx_active_override (I)
-        // ref_pic_list_modification for I-slice: empty (no flags emitted)
-        // No pred_weight_table for I-slice
+        // P-slice specific: num_ref_idx_active_override + ref_pic_list_modification
+        bool numRefIdxOverride = false;
+        uint numRefIdxL0ActiveMinus1 = pps.NumRefIdxL0DefaultActiveMinus1;
+        if (sliceType == SliceType.P)
+        {
+            numRefIdxOverride = r.ReadBit() == 1;
+            if (numRefIdxOverride)
+            {
+                numRefIdxL0ActiveMinus1 = ExpGolomb.ReadUe(ref r);
+            }
+            // ref_pic_list_modification for P-slice: reads ref_pic_list_modification_flag_l0
+            bool listModL0 = r.ReadBit() == 1;
+            if (listModL0)
+            {
+                while (true)
+                {
+                    uint op = ExpGolomb.ReadUe(ref r);
+                    if (op == 3) break;
+                    _ = ExpGolomb.ReadUe(ref r); // abs_diff_pic_num_minus1 / long_term_pic_num
+                }
+            }
+        }
+
+        // No pred_weight_table for our subset (weighted_pred_flag is 0 in baseline x264 default).
 
         bool noOutputPriorPics = false;
         bool longTermRef = false;
@@ -153,6 +178,8 @@ public sealed class SliceHeader
             DisableDeblockingFilterIdc = disableDeblockingIdc,
             SliceAlphaC0OffsetDiv2 = alphaOffset / 2,
             SliceBetaOffsetDiv2 = betaOffset / 2,
+            NumRefIdxL0ActiveMinus1 = numRefIdxL0ActiveMinus1,
+            NumRefIdxActiveOverrideFlag = numRefIdxOverride,
         };
     }
 }
