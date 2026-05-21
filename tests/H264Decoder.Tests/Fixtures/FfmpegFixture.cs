@@ -33,6 +33,21 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 128x96 testsrc clip with horizontal shift: forces x264 to use
+    /// P_L0_16x16 with non-zero integer-pel motion vectors plus inter residuals.</summary>
+    public static Sample TwoFramesShifted128x96()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_shifted_128x96.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_shifted_128x96.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:d=0.5:r=2[a];testsrc=size={W}x{H}:d=0.5:r=2,crop=120:96:8:0,pad={W}:{H}:0:0[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            $"-pix_fmt yuv420p -c:v libx264 -profile:v baseline -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 0 -an -qp 5 -x264-params \"no-deblock=1\" -f h264 \"{h264}\"",
+            // Note: -vsync passthrough is critical — without it ffmpeg dup/drops frames to a default rate
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 16x16 red clip: I-frame + identical P-frame (all P_Skip).</summary>
     public static Sample TwoFramesIdentical16x16()
     {

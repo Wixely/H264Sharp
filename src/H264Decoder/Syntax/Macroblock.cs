@@ -47,4 +47,8 @@ public sealed class Macroblock
     /// <summary>Motion vector L0 in quarter-pixel units. (X, Y).</summary>
     public int MvL0X { get; set; }
     public int MvL0Y { get; set; }
+
+    /// <summary>Diagnostic: bit position in the slice RBSP where this MB's parsing started/ended.</summary>
+    public int ParseStartBit { get; set; }
+    public int ParseEndBit { get; set; }
 }

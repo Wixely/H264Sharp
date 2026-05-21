@@ -45,6 +45,7 @@ public static class MacroblockParser
         ref int qpYRunning)
     {
         _ = sps; // currently no SPS-dependent fields in I-slice MB layer
+        int startBit = reader.BitPosition;
         uint mbTypeCode = ExpGolomb.ReadUe(ref reader);
         bool isPSlice = sliceHeader.SliceType == SliceType.P;
         var type = isPSlice
@@ -59,6 +60,7 @@ public static class MacroblockParser
         {
             MbAddress = mbAddress,
             Type = type,
+            ParseStartBit = startBit,
         };
 
         // mb_pred
@@ -137,6 +139,7 @@ public static class MacroblockParser
             mb.QpY = qpYRunning;
         }
 
+        mb.ParseEndBit = reader.BitPosition;
         return mb;
     }
 
@@ -338,6 +341,33 @@ public static class MacroblockParser
         }
 
         return (Median3(A.x, B.x, C.x), Median3(A.y, B.y, C.y));
+    }
+
+    /// <summary>
+    /// Derive the L0 motion vector for a P_Skip macroblock per spec §8.4.1.1.
+    /// Returns (0,0) if either of the two needed neighbors (A=left, B=top) is
+    /// unavailable OR has refIdx==0 with mv==(0,0); otherwise returns the
+    /// regular 16x16 median MV prediction.
+    /// </summary>
+    public static (int X, int Y) DerivePSkipMv(
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        bool leftUnavailOrZero = leftMb is null
+            || leftMb.Type.PredMode != MbPartPredMode.PredL0
+            || (leftMb.RefIdxL0 == 0 && leftMb.MvL0X == 0 && leftMb.MvL0Y == 0);
+        bool topUnavailOrZero = topMb is null
+            || topMb.Type.PredMode != MbPartPredMode.PredL0
+            || (topMb.RefIdxL0 == 0 && topMb.MvL0X == 0 && topMb.MvL0Y == 0);
+
+        if (leftUnavailOrZero || topUnavailOrZero)
+        {
+            return (0, 0);
+        }
+
+        // Otherwise: use the same median predictor as P_L0_16x16, with a synthetic
+        // "current MB" whose refIdx == 0.
+        var synth = new Macroblock { RefIdxL0 = 0 };
+        return PredictMv16x16(synth, leftMb, topMb, topRightMb, topLeftMb);
     }
 
     private static int Median3(int a, int b, int c)

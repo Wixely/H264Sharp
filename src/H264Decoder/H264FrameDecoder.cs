@@ -131,11 +131,15 @@ public sealed class H264FrameDecoder
 
             if (isPSlice && mbSkipRun > 0)
             {
-                CopySkipMacroblockFromReference(picture, referencePicture!, mbX, mbY);
-                mbs[addr] = SkipPlaceholder(addr);
+                // P_Skip: derive MV per spec §8.4.1.1 from neighbors, then treat as
+                // P_L0_16x16 with refIdx=0 + that MV + zero residual.
+                (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
+                Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
+                mbs[addr] = skipMb;
+                MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, referencePicture);
                 mbSkipRun--;
                 addr++;
-                // After consuming the run, read mb_type for the next MB (unless we're done)
                 continue;
             }
 
@@ -196,15 +200,15 @@ public sealed class H264FrameDecoder
         }
     }
 
-    /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with MV=(0,0), refIdx=0.</summary>
-    private static Macroblock SkipPlaceholder(int addr) =>
+    /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.</summary>
+    private static Macroblock SkipPlaceholder(int addr, int mvX, int mvY) =>
         new()
         {
             MbAddress = addr,
             Type = new IntraMbType(0, MbPartPredMode.PredL0, default, 0, 0),
             RefIdxL0 = 0,
-            MvL0X = 0,
-            MvL0Y = 0,
+            MvL0X = mvX,
+            MvL0Y = mvY,
         };
 
     /// <summary>Advance the bit reader past the slice header (mirrors SliceHeader.Parse).</summary>
