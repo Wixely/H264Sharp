@@ -34,6 +34,7 @@ string[] wanted =
     "g_kuiTotalZerosTable11", "g_kuiTotalZerosTable12", "g_kuiTotalZerosTable13", "g_kuiTotalZerosTable14",
     "g_kuiZeroLeftTable0", "g_kuiZeroLeftTable1", "g_kuiZeroLeftTable2", "g_kuiZeroLeftTable3",
     "g_kuiZeroLeftTable4", "g_kuiZeroLeftTable5", "g_kuiZeroLeftTable6",
+    "g_kuiTotalZerosChromaTable0", "g_kuiTotalZerosChromaTable1", "g_kuiTotalZerosChromaTable2",
     "g_kuiTotalZerosBitNumMap",
     "g_kuiTotalZerosBitNumChromaMap",
     "g_kuiZeroLeftBitNumMap",

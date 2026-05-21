@@ -45,6 +45,45 @@ public ref struct BitReader
         return result;
     }
 
+    /// <summary>Peek the next <paramref name="n"/> bits MSB-first without advancing the cursor.
+    /// If fewer than n bits remain, the missing trailing bits are padded as zero —
+    /// matching the behavior of openh264's 32-bit read cache at end-of-buffer.</summary>
+    public uint PeekBits(int n)
+    {
+        if ((uint)n > 32u)
+        {
+            throw new ArgumentOutOfRangeException(nameof(n));
+        }
+        uint result = 0;
+        int pos = _bitPos;
+        int total = TotalBits;
+        for (int i = 0; i < n; i++)
+        {
+            if (pos < total)
+            {
+                int byteIndex = pos >> 3;
+                int bitInByte = 7 - (pos & 7);
+                result = (result << 1) | (uint)((_data[byteIndex] >> bitInByte) & 1);
+            }
+            else
+            {
+                result <<= 1;
+            }
+            pos++;
+        }
+        return result;
+    }
+
+    public void Skip(int n)
+    {
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n));
+        if (_bitPos + n > TotalBits)
+        {
+            throw new InvalidDataException("BitReader: skip past end of RBSP");
+        }
+        _bitPos += n;
+    }
+
     public void ByteAlign()
     {
         int rem = _bitPos & 7;

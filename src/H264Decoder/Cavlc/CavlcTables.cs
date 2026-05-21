@@ -209,6 +209,9 @@ internal static class CavlcTables
     public static readonly byte[] ZeroLeftTable4 = new byte[] { 5, 3, 4, 3, 3, 3, 2, 3, 1, 2, 1, 2, 0, 2, 0, 2 };
     public static readonly byte[] ZeroLeftTable5 = new byte[] { 1, 3, 2, 3, 4, 3, 3, 3, 6, 3, 5, 3, 0, 2, 0, 2 };
     public static readonly byte[] ZeroLeftTable6 = new byte[] { 7, 3, 6, 3, 5, 3, 4, 3, 3, 3, 2, 3, 1, 3, 0, 3 };
+    public static readonly byte[] TotalZerosChromaTable0 = new byte[] { 3, 3, 2, 3, 1, 2, 1, 2, 0, 1, 0, 1, 0, 1, 0, 1 };
+    public static readonly byte[] TotalZerosChromaTable1 = new byte[] { 2, 2, 1, 2, 0, 1, 0, 1 };
+    public static readonly byte[] TotalZerosChromaTable2 = new byte[] { 1, 1, 0, 1 };
     public static readonly byte[] TotalZerosBitNumMap = new byte[] { 9, 6, 6, 5, 5, 6, 6, 6, 6, 5, 4, 4, 3, 2, 1 };
     public static readonly byte[] TotalZerosBitNumChromaMap = new byte[] { 3, 2, 1 };
     public static readonly byte[] ZeroLeftBitNumMap = new byte[] { 0, 1, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 };
