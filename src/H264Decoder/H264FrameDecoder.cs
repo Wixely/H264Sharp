@@ -201,8 +201,9 @@ public sealed class H264FrameDecoder
     }
 
     /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.</summary>
-    private static Macroblock SkipPlaceholder(int addr, int mvX, int mvY) =>
-        new()
+    private static Macroblock SkipPlaceholder(int addr, int mvX, int mvY)
+    {
+        var mb = new Macroblock
         {
             MbAddress = addr,
             Type = new IntraMbType(0, MbPartPredMode.PredL0, default, 0, 0),
@@ -210,6 +211,11 @@ public sealed class H264FrameDecoder
             MvL0X = mvX,
             MvL0Y = mvY,
         };
+        for (int i = 0; i < 16; i++) { mb.MvL0XBlock[i] = mvX; mb.MvL0YBlock[i] = mvY; }
+        // RefIdxL08x8 left as zeros (correct for P_Skip).
+        mb.InterPartitions.Add(new MvPartition(0, 0, 16, 16, 0, mvX, mvY));
+        return mb;
+    }
 
     /// <summary>Advance the bit reader past the slice header (mirrors SliceHeader.Parse).</summary>
     private static void SkipSliceHeader(

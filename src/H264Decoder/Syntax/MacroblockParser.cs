@@ -82,24 +82,7 @@ public static class MacroblockParser
 
         if (type.PredMode == MbPartPredMode.PredL0)
         {
-            // ref_idx_l0: te(v) with max value = num_ref_idx_l0_active_minus1
-            uint maxRef = sliceHeader.NumRefIdxL0ActiveMinus1;
-            if (maxRef > 0)
-            {
-                mb.RefIdxL0 = (int)ExpGolomb.ReadTe(ref reader, maxRef);
-            }
-            else
-            {
-                mb.RefIdxL0 = 0;
-            }
-            int mvdX = ExpGolomb.ReadSe(ref reader);
-            int mvdY = ExpGolomb.ReadSe(ref reader);
-            // MV prediction: for P_L0_16x16 with only-skip neighbors or no neighbors,
-            // predicted MV is (0, 0). For the general case we compute the median over
-            // available L0 neighbor MVs (spec §8.4.1.3).
-            (int predX, int predY) = PredictMv16x16(mb, leftMb, topMb, topRightMb, topLeftMb);
-            mb.MvL0X = predX + mvdX;
-            mb.MvL0Y = predY + mvdY;
+            ParseInterMbPred(ref reader, mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
         }
         else
         {
@@ -352,22 +335,19 @@ public static class MacroblockParser
     public static (int X, int Y) DerivePSkipMv(
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
     {
-        bool leftUnavailOrZero = leftMb is null
-            || leftMb.Type.PredMode != MbPartPredMode.PredL0
-            || (leftMb.RefIdxL0 == 0 && leftMb.MvL0X == 0 && leftMb.MvL0Y == 0);
-        bool topUnavailOrZero = topMb is null
-            || topMb.Type.PredMode != MbPartPredMode.PredL0
-            || (topMb.RefIdxL0 == 0 && topMb.MvL0X == 0 && topMb.MvL0Y == 0);
+        // Look at the specific 4x4 neighbor blocks A (left, at (-1, 0)) and B (top, at (0, -1)).
+        var synth = new Macroblock();
+        var A = GetMvNeighbor(-1, 0, synth, leftMb, topMb, topRightMb, topLeftMb);
+        var B = GetMvNeighbor(0, -1, synth, leftMb, topMb, topRightMb, topLeftMb);
 
-        if (leftUnavailOrZero || topUnavailOrZero)
-        {
-            return (0, 0);
-        }
+        bool aUnavailOrZero = !A.Avail || (A.RefIdx == 0 && A.MvX == 0 && A.MvY == 0);
+        bool bUnavailOrZero = !B.Avail || (B.RefIdx == 0 && B.MvX == 0 && B.MvY == 0);
 
-        // Otherwise: use the same median predictor as P_L0_16x16, with a synthetic
-        // "current MB" whose refIdx == 0.
-        var synth = new Macroblock { RefIdxL0 = 0 };
-        return PredictMv16x16(synth, leftMb, topMb, topRightMb, topLeftMb);
+        if (aUnavailOrZero || bUnavailOrZero) return (0, 0);
+
+        // Otherwise: standard 16x16 median MV prediction with current refIdx = 0.
+        return PredictMvForPartition(synth, 0, 0, 0, 0, 4, 4, 0,
+            leftMb, topMb, topRightMb, topLeftMb);
     }
 
     private static int Median3(int a, int b, int c)
@@ -376,5 +356,272 @@ public static class MacroblockParser
         int min = Math.Min(a, Math.Min(b, c));
         int max = Math.Max(a, Math.Max(b, c));
         return a + b + c - min - max;
+    }
+
+    // -----------------------------------------------------------------
+    // Inter mb_pred / sub_mb_pred parsing (P_L0_16x16, 16x8, 8x16, 8x8)
+    // -----------------------------------------------------------------
+    private static void ParseInterMbPred(
+        ref BitReader reader, Macroblock mb, SliceHeader sliceHeader,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        int rawMbType = mb.Type.RawMbType;
+        bool isP8x8 = rawMbType == 3 || rawMbType == 4;
+        bool refIdxForcedZero = rawMbType == 4; // P_8x8ref0
+        uint maxRef = sliceHeader.NumRefIdxL0ActiveMinus1;
+
+        var subMbTypes = isP8x8 ? new SubMbType[4] : null;
+        if (isP8x8)
+        {
+            for (int i = 0; i < 4; i++)
+            {
+                uint code = ExpGolomb.ReadUe(ref reader);
+                if (code > 3) throw new InvalidDataException($"P sub_mb_type {code} out of range");
+                subMbTypes![i] = (SubMbType)code;
+            }
+        }
+
+        // Read ref_idx_l0
+        int[] refIdxPerQuadrant = new int[4]; // per 8x8 quadrant
+        if (rawMbType <= 2)
+        {
+            int numMbPart = IntraMbType.NumMbPart(rawMbType);
+            int[] partRefIdx = new int[numMbPart];
+            for (int p = 0; p < numMbPart; p++)
+            {
+                partRefIdx[p] = maxRef > 0 ? (int)ExpGolomb.ReadTe(ref reader, maxRef) : 0;
+            }
+            ReplicateRefIdxAcross16x16Partitions(rawMbType, partRefIdx, refIdxPerQuadrant);
+        }
+        else // P_8x8 / P_8x8ref0
+        {
+            for (int q = 0; q < 4; q++)
+            {
+                if (refIdxForcedZero) refIdxPerQuadrant[q] = 0;
+                else refIdxPerQuadrant[q] = maxRef > 0 ? (int)ExpGolomb.ReadTe(ref reader, maxRef) : 0;
+            }
+        }
+        for (int q = 0; q < 4; q++) mb.RefIdxL08x8[q] = refIdxPerQuadrant[q];
+
+        // Read mvds and apply MV prediction per partition.
+        if (rawMbType <= 2)
+        {
+            ParseInterMbPred_NoSubMb(ref reader, mb, rawMbType, refIdxPerQuadrant,
+                                     leftMb, topMb, topRightMb, topLeftMb);
+        }
+        else
+        {
+            ParseInterMbPred_P8x8(ref reader, mb, subMbTypes!, refIdxPerQuadrant,
+                                  leftMb, topMb, topRightMb, topLeftMb);
+        }
+
+        // Convenience scalars: take partition 0's values.
+        if (mb.InterPartitions.Count > 0)
+        {
+            var p0 = mb.InterPartitions[0];
+            mb.RefIdxL0 = p0.RefIdxL0;
+            mb.MvL0X = p0.MvL0X;
+            mb.MvL0Y = p0.MvL0Y;
+        }
+    }
+
+    /// <summary>Distribute the 1, 2, or 2 partition-refIdx values from mb_type 0/1/2 across the 4 8x8 quadrants.</summary>
+    private static void ReplicateRefIdxAcross16x16Partitions(int rawMbType, int[] partRefIdx, int[] perQuadrant)
+    {
+        switch (rawMbType)
+        {
+            case 0: // 16x16: 1 refIdx, all 4 quadrants
+                for (int q = 0; q < 4; q++) perQuadrant[q] = partRefIdx[0];
+                break;
+            case 1: // 16x8: refIdx[0]=top (q 0,1), refIdx[1]=bottom (q 2,3)
+                perQuadrant[0] = partRefIdx[0]; perQuadrant[1] = partRefIdx[0];
+                perQuadrant[2] = partRefIdx[1]; perQuadrant[3] = partRefIdx[1];
+                break;
+            case 2: // 8x16: refIdx[0]=left (q 0,2), refIdx[1]=right (q 1,3)
+                perQuadrant[0] = partRefIdx[0]; perQuadrant[2] = partRefIdx[0];
+                perQuadrant[1] = partRefIdx[1]; perQuadrant[3] = partRefIdx[1];
+                break;
+        }
+    }
+
+    private static void ParseInterMbPred_NoSubMb(
+        ref BitReader reader, Macroblock mb, int rawMbType, int[] refIdxPerQuadrant,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        // Partition layout (X, Y in pixels, W, H in pixels):
+        var partRects = rawMbType switch
+        {
+            0 => new[] { (X: 0, Y: 0, W: 16, H: 16) },
+            1 => new[] { (X: 0, Y: 0, W: 16, H: 8), (X: 0, Y: 8, W: 16, H: 8) },
+            2 => new[] { (X: 0, Y: 0, W: 8, H: 16), (X: 8, Y: 0, W: 8, H: 16) },
+            _ => throw new ArgumentOutOfRangeException(nameof(rawMbType)),
+        };
+
+        for (int p = 0; p < partRects.Length; p++)
+        {
+            int mvdX = ExpGolomb.ReadSe(ref reader);
+            int mvdY = ExpGolomb.ReadSe(ref reader);
+
+            // Refidx for this partition: the 8x8 quadrant that the partition's
+            // top-left 4x4 block lives in.
+            int curRefIdx = refIdxPerQuadrant[QuadrantOf(partRects[p].X / 4, partRects[p].Y / 4)];
+
+            (int predX, int predY) = PredictMvForPartition(
+                mb, rawMbType, p,
+                partRects[p].X / 4, partRects[p].Y / 4, partRects[p].W / 4, partRects[p].H / 4,
+                curRefIdx, leftMb, topMb, topRightMb, topLeftMb);
+
+            int mvX = predX + mvdX;
+            int mvY = predY + mvdY;
+
+            mb.InterPartitions.Add(new MvPartition(partRects[p].X, partRects[p].Y, partRects[p].W, partRects[p].H, curRefIdx, mvX, mvY));
+            FillBlockMvs(mb, partRects[p].X / 4, partRects[p].Y / 4, partRects[p].W / 4, partRects[p].H / 4, mvX, mvY);
+        }
+    }
+
+    private static void ParseInterMbPred_P8x8(
+        ref BitReader reader, Macroblock mb, SubMbType[] subMbTypes, int[] refIdxPerQuadrant,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        // 4 8x8 quadrants, raster: 0=TL, 1=TR, 2=BL, 3=BR
+        // Each 8x8 quadrant has its own sub_mb_type that further splits it.
+        for (int q = 0; q < 4; q++)
+        {
+            int qx = (q & 1) * 8;
+            int qy = (q >> 1) * 8;
+            var (subW, subH) = SubMbTypeOps.SubMbPartSize(subMbTypes[q]);
+            int numSubParts = SubMbTypeOps.NumSubMbPart(subMbTypes[q]);
+
+            for (int sp = 0; sp < numSubParts; sp++)
+            {
+                // Sub-partition layout within the 8x8 quadrant:
+                //   8x8: 1 part at (0,0)
+                //   8x4: 2 parts at (0,0) and (0,4)
+                //   4x8: 2 parts at (0,0) and (4,0)
+                //   4x4: 4 parts at (0,0), (4,0), (0,4), (4,4) (raster)
+                int spx, spy;
+                if (subW == 8 && subH == 8) { spx = 0; spy = 0; }
+                else if (subW == 8 && subH == 4) { spx = 0; spy = sp * 4; }
+                else if (subW == 4 && subH == 8) { spx = sp * 4; spy = 0; }
+                else { spx = (sp & 1) * 4; spy = (sp >> 1) * 4; }
+
+                int partX = qx + spx;
+                int partY = qy + spy;
+                int curRefIdx = refIdxPerQuadrant[q];
+
+                int mvdX = ExpGolomb.ReadSe(ref reader);
+                int mvdY = ExpGolomb.ReadSe(ref reader);
+
+                // 8x8 sub-partitions use standard median prediction (no 16x8/8x16 override).
+                (int predX, int predY) = PredictMvForPartition(
+                    mb, 0 /*sentinel: treat as standard median*/, 0,
+                    partX / 4, partY / 4, subW / 4, subH / 4,
+                    curRefIdx, leftMb, topMb, topRightMb, topLeftMb);
+
+                int mvX = predX + mvdX;
+                int mvY = predY + mvdY;
+
+                mb.InterPartitions.Add(new MvPartition(partX, partY, subW, subH, curRefIdx, mvX, mvY));
+                FillBlockMvs(mb, partX / 4, partY / 4, subW / 4, subH / 4, mvX, mvY);
+            }
+        }
+    }
+
+    private static int QuadrantOf(int bx, int by) => (bx >> 1) + (by >> 1) * 2;
+
+    private static void FillBlockMvs(Macroblock mb, int bx0, int by0, int bw, int bh, int mvX, int mvY)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+            {
+                int idx = _spatialToRaster[by * 4 + bx];
+                mb.MvL0XBlock[idx] = mvX;
+                mb.MvL0YBlock[idx] = mvY;
+            }
+    }
+
+    /// <summary>Compute the L0 MV prediction for a partition at (bx, by) of size (bwBlocks, bhBlocks) in 4x4-block units.</summary>
+    private static (int X, int Y) PredictMvForPartition(
+        Macroblock cur, int rawMbType, int partIdx,
+        int bx, int by, int bwBlocks, int bhBlocks, int curRefIdx,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        // Gather A (left), B (top), C (top-right of partition top-right block), D (top-left of partition top-left).
+        var A = GetMvNeighbor(bx - 1, by, cur, leftMb, topMb, topRightMb, topLeftMb);
+        var B = GetMvNeighbor(bx, by - 1, cur, leftMb, topMb, topRightMb, topLeftMb);
+        // C is at the position above-right of the partition's top-right 4x4 block.
+        int cBx = bx + bwBlocks;
+        int cBy = by - 1;
+        var C = GetMvNeighbor(cBx, cBy, cur, leftMb, topMb, topRightMb, topLeftMb);
+        // If C is not available, fall back to D (top-left).
+        if (!C.Avail)
+        {
+            C = GetMvNeighbor(bx - 1, by - 1, cur, leftMb, topMb, topRightMb, topLeftMb);
+        }
+
+        // Spec §8.4.1.3.1 partition-specific overrides:
+        if (rawMbType == 1) // 16x8
+        {
+            if (partIdx == 0 && B.Avail && B.RefIdx == curRefIdx) return (B.MvX, B.MvY);
+            if (partIdx == 1 && A.Avail && A.RefIdx == curRefIdx) return (A.MvX, A.MvY);
+        }
+        else if (rawMbType == 2) // 8x16
+        {
+            if (partIdx == 0 && A.Avail && A.RefIdx == curRefIdx) return (A.MvX, A.MvY);
+            if (partIdx == 1 && C.Avail && C.RefIdx == curRefIdx) return (C.MvX, C.MvY);
+        }
+
+        // Spec rule: if B and C both unavailable and A available, copy A into B, C.
+        if (!B.Avail && !C.Avail && A.Avail)
+        {
+            return (A.MvX, A.MvY);
+        }
+
+        // Otherwise standard median with substitution.
+        int aX = A.Avail ? A.MvX : 0, aY = A.Avail ? A.MvY : 0, aR = A.Avail ? A.RefIdx : -1;
+        int bX = B.Avail ? B.MvX : 0, bY = B.Avail ? B.MvY : 0, bR = B.Avail ? B.RefIdx : -1;
+        int cX = C.Avail ? C.MvX : 0, cY = C.Avail ? C.MvY : 0, cR = C.Avail ? C.RefIdx : -1;
+
+        int matchCount = (aR == curRefIdx ? 1 : 0) + (bR == curRefIdx ? 1 : 0) + (cR == curRefIdx ? 1 : 0);
+        if (matchCount == 1)
+        {
+            if (aR == curRefIdx) return (aX, aY);
+            if (bR == curRefIdx) return (bX, bY);
+            return (cX, cY);
+        }
+        return (Median3(aX, bX, cX), Median3(aY, bY, cY));
+    }
+
+    private readonly struct MvNeighbor
+    {
+        public readonly bool Avail;
+        public readonly int MvX, MvY, RefIdx;
+        public MvNeighbor(bool a, int x, int y, int r) { Avail = a; MvX = x; MvY = y; RefIdx = r; }
+    }
+
+    private static MvNeighbor GetMvNeighbor(
+        int bx, int by, Macroblock cur,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        // Resolve the MB containing the 4x4 block at (bx, by) (relative to current MB).
+        Macroblock? mb;
+        int nbBx, nbBy;
+        if (bx >= 0 && by >= 0 && bx <= 3 && by <= 3) { mb = cur; nbBx = bx; nbBy = by; }
+        else if (bx < 0 && by >= 0 && by <= 3) { mb = leftMb; nbBx = 3; nbBy = by; }
+        else if (by < 0 && bx >= 0 && bx <= 3) { mb = topMb; nbBx = bx; nbBy = 3; }
+        else if (bx < 0 && by < 0) { mb = topLeftMb; nbBx = 3; nbBy = 3; }
+        else if (bx > 3 && by < 0) { mb = topRightMb; nbBx = 0; nbBy = 3; }
+        else { mb = null; nbBx = 0; nbBy = 0; }
+
+        if (mb is null) return new MvNeighbor(false, 0, 0, -1);
+        if (mb.Type.PredMode != MbPartPredMode.PredL0)
+        {
+            // Intra neighbor: MV unavailable for prediction purposes (refIdx=-1).
+            return new MvNeighbor(true, 0, 0, -1);
+        }
+
+        int idx = _spatialToRaster[nbBy * 4 + nbBx];
+        int refIdx = mb.RefIdxL08x8[QuadrantOf(nbBx, nbBy)];
+        return new MvNeighbor(true, mb.MvL0XBlock[idx], mb.MvL0YBlock[idx], refIdx);
     }
 }

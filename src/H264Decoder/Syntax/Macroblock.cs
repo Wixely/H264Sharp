@@ -1,5 +1,10 @@
 namespace H264Decoder.Syntax;
 
+/// <summary>One motion partition within a P-slice MB. Pixel coordinates are MB-relative
+/// (X, Y in 0..15 and width/height in 4..16). MV is in quarter-pixel units.</summary>
+public readonly record struct MvPartition(int X, int Y, int Width, int Height, int RefIdxL0, int MvL0X, int MvL0Y);
+
+
 /// <summary>
 /// One parsed macroblock — fully decoded syntax + residual coefficients, but
 /// NOT yet inverse-transformed or reconstructed. Allocated fresh per MB.
@@ -41,12 +46,25 @@ public sealed class Macroblock
 
     // ---- P-slice inter fields (for P_L0_16x16 currently) ----
 
-    /// <summary>L0 reference index for inter MBs (P_L0_16x16). 0 for the default single-ref case.</summary>
+    /// <summary>Convenience: L0 reference index for the FIRST partition of inter MBs.</summary>
     public int RefIdxL0 { get; set; }
 
-    /// <summary>Motion vector L0 in quarter-pixel units. (X, Y).</summary>
+    /// <summary>Convenience: L0 motion vector of the FIRST partition, in quarter-pixel units.</summary>
     public int MvL0X { get; set; }
     public int MvL0Y { get; set; }
+
+    /// <summary>Per-4x4-block L0 motion vector (X, in quarter-pixel units). Raster scan order.
+    /// Same MV is replicated within a motion partition.</summary>
+    public int[] MvL0XBlock { get; } = new int[16];
+    public int[] MvL0YBlock { get; } = new int[16];
+
+    /// <summary>RefIdx per 8x8 quadrant (raster scan: 0=TL, 1=TR, 2=BL, 3=BR).
+    /// For mb_type 0/1/2 the refIdx is per partition; we replicate to per-quadrant.</summary>
+    public int[] RefIdxL08x8 { get; } = new int[4];
+
+    /// <summary>Motion partitions for this MB (list of (x, y, w, h, refIdx, mvX, mvY)).
+    /// One entry for P_L0_16x16, two for 16x8 / 8x16, up to sixteen for P_8x8 with 4x4 sub-blocks.</summary>
+    public List<MvPartition> InterPartitions { get; set; } = new();
 
     /// <summary>Diagnostic: bit position in the slice RBSP where this MB's parsing started/ended.</summary>
     public int ParseStartBit { get; set; }

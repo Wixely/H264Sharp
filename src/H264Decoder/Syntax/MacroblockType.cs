@@ -25,8 +25,7 @@ public enum IntraChromaPredMode
 }
 
 /// <summary>
-/// Decoded I-slice mb_type (spec Table 7-11). For mb_type values 1..24 the
-/// type encodes (Intra_16x16 prediction mode, CBP luma, CBP chroma) jointly.
+/// Decoded mb_type (spec Table 7-11 for I-slice, 7-13 for P-slice).
 /// </summary>
 public readonly record struct IntraMbType(
     int RawMbType,
@@ -36,28 +35,44 @@ public readonly record struct IntraMbType(
     int CbpChroma)
 {
     /// <summary>
-    /// P-slice mb_type decoding (spec Table 7-13). Returns the mapped type plus,
-    /// for P_L0_16x16 (mb_type=0), the PredL0 partition. For mb_type values >= 5
-    /// in a P-slice, they encode I-slice types (with offset 5).
+    /// P-slice mb_type decoding (spec Table 7-13). Values 0..4 are inter partition
+    /// configurations; 5..30 are intra MB types with offset 5; 31 is I_PCM.
     /// </summary>
     public static IntraMbType FromPSliceCodeword(uint mbType)
     {
-        // Table 7-13: 0=P_L0_16x16, 1=P_L0_L0_16x8, 2=P_L0_L0_8x16, 3=P_8x8, 4=P_8x8ref0
-        if (mbType == 0)
+        if (mbType <= 4)
         {
             return new IntraMbType((int)mbType, MbPartPredMode.PredL0, default, 0, 0);
         }
-        if (mbType >= 1 && mbType <= 4)
-        {
-            throw new NotSupportedException($"P-slice mb_type {mbType} (multi-partition) not yet supported");
-        }
         if (mbType >= 5 && mbType <= 30)
         {
-            // Intra MB inside P-slice — offset is 5.
             return FromISliceCodeword(mbType - 5);
         }
         throw new InvalidDataException($"P-slice mb_type {mbType} out of range");
     }
+
+    /// <summary>For inter P mb_types, returns the number of motion partitions (1, 2, 2, 4, 4).</summary>
+    public static int NumMbPart(int rawPMbType) => rawPMbType switch
+    {
+        0 => 1,
+        1 => 2,
+        2 => 2,
+        3 => 4,
+        4 => 4,
+        _ => throw new ArgumentOutOfRangeException(nameof(rawPMbType)),
+    };
+
+    /// <summary>Pixel size of one motion partition for mb_type 0..2. For mb_type 3/4 the
+    /// partition is 8x8 and further split by sub_mb_type.</summary>
+    public static (int Width, int Height) MbPartSize(int rawPMbType) => rawPMbType switch
+    {
+        0 => (16, 16),
+        1 => (16, 8),
+        2 => (8, 16),
+        3 => (8, 8),
+        4 => (8, 8),
+        _ => throw new ArgumentOutOfRangeException(nameof(rawPMbType)),
+    };
 
     public static IntraMbType FromISliceCodeword(uint mbType)
     {
@@ -74,16 +89,6 @@ public readonly record struct IntraMbType(
             throw new InvalidDataException($"I-slice mb_type {mbType} out of range");
         }
 
-        // Entries 1..24 are six groups of four:
-        //   group g = (mbType - 1) / 4
-        //   pred  p = (mbType - 1) % 4    -> Intra16x16PredMode
-        // group  CbpLuma  CbpChroma
-        //   0     0        0
-        //   1     0        1
-        //   2     0        2
-        //   3     15       0
-        //   4     15       1
-        //   5     15       2
         int g = ((int)mbType - 1) / 4;
         int p = ((int)mbType - 1) % 4;
         (int cbpLuma, int cbpChroma) = g switch
@@ -99,4 +104,33 @@ public readonly record struct IntraMbType(
         return new IntraMbType((int)mbType, MbPartPredMode.Intra16x16,
             (Intra16x16PredMode)p, cbpLuma, cbpChroma);
     }
+}
+
+public enum SubMbType
+{
+    PL0_8x8 = 0,
+    PL0_8x4 = 1,
+    PL0_4x8 = 2,
+    PL0_4x4 = 3,
+}
+
+public static class SubMbTypeOps
+{
+    public static int NumSubMbPart(SubMbType t) => t switch
+    {
+        SubMbType.PL0_8x8 => 1,
+        SubMbType.PL0_8x4 => 2,
+        SubMbType.PL0_4x8 => 2,
+        SubMbType.PL0_4x4 => 4,
+        _ => throw new ArgumentOutOfRangeException(nameof(t)),
+    };
+
+    public static (int Width, int Height) SubMbPartSize(SubMbType t) => t switch
+    {
+        SubMbType.PL0_8x8 => (8, 8),
+        SubMbType.PL0_8x4 => (8, 4),
+        SubMbType.PL0_4x8 => (4, 8),
+        SubMbType.PL0_4x4 => (4, 4),
+        _ => throw new ArgumentOutOfRangeException(nameof(t)),
+    };
 }

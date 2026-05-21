@@ -332,16 +332,26 @@ internal static class MacroblockReconstructor
         return true;
     }
 
-    // ---------------- Luma (PredL0 / P_L0_16x16) ----------------
+    // ---------------- Luma (PredL0, all P partition shapes) ----------------
     private static void ReconstructLumaInterP16x16(
         Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY)
     {
+        // Build the 16x16 prediction by running MC for each motion partition.
         Span<byte> predBlock = stackalloc byte[256];
-        MotionCompensation.LumaPredict(
-            refPic.Y, refPic.Width, refPic.Height,
-            mbX * 16, mbY * 16,
-            mb.MvL0X, mb.MvL0Y,
-            16, 16, predBlock);
+        Span<byte> partPred = stackalloc byte[256]; // worst case 16x16
+        foreach (var part in mb.InterPartitions)
+        {
+            int n = part.Width * part.Height;
+            Span<byte> partOut = partPred[..n];
+            MotionCompensation.LumaPredict(
+                refPic.Y, refPic.Width, refPic.Height,
+                mbX * 16 + part.X, mbY * 16 + part.Y,
+                part.MvL0X, part.MvL0Y,
+                part.Width, part.Height, partOut);
+            for (int yy = 0; yy < part.Height; yy++)
+                for (int xx = 0; xx < part.Width; xx++)
+                    predBlock[(part.Y + yy) * 16 + (part.X + xx)] = partOut[yy * part.Width + xx];
+        }
 
         // Now add residual per 4x4 block (CBP-gated, full 16-coeff blocks).
         Span<int> coeffsScan = stackalloc int[16];
@@ -398,6 +408,7 @@ internal static class MacroblockReconstructor
         Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY, int qPc)
     {
         Span<byte> predBlock = stackalloc byte[64];
+        Span<byte> partPred = stackalloc byte[64];
         Span<int> dc = stackalloc int[4];
         Span<int> coeffsScan = stackalloc int[16];
         Span<int> coeffsRaster = stackalloc int[16];
@@ -407,11 +418,24 @@ internal static class MacroblockReconstructor
             byte[] refPlane = comp == 0 ? refPic.U : refPic.V;
             byte[] plane = comp == 0 ? picture.U : picture.V;
             int stride = picture.ChromaWidth;
-            MotionCompensation.ChromaPredict(
-                refPlane, refPic.ChromaWidth, refPic.ChromaHeight,
-                mbX * 8, mbY * 8,
-                mb.MvL0X, mb.MvL0Y,
-                8, 8, predBlock);
+            // For each motion partition, do chroma MC on the corresponding 8x8 region scaled to half size.
+            foreach (var part in mb.InterPartitions)
+            {
+                int cx = part.X / 2;
+                int cy = part.Y / 2;
+                int cw = part.Width / 2;
+                int ch = part.Height / 2;
+                int n = cw * ch;
+                Span<byte> partOut = partPred[..n];
+                MotionCompensation.ChromaPredict(
+                    refPlane, refPic.ChromaWidth, refPic.ChromaHeight,
+                    mbX * 8 + cx, mbY * 8 + cy,
+                    part.MvL0X, part.MvL0Y,
+                    cw, ch, partOut);
+                for (int yy = 0; yy < ch; yy++)
+                    for (int xx = 0; xx < cw; xx++)
+                        predBlock[(cy + yy) * 8 + (cx + xx)] = partOut[yy * cw + xx];
+            }
 
             dc.Clear();
             if ((mb.CbpChroma & 3) != 0)
