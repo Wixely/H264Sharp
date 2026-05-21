@@ -5,6 +5,157 @@ namespace H264Decoder.Tests.Prediction;
 
 public sealed class IntraPredictionTests
 {
+    // ----- Intra_8x8 -----
+    [Fact]
+    public void I8x8_Filter_AllConstantNeighbors_RemainsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 128;
+        for (int i = 0; i < 8; i++) left[i] = 128;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(
+            top, true, true, left, true, 128, true,
+            ft, fl, out byte ftl);
+        for (int i = 0; i < 16; i++) Assert.Equal(128, ft[i]);
+        for (int i = 0; i < 8; i++) Assert.Equal(128, fl[i]);
+        Assert.Equal(128, ftl);
+    }
+
+    [Fact]
+    public void I8x8_DC_NoNeighbors_Returns128()
+    {
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.Dc,
+            ft, false, fl, false, 0, false, output);
+        foreach (byte b in output) Assert.Equal(128, b);
+    }
+
+    [Fact]
+    public void I8x8_DC_All128Neighbors_Returns128()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 128;
+        for (int i = 0; i < 8; i++) left[i] = 128;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, true, 128, true, ft, fl, out byte ftl);
+
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.Dc,
+            ft, true, fl, true, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(128, b);
+    }
+
+    [Fact]
+    public void I8x8_Vertical_All77Top_Returns77Everywhere()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 77;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, false, 77, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.Vertical,
+            ft, true, fl, false, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(77, b);
+    }
+
+    [Fact]
+    public void I8x8_Horizontal_All55Left_Returns55Everywhere()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 8; i++) left[i] = 55;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, false, false, left, true, 55, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.Horizontal,
+            ft, false, fl, true, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(55, b);
+    }
+
+    [Fact]
+    public void I8x8_DiagDownLeft_AllConstantTop_ReturnsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 100;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, false, 100, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.DiagDownLeft,
+            ft, true, fl, false, ftl, false, output);
+        foreach (byte b in output) Assert.Equal(100, b);
+    }
+
+    [Fact]
+    public void I8x8_DiagDownRight_AllConstantNeighbors_ReturnsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 80;
+        for (int i = 0; i < 8; i++) left[i] = 80;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, true, 80, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.DiagDownRight,
+            ft, true, fl, true, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(80, b);
+    }
+
+    [Fact]
+    public void I8x8_VerticalLeft_AllConstantTop_ReturnsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 90;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, false, 90, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.VerticalLeft,
+            ft, true, fl, false, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(90, b);
+    }
+
+    [Fact]
+    public void I8x8_VR_HD_HU_AreStubbed_Throw()
+    {
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        byte[] ftArr = ft.ToArray();
+        byte[] flArr = fl.ToArray();
+        var output = new byte[64];
+        Assert.Throws<NotSupportedException>(() =>
+            IntraPrediction.PredictIntra8x8(
+                IntraPrediction.Intra8x8Mode.VerticalRight,
+                ftArr, true, flArr, true, (byte)0, true, output));
+        Assert.Throws<NotSupportedException>(() =>
+            IntraPrediction.PredictIntra8x8(
+                IntraPrediction.Intra8x8Mode.HorizontalDown,
+                ftArr, true, flArr, true, (byte)0, true, output));
+        Assert.Throws<NotSupportedException>(() =>
+            IntraPrediction.PredictIntra8x8(
+                IntraPrediction.Intra8x8Mode.HorizontalUp,
+                ftArr, true, flArr, true, (byte)0, true, output));
+    }
+
     // ----- Intra_16x16 -----
     [Fact]
     public void I16_DC_NoNeighbors_Returns128()

@@ -318,6 +318,205 @@ public static class IntraPrediction
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Intra_8x8 (spec §8.3.2) — 9 modes, with mandatory 3-tap low-pass filter on neighbors.
+    // ---------------------------------------------------------------------
+    public enum Intra8x8Mode
+    {
+        Vertical = 0,
+        Horizontal = 1,
+        Dc = 2,
+        DiagDownLeft = 3,
+        DiagDownRight = 4,
+        VerticalRight = 5,
+        HorizontalDown = 6,
+        VerticalLeft = 7,
+        HorizontalUp = 8,
+    }
+
+    /// <summary>
+    /// Reference-sample filter for Intra_8x8 prediction (spec §8.3.2.2.1). Applies a 3-tap
+    /// [1,2,1]/4 low-pass over the 16 top samples, 8 left samples, and the corner sample,
+    /// with edge handling per spec equations 8-78..8-83.
+    /// </summary>
+    /// <param name="top">Up to 16 unfiltered top samples (top[0..7] required if topAvail; top[8..15] is top-right).</param>
+    /// <param name="left">8 unfiltered left samples.</param>
+    /// <param name="topLeft">Unfiltered corner sample.</param>
+    /// <param name="topAvail">True if top row neighbors exist.</param>
+    /// <param name="topRightAvail">True if top-right 8 samples exist (otherwise top[8..15] = top[7]).</param>
+    /// <param name="leftAvail">True if left column neighbors exist.</param>
+    /// <param name="topLeftAvail">True if corner exists.</param>
+    /// <param name="outTop">16 filtered top samples.</param>
+    /// <param name="outLeft">8 filtered left samples.</param>
+    /// <param name="outTopLeft">Filtered corner sample.</param>
+    public static void Intra8x8PredFilter(
+        ReadOnlySpan<byte> top, bool topAvail, bool topRightAvail,
+        ReadOnlySpan<byte> left, bool leftAvail,
+        byte topLeft, bool topLeftAvail,
+        Span<byte> outTop, Span<byte> outLeft, out byte outTopLeft)
+    {
+        // Build unfiltered 16-sample top row, substituting top[7] when top-right is unavailable.
+        Span<byte> t = stackalloc byte[16];
+        if (topAvail)
+        {
+            for (int i = 0; i < 8; i++) t[i] = top[i];
+            if (topRightAvail) for (int i = 0; i < 8; i++) t[8 + i] = top[8 + i];
+            else { byte fill = t[7]; for (int i = 8; i < 16; i++) t[i] = fill; }
+        }
+
+        // Filtered top row (16 samples).
+        if (topAvail)
+        {
+            // x = 0
+            if (topLeftAvail) outTop[0] = (byte)((topLeft + 2 * t[0] + t[1] + 2) >> 2);
+            else outTop[0] = (byte)((3 * t[0] + t[1] + 2) >> 2);
+            // x = 1..14
+            for (int x = 1; x <= 14; x++)
+                outTop[x] = (byte)((t[x - 1] + 2 * t[x] + t[x + 1] + 2) >> 2);
+            // x = 15
+            outTop[15] = (byte)((t[14] + 3 * t[15] + 2) >> 2);
+        }
+
+        // Filtered left column (8 samples).
+        if (leftAvail)
+        {
+            if (topLeftAvail) outLeft[0] = (byte)((topLeft + 2 * left[0] + left[1] + 2) >> 2);
+            else outLeft[0] = (byte)((3 * left[0] + left[1] + 2) >> 2);
+            for (int y = 1; y <= 6; y++)
+                outLeft[y] = (byte)((left[y - 1] + 2 * left[y] + left[y + 1] + 2) >> 2);
+            outLeft[7] = (byte)((left[6] + 3 * left[7] + 2) >> 2);
+        }
+
+        // Filtered corner.
+        if (topLeftAvail)
+        {
+            if (topAvail && leftAvail)
+                outTopLeft = (byte)((t[0] + 2 * topLeft + left[0] + 2) >> 2);
+            else if (topAvail)
+                outTopLeft = (byte)((t[0] + 3 * topLeft + 2) >> 2);
+            else if (leftAvail)
+                outTopLeft = (byte)((left[0] + 3 * topLeft + 2) >> 2);
+            else
+                outTopLeft = topLeft;
+        }
+        else
+        {
+            outTopLeft = 0;
+        }
+    }
+
+    /// <summary>
+    /// Intra_8x8 prediction (spec §8.3.2). Neighbors must already be filtered via
+    /// <see cref="Intra8x8PredFilter"/>. Output is 64 samples in raster order.
+    /// </summary>
+    public static void PredictIntra8x8(
+        Intra8x8Mode mode,
+        ReadOnlySpan<byte> filteredTop, bool topAvail,
+        ReadOnlySpan<byte> filteredLeft, bool leftAvail,
+        byte filteredTopLeft, bool topLeftAvail,
+        Span<byte> output)
+    {
+        switch (mode)
+        {
+            case Intra8x8Mode.Vertical:
+                if (!topAvail) throw new InvalidDataException("Intra_8x8 V: top not available");
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++)
+                        output[y * 8 + x] = filteredTop[x];
+                break;
+
+            case Intra8x8Mode.Horizontal:
+                if (!leftAvail) throw new InvalidDataException("Intra_8x8 H: left not available");
+                for (int y = 0; y < 8; y++)
+                    for (int x = 0; x < 8; x++)
+                        output[y * 8 + x] = filteredLeft[y];
+                break;
+
+            case Intra8x8Mode.Dc:
+                {
+                    int sum = 0, count = 0;
+                    if (topAvail) { for (int i = 0; i < 8; i++) sum += filteredTop[i]; count += 8; }
+                    if (leftAvail) { for (int i = 0; i < 8; i++) sum += filteredLeft[i]; count += 8; }
+                    byte dc = count == 0 ? (byte)128 :
+                              count == 16 ? (byte)((sum + 8) >> 4) :
+                                            (byte)((sum + 4) >> 3);
+                    output.Fill(dc);
+                    break;
+                }
+
+            case Intra8x8Mode.DiagDownLeft:
+                {
+                    if (!topAvail) throw new InvalidDataException("Intra_8x8 DDL: top not available");
+                    for (int y = 0; y < 8; y++)
+                        for (int x = 0; x < 8; x++)
+                        {
+                            int v;
+                            if (x == 7 && y == 7)
+                                v = (filteredTop[14] + 3 * filteredTop[15] + 2) >> 2;
+                            else
+                                v = (filteredTop[x + y] + 2 * filteredTop[x + y + 1] + filteredTop[x + y + 2] + 2) >> 2;
+                            output[y * 8 + x] = (byte)v;
+                        }
+                    break;
+                }
+
+            case Intra8x8Mode.DiagDownRight:
+                {
+                    if (!topAvail || !leftAvail || !topLeftAvail)
+                        throw new InvalidDataException("Intra_8x8 DDR: neighbors not available");
+                    for (int y = 0; y < 8; y++)
+                        for (int x = 0; x < 8; x++)
+                        {
+                            int v;
+                            if (x > y)
+                            {
+                                int z = x - y;
+                                int s0 = z >= 2 ? filteredTop[z - 2] : (int)filteredTopLeft;
+                                int s1 = z >= 1 ? filteredTop[z - 1] : (int)filteredTopLeft;
+                                v = (s0 + 2 * s1 + filteredTop[z] + 2) >> 2;
+                            }
+                            else if (x < y)
+                            {
+                                int z = y - x;
+                                int s0 = z >= 2 ? filteredLeft[z - 2] : (int)filteredTopLeft;
+                                int s1 = z >= 1 ? filteredLeft[z - 1] : (int)filteredTopLeft;
+                                v = (s0 + 2 * s1 + filteredLeft[z] + 2) >> 2;
+                            }
+                            else
+                            {
+                                v = (filteredTop[0] + 2 * filteredTopLeft + filteredLeft[0] + 2) >> 2;
+                            }
+                            output[y * 8 + x] = (byte)v;
+                        }
+                    break;
+                }
+
+            case Intra8x8Mode.VerticalLeft:
+                {
+                    if (!topAvail) throw new InvalidDataException("Intra_8x8 VL: top not available");
+                    // Spec eq 8-115/8-116. y even -> 2-tap, y odd -> 3-tap. Top index 0..14 needed.
+                    for (int y = 0; y < 8; y++)
+                        for (int x = 0; x < 8; x++)
+                        {
+                            int k = x + (y >> 1);
+                            int v = (y & 1) == 0
+                                ? (filteredTop[k] + filteredTop[k + 1] + 1) >> 1
+                                : (filteredTop[k] + 2 * filteredTop[k + 1] + filteredTop[k + 2] + 2) >> 2;
+                            output[y * 8 + x] = (byte)v;
+                        }
+                    break;
+                }
+
+            case Intra8x8Mode.VerticalRight:
+            case Intra8x8Mode.HorizontalDown:
+            case Intra8x8Mode.HorizontalUp:
+                // VR/HD/HU modes are non-trivial (zVR/zHD position-classified per spec eq 8-104..8-119).
+                // Stubbed to avoid shipping subtly wrong code; will be filled in alongside Stage 4 when
+                // there is an end-to-end byte-exact fixture to validate against.
+                throw new NotSupportedException($"Intra_8x8 mode {mode} not yet implemented (stage 4)");
+        }
+    }
+
     /// <summary>
     /// Port of OpenH264's table-driven Intra_4x4 prediction for the
     /// diagonal/oblique modes (VR, HD, VL, HU). Each computes a small list

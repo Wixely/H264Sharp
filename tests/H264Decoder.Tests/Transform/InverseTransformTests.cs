@@ -41,6 +41,69 @@ public sealed class InverseTransformTests
     }
 
     [Fact]
+    public void Inverse8x8_AllZero_IsZero()
+    {
+        Span<int> b = stackalloc int[64];
+        InverseTransform.Inverse8x8(b);
+        foreach (int v in b) Assert.Equal(0, v);
+    }
+
+    [Fact]
+    public void Inverse8x8_PureDc64_Yields1()
+    {
+        // DC=64: row pass produces 64 across all 8 row entries; col pass produces 64 again,
+        // then (64+32)>>6 = 1 per sample (analogous to the 4x4 DC=64 -> 1 round-trip).
+        Span<int> b = stackalloc int[64];
+        b[0] = 64;
+        InverseTransform.Inverse8x8(b);
+        foreach (int v in b) Assert.Equal(1, v);
+    }
+
+    [Fact]
+    public void Inverse8x8_PureDc4096_Yields64()
+    {
+        // 4096 = 64*64, the magnitude needed for output exactly 64 everywhere.
+        Span<int> b = stackalloc int[64];
+        b[0] = 4096;
+        InverseTransform.Inverse8x8(b);
+        foreach (int v in b) Assert.Equal(64, v);
+    }
+
+    [Fact]
+    public void Inverse8x8_OffDcCoeffsSymmetric()
+    {
+        // Sanity: any single non-DC coefficient should produce a non-constant output that
+        // sums (approximately) to zero — the basis functions are zero-mean.
+        Span<int> b = stackalloc int[64];
+        b[1] = 4096;
+        InverseTransform.Inverse8x8(b);
+        long sum = 0;
+        foreach (int v in b) sum += v;
+        // Allow small bias from the +32 rounding term over 64 samples.
+        Assert.InRange(sum, -64, 64);
+    }
+
+    [Fact]
+    public void Dequant8x8_DcAtQpZero_AppliesFirstScale()
+    {
+        Span<int> c = stackalloc int[64];
+        c[0] = 1;
+        Quantization.Dequant8x8(c, 0);
+        // normAdjust8x8[0][0] = 20, shift qP/6 = 0.
+        Assert.Equal(20, c[0]);
+    }
+
+    [Fact]
+    public void Dequant8x8_QpShifts()
+    {
+        Span<int> c = stackalloc int[64];
+        c[0] = 1;
+        Quantization.Dequant8x8(c, 6);
+        // m=0, shift=1 -> 20*1<<1 = 40
+        Assert.Equal(40, c[0]);
+    }
+
+    [Fact]
     public void InverseHadamard2x2_Sample()
     {
         Span<int> b = stackalloc int[4];

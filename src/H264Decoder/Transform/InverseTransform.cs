@@ -97,6 +97,60 @@ public static class InverseTransform
         }
     }
 
+    /// <summary>
+    /// Inverse 8x8 integer transform (spec §8.5.10.2). Operates in place on a 64-entry
+    /// block in raster order: 1-D inverse applied to each row then each column.
+    /// Final shift (+32)&gt;&gt;6 applied after the column pass.
+    /// </summary>
+    public static void Inverse8x8(Span<int> b)
+    {
+        Span<int> tmp = stackalloc int[64];
+
+        for (int i = 0; i < 8; i++) Row8(b.Slice(i * 8, 8), tmp.Slice(i * 8, 8));
+
+        Span<int> col = stackalloc int[8];
+        Span<int> outCol = stackalloc int[8];
+        for (int j = 0; j < 8; j++)
+        {
+            for (int k = 0; k < 8; k++) col[k] = tmp[k * 8 + j];
+            Row8(col, outCol);
+            for (int k = 0; k < 8; k++) b[k * 8 + j] = (outCol[k] + 32) >> 6;
+        }
+    }
+
+    // 1-D 8-point inverse transform (spec §8.5.10.2 equations 8-338..8-345).
+    private static void Row8(ReadOnlySpan<int> c, Span<int> o)
+    {
+        int c0 = c[0], c1 = c[1], c2 = c[2], c3 = c[3], c4 = c[4], c5 = c[5], c6 = c[6], c7 = c[7];
+
+        int h0 = c0 + c4;
+        int h1 = -c3 + c5 - c7 - (c7 >> 1);
+        int h2 = c0 - c4;
+        int h3 = c1 + c7 - c3 - (c3 >> 1);
+        int h4 = (c2 >> 1) - c6;
+        int h5 = -c1 + c7 + c5 + (c5 >> 1);
+        int h6 = c2 + (c6 >> 1);
+        int h7 = c3 + c5 + c1 + (c1 >> 1);
+
+        int k0 = h0 + h6;
+        int k1 = h1 + (h7 >> 2);
+        int k2 = h2 + h4;
+        int k3 = h3 + (h5 >> 2);
+        int k4 = h2 - h4;
+        int k5 = (h3 >> 2) - h5;
+        int k6 = h0 - h6;
+        int k7 = h7 - (h1 >> 2);
+
+        o[0] = k0 + k7;
+        o[1] = k2 + k5;
+        o[2] = k4 + k3;
+        o[3] = k6 + k1;
+        o[4] = k6 - k1;
+        o[5] = k4 - k3;
+        o[6] = k2 - k5;
+        o[7] = k0 - k7;
+    }
+
     /// <summary>Inverse 2x2 Hadamard for chroma DC (spec §8.5.11.1). Block layout: [TL, TR, BL, BR].</summary>
     public static void InverseHadamard2x2(Span<int> b)
     {
