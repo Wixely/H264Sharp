@@ -396,15 +396,24 @@ internal static class MacroblockReconstructor
         if (bx < 0)
         {
             if (leftMb is null) return -1;
-            // Neighbor MB's right column of 8x8 blocks (bx=1 in that MB).
-            if (leftMb.Type.PredMode != MbPartPredMode.Intra4x4 || !leftMb.TransformSize8x8) return 2;
-            return leftMb.Intra8x8Mode[by * 2 + 1];
+            if (leftMb.Type.PredMode != MbPartPredMode.Intra4x4) return 2;
+            if (leftMb.TransformSize8x8)
+            {
+                return leftMb.Intra8x8Mode[by * 2 + 1];
+            }
+            // Neighbor uses Intra_4x4: use the 4x4 block at (3, by*2) of the left MB
+            // (the upper-right 4x4 within the corresponding left 8x8 block).
+            return leftMb.Intra4x4Mode[MacroblockParser.SpatialToRaster(3, by * 2)];
         }
         if (by < 0)
         {
             if (topMb is null) return -1;
-            if (topMb.Type.PredMode != MbPartPredMode.Intra4x4 || !topMb.TransformSize8x8) return 2;
-            return topMb.Intra8x8Mode[1 * 2 + bx];
+            if (topMb.Type.PredMode != MbPartPredMode.Intra4x4) return 2;
+            if (topMb.TransformSize8x8)
+            {
+                return topMb.Intra8x8Mode[1 * 2 + bx];
+            }
+            return topMb.Intra4x4Mode[MacroblockParser.SpatialToRaster(bx * 2, 3)];
         }
         return -1;
     }
@@ -439,12 +448,24 @@ internal static class MacroblockReconstructor
         {
             if (leftMb is null) return -1;
             if (leftMb.Type.PredMode != MbPartPredMode.Intra4x4) return 2;
+            if (leftMb.TransformSize8x8)
+            {
+                // Neighbor is Intra_8x8: use the 8x8-block mode of the block containing
+                // the corresponding 4x4 position. Spec §8.3.1.1.
+                // 4x4 (bx=3, by) lies in 8x8 block at (1, by>>1).
+                return leftMb.Intra8x8Mode[(by >> 1) * 2 + 1];
+            }
             return leftMb.Intra4x4Mode[MacroblockParser.SpatialToRaster(3, by)];
         }
         if (by < 0)
         {
             if (topMb is null) return -1;
             if (topMb.Type.PredMode != MbPartPredMode.Intra4x4) return 2;
+            if (topMb.TransformSize8x8)
+            {
+                // 4x4 (bx, by=3) lies in 8x8 block at (bx>>1, 1).
+                return topMb.Intra8x8Mode[1 * 2 + (bx >> 1)];
+            }
             return topMb.Intra4x4Mode[MacroblockParser.SpatialToRaster(bx, 3)];
         }
         _ = isLeft;

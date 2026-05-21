@@ -368,7 +368,7 @@ public sealed class SingleFrameDecodeTests
         }
     }
 
-    [Fact(Skip = "Stage 4 CAVLC 8x8 residual: Dequant8x8 now implements the spec §8.5.12.2 two-branch formula (qP<36 round/right-shift and qP>=36 left-shift, with LevelScale8x8 = normAdjust8x8 * 16). Inverse8x8 keeps spec-correct terminal (+32)>>6. Luma maxErr improved 119 -> 82. Remaining 80-unit error is not from Dequant8x8 or Inverse8x8 in isolation — verified inverse 1-D against JM/x264 reference, Unzigzag8x8 against spec Figure 8-10. Errors accumulate row-by-row and column-by-column through intra prediction, peaking at MB(4,5)=82. Suspects: (a) NeighborIntra8x8Mode currently returns DC for any 4x4-transform neighbor MB — spec §8.3.1.1 wants the corresponding 4x4-block Intra4x4 mode; (b) deblocking strong-filter for 8x8 internal edges may differ from 4x4 case; (c) some subtle filter-tap edge case in Intra8x8 VR/HD around block boundaries. Math fix is locked in; further investigation needs ffmpeg first-MB sample diff.")]
+    [Fact]
     public void DecodeMandelbrot128x96HighCavlc8x8_Intra8x8()
     {
         // High-profile CAVLC clip with PPS.transform_8x8_mode_flag=1 and partitions=i8x8 —
@@ -380,6 +380,7 @@ public sealed class SingleFrameDecodeTests
         byte[] reference = File.ReadAllBytes(sample.YuvPath);
         int yLen = sample.Width * sample.Height;
         int cLen = yLen / 4;
+
 
         int maxY = 0;
         for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[i]));
