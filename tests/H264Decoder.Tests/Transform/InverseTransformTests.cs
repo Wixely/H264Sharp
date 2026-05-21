@@ -89,8 +89,8 @@ public sealed class InverseTransformTests
         Span<int> c = stackalloc int[64];
         c[0] = 1;
         Quantization.Dequant8x8(c, 0);
-        // normAdjust8x8[0][0] = 20, shift qP/6 = 0.
-        Assert.Equal(20, c[0]);
+        // Spec §8.5.12.2, qP<36 branch: (1 * 20 * 16 + (1<<5)) >> 6 = 352 >> 6 = 5.
+        Assert.Equal(5, c[0]);
     }
 
     [Fact]
@@ -99,8 +99,28 @@ public sealed class InverseTransformTests
         Span<int> c = stackalloc int[64];
         c[0] = 1;
         Quantization.Dequant8x8(c, 6);
-        // m=0, shift=1 -> 20*1<<1 = 40
-        Assert.Equal(40, c[0]);
+        // qP<36 branch: (1 * 20 * 16 + (1<<4)) >> 5 = 336 >> 5 = 10.
+        Assert.Equal(10, c[0]);
+    }
+
+    [Fact]
+    public void Dequant8x8_QpAt36_PureLeftShift()
+    {
+        Span<int> c = stackalloc int[64];
+        c[0] = 1;
+        Quantization.Dequant8x8(c, 36);
+        // qP>=36 branch with qP/6=6, shift=0: 1 * 20 * 16 << 0 = 320.
+        Assert.Equal(320, c[0]);
+    }
+
+    [Fact]
+    public void Dequant8x8_QpAbove36_AppliesLeftShift()
+    {
+        Span<int> c = stackalloc int[64];
+        c[0] = 1;
+        Quantization.Dequant8x8(c, 42);
+        // qP>=36, qP/6=7, shift=1: 1 * 20 * 16 << 1 = 640.
+        Assert.Equal(640, c[0]);
     }
 
     [Fact]

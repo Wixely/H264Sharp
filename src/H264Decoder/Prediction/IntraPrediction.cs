@@ -665,15 +665,15 @@ public static class IntraPrediction
         // zHU >= 15:
         int pp = fl[7];
 
-        // Output:
-        // Row 0: aa  i  bb  j  cc  k  dd  l
-        // Row 1: bb  j  cc  k  dd  l  ee  m
-        // Row 2: cc  k  dd  l  ee  m  ff  n
-        // Row 3: dd  l  ee  m  ff  n  gg oo
-        // Row 4: ee  m  ff  n  gg oo  pp pp
-        // Row 5: ff  n  gg oo  pp pp  pp pp
-        // Row 6: gg oo  pp pp  pp pp  pp pp
-        // Row 7: pp pp  pp pp  pp pp  pp pp
+        // Output by zHU = x + 2*y: 0,2,..,12 -> 2-tap; 1,3,..,11 -> 3-tap; 13 -> oo; >=14 -> pp.
+        // Row 0: zHU=0,1,2,3,4,5,6,7   -> aa  i bb  j cc  k dd  l
+        // Row 1: zHU=2..9              -> bb  j cc  k dd  l ee  m
+        // Row 2: zHU=4..11             -> cc  k dd  l ee  m ff  n
+        // Row 3: zHU=6..13             -> dd  l ee  m ff  n gg oo
+        // Row 4: zHU=8..15             -> ee  m ff  n gg oo pp pp
+        // Row 5: zHU=10..17            -> ff  n gg oo pp pp pp pp
+        // Row 6: zHU=12..19            -> gg oo pp pp pp pp pp pp
+        // Row 7: zHU=14..21            -> pp pp pp pp pp pp pp pp
         int[] row = {
             aa, i, bb, j, cc, k, dd, l,
             bb, j, cc, k, dd, l, ee, m,

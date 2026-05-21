@@ -405,7 +405,7 @@ internal static class CavlcResidual
                 else
                 {
                     int extraZeros = ReadLevelPrefix(ref reader);
-                    run = extraZeros + 6;
+                    run = extraZeros + 7;
                     if (run > zerosLeft)
                     {
                         throw new InvalidDataException("CAVLC: run_before > zerosLeft");

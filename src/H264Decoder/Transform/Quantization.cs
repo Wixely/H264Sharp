@@ -130,18 +130,34 @@ internal static class Quantization
     };
 
     /// <summary>
-    /// 8x8 dequantization (spec §8.5.12.2 step 1). LevelScale8x8 = normAdjust8x8(qP%6, i, j).
-    /// Final coefficient = level * LevelScale8x8 &lt;&lt; (qP/6) when qP/6 &gt;= 0 (always true).
-    /// Operates in place on a 64-entry block in raster order.
+    /// 8x8 dequantization (spec §8.5.12.2). With flat scaling list (default),
+    /// LevelScale8x8(qP%6,i,j) = normAdjust8x8 * 16. Two branches:
+    ///   qP &gt;= 36:  dcoeff = (c * LevelScale8x8) &lt;&lt; (qP/6 - 6)
+    ///   qP &lt;  36:  dcoeff = (c * LevelScale8x8 + (1 &lt;&lt; (5 - qP/6))) &gt;&gt; (6 - qP/6)
+    /// Output is in spec dcoeff domain; the inverse 8x8 transform applies the terminal &gt;&gt;6.
     /// </summary>
     public static void Dequant8x8(scoped Span<int> coeffs, int qP)
     {
         int m = qP % 6;
-        int shift = qP / 6;
+        int qpDiv6 = qP / 6;
         int[] na = _normAdjust8x8[m];
-        for (int idx = 0; idx < 64; idx++)
+        if (qP >= 36)
         {
-            coeffs[idx] = (coeffs[idx] * na[idx]) << shift;
+            int shift = qpDiv6 - 6;
+            for (int idx = 0; idx < 64; idx++)
+            {
+                // LevelScale8x8 = na * 16, fold the *16 with the left shift.
+                coeffs[idx] = (coeffs[idx] * na[idx]) << (shift + 4);
+            }
+        }
+        else
+        {
+            int shift = 6 - qpDiv6;
+            int round = 1 << (5 - qpDiv6);
+            for (int idx = 0; idx < 64; idx++)
+            {
+                coeffs[idx] = (coeffs[idx] * na[idx] * 16 + round) >> shift;
+            }
         }
     }
 
