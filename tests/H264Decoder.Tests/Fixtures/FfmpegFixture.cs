@@ -79,6 +79,19 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Same content as TwoFramesAllPartitions128x96 but muxed into an MP4 container.</summary>
+    public static Sample TwoFramesAllPartitionsMp4()
+    {
+        const int W = 128, H = 96;
+        string mp4 = Path.Combine(SamplesDirectory, "two_frames_all_parts_128x96.mp4");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_all_parts_128x96_mp4.yuv");
+        EnsureGenerated(mp4, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:d=0.5:r=2[a];testsrc=size={W}x{H}:d=0.5:r=2,gblur=sigma=0.5[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            $"-pix_fmt yuv420p -c:v libx264 -profile:v baseline -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 0 -an -qp 8 -x264-params \"no-deblock=1:subme=8:partitions=all\" -movflags +faststart \"{mp4}\"",
+            $"-y -i \"{mp4}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(mp4, yuv, W, H);
+    }
+
     /// <summary>Two-frame 16x16 red clip: I-frame + identical P-frame (all P_Skip).</summary>
     public static Sample TwoFramesIdentical16x16()
     {

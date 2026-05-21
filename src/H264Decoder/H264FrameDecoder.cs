@@ -11,26 +11,35 @@ public sealed class H264FrameDecoder
     public Macroblock[]? LastMacroblocks { get; private set; }
 
     /// <summary>
-    /// Decode the first I-frame from a byte stream. Accepts either Annex-B
-    /// (start-code framed) or AVCC (4-byte length prefixed). The framing is
-    /// auto-detected: a leading zero byte indicates Annex-B; anything else is
-    /// treated as AVCC.
+    /// Decode the first I-frame from a byte stream. Auto-detects the framing:
+    /// MP4 container, AVCC (length-prefixed), or Annex-B (start-code framed).
     /// </summary>
-    public DecodedPicture DecodeFirstIFrame(ReadOnlySpan<byte> bytes)
-    {
-        List<NalUnit> nals = LooksLikeAnnexB(bytes)
-            ? AnnexBReader.SplitNalUnits(bytes)
-            : AvccReader.SplitNalUnits(bytes);
-        return DecodeFirstIFrame(nals);
-    }
+    public DecodedPicture DecodeFirstIFrame(ReadOnlySpan<byte> bytes) =>
+        DecodeFirstIFrame(SplitToNalUnits(bytes));
 
     /// <summary>Decode all frames in the stream in decode order.</summary>
-    public List<DecodedPicture> DecodeAllFrames(ReadOnlySpan<byte> bytes)
+    public List<DecodedPicture> DecodeAllFrames(ReadOnlySpan<byte> bytes) =>
+        DecodeAllFrames(SplitToNalUnits(bytes));
+
+    private static List<NalUnit> SplitToNalUnits(ReadOnlySpan<byte> bytes)
     {
-        List<NalUnit> nals = LooksLikeAnnexB(bytes)
-            ? AnnexBReader.SplitNalUnits(bytes)
-            : AvccReader.SplitNalUnits(bytes);
-        return DecodeAllFrames(nals);
+        if (LooksLikeMp4(bytes)) return Mp4Reader.ExtractH264NalUnits(bytes);
+        if (LooksLikeAnnexB(bytes)) return AnnexBReader.SplitNalUnits(bytes);
+        return AvccReader.SplitNalUnits(bytes);
+    }
+
+    /// <summary>Detects MP4: bytes 4..7 are a well-known top-level box type.</summary>
+    private static bool LooksLikeMp4(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.Length < 8) return false;
+        // First 4 bytes are a size. Bytes 4-7 are the type fourcc.
+        ReadOnlySpan<byte> ty = bytes.Slice(4, 4);
+        // Common top-level types: ftyp, moov, mdat, free, skip, wide
+        return Match(ty, "ftyp") || Match(ty, "moov") || Match(ty, "mdat")
+            || Match(ty, "free") || Match(ty, "skip") || Match(ty, "wide");
+
+        static bool Match(ReadOnlySpan<byte> a, string b) =>
+            a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
     }
 
     /// <summary>Detects Annex-B framing by looking for a leading zero byte (start code).</summary>
