@@ -336,15 +336,23 @@ internal static class MacroblockReconstructor
     private static void ReconstructLumaInterP16x16(
         Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY)
     {
-        // NOTE: P_L0_16x16 with non-zero MV needs proper MV-prediction (spec §8.4.1.3
-        // median over A/B/C with refIdx-equality rules + 16x8/8x16 overrides). The
-        // current implementation gives wrong results vs ffmpeg for non-skip MVs.
-        // Until that's fixed, we only handle MV=(0,0) (which matches the P_Skip path).
+        // MV is in 1/4 pixel units. Integer-pel only at this stage.
+        if ((mb.MvL0X & 3) != 0 || (mb.MvL0Y & 3) != 0)
+        {
+            throw new NotSupportedException(
+                $"sub-pel luma MC not yet implemented (MV=({mb.MvL0X}, {mb.MvL0Y}) in 1/4-pel units)");
+        }
+        // KNOWN ISSUE: non-zero MV reconstruction passes the parser but produces incorrect
+        // output for some MBs. Likely bit-alignment drift in inter residual CAVLC (e.g. MB
+        // with mixed CbpLuma). Investigated 2026: parsing of mvd is correct (verified by
+        // hand-tracing bytes 0x9A 39 58 43 FF FC for the 2f_nodb fixture's MB(0,0)), and
+        // MV prediction is now spec-compliant median over A/B/C, but reconstruction still
+        // diverges from ffmpeg at MB(1,1). Keeping the guard until the alignment bug is
+        // located.
         if (mb.MvL0X != 0 || mb.MvL0Y != 0)
         {
             throw new NotSupportedException(
-                $"P_L0_16x16 with non-zero MV ({mb.MvL0X}, {mb.MvL0Y}) not yet implemented; " +
-                "needs median MV prediction over A/B/C neighbors (spec §8.4.1.3)");
+                $"P_L0_16x16 non-zero MV ({mb.MvL0X}, {mb.MvL0Y}): reconstruction not yet correct");
         }
         int dx = mb.MvL0X >> 2;
         int dy = mb.MvL0Y >> 2;
@@ -406,11 +414,11 @@ internal static class MacroblockReconstructor
     private static void ReconstructChromaInter(
         Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY, int qPc)
     {
-        // Same restriction as luma: only MV=(0,0) is supported at this scaffolding stage.
+        // Same guard as luma: only MV=(0,0) is verified correct right now.
         if (mb.MvL0X != 0 || mb.MvL0Y != 0)
         {
             throw new NotSupportedException(
-                $"P inter chroma with non-zero MV not yet implemented");
+                $"P chroma non-zero MV not yet implemented (see luma comment)");
         }
         int cdx = mb.MvL0X >> 3;
         int cdy = mb.MvL0Y >> 3;

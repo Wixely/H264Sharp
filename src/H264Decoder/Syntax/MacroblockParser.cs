@@ -39,6 +39,8 @@ public static class MacroblockParser
         SliceHeader sliceHeader,
         Macroblock? leftMb,
         Macroblock? topMb,
+        Macroblock? topRightMb,
+        Macroblock? topLeftMb,
         int mbAddress,
         ref int qpYRunning)
     {
@@ -93,7 +95,7 @@ public static class MacroblockParser
             // MV prediction: for P_L0_16x16 with only-skip neighbors or no neighbors,
             // predicted MV is (0, 0). For the general case we compute the median over
             // available L0 neighbor MVs (spec §8.4.1.3).
-            (int predX, int predY) = PredictMv16x16(mb, leftMb, topMb);
+            (int predX, int predY) = PredictMv16x16(mb, leftMb, topMb, topRightMb, topLeftMb);
             mb.MvL0X = predX + mvdX;
             mb.MvL0Y = predY + mvdY;
         }
@@ -284,31 +286,65 @@ public static class MacroblockParser
     }
 
     /// <summary>
-    /// Predict the L0 motion vector for a P_L0_16x16 partition. Simplified version
-    /// of spec §8.4.1.3: when only one of A/B/C is available, use it directly; if
-    /// none, use (0,0); otherwise median over A/B/C. For now we treat any neighbor
-    /// MB that is not also an inter-coded P_L0_16x16 (including intra and skip) as
-    /// "ref mismatch" → MV(0,0) per spec.
+    /// Predict the L0 motion vector for a P_L0_16x16 partition (spec §8.4.1.3.1).
+    /// Median over neighbors A (left), B (top), C (top-right). Unavailable neighbors
+    /// substitute mv=(0,0) and refIdx=-1. The top-right C falls back to top-left D
+    /// when C is unavailable. A neighbor MB that is not inter-coded is treated as
+    /// "ref mismatch" (refIdx differs from current's 0, contributing mv=(0,0) but
+    /// with mismatched refIdx).
     /// </summary>
-    private static (int X, int Y) PredictMv16x16(Macroblock cur, Macroblock? leftMb, Macroblock? topMb)
+    private static (int X, int Y) PredictMv16x16(
+        Macroblock cur,
+        Macroblock? leftMb,    // A
+        Macroblock? topMb,     // B
+        Macroblock? topRightMb,// C
+        Macroblock? topLeftMb) // D (fallback for C)
     {
         _ = cur;
-        (int mvX, int mvY) leftMv = leftMb is not null && leftMb.Type.PredMode == MbPartPredMode.PredL0
-            ? (leftMb.MvL0X, leftMb.MvL0Y)
-            : (0, 0);
-        (int mvX, int mvY) topMv = topMb is not null && topMb.Type.PredMode == MbPartPredMode.PredL0
-            ? (topMb.MvL0X, topMb.MvL0Y)
-            : (0, 0);
-        // Without left or top available (e.g. corner MB), the predicted MV is (0,0).
-        if (leftMb is null && topMb is null) return (0, 0);
-        // Two-neighbor (no top-right available here) median degenerates to averaging-ish;
-        // spec uses median(A,B,C). For the simple case where one of them is missing we
-        // pass through the other.
-        if (leftMb is null) return topMv;
-        if (topMb is null) return leftMv;
-        // With both present (no top-right tracked yet), use a simple median over (A,B) — for
-        // accurate spec behaviour the third tap (top-right or top-left) is needed; we'll
-        // refine when that branch is exercised by a test.
-        return ((leftMv.mvX + topMv.mvX) / 2, (leftMv.mvY + topMv.mvY) / 2);
+        // Effective C: top-right if available, else top-left.
+        Macroblock? cMb = topRightMb ?? topLeftMb;
+
+        bool aAvail = leftMb is not null;
+        bool bAvail = topMb is not null;
+        bool cAvail = cMb is not null;
+
+        // Spec rule: if B and C are unavailable but A is available, copy A into B and C.
+        if (!bAvail && !cAvail && aAvail)
+        {
+            return (leftMb!.MvL0X, leftMb.MvL0Y);
+        }
+
+        // Per spec, a neighbor that is unavailable OR intra-coded gets mv=(0,0), refIdx=-1.
+        (int x, int y, int refIdx) A = aAvail && leftMb!.Type.PredMode == MbPartPredMode.PredL0
+            ? (leftMb.MvL0X, leftMb.MvL0Y, leftMb.RefIdxL0)
+            : (0, 0, -1);
+        (int x, int y, int refIdx) B = bAvail && topMb!.Type.PredMode == MbPartPredMode.PredL0
+            ? (topMb.MvL0X, topMb.MvL0Y, topMb.RefIdxL0)
+            : (0, 0, -1);
+        (int x, int y, int refIdx) C = cAvail && cMb!.Type.PredMode == MbPartPredMode.PredL0
+            ? (cMb.MvL0X, cMb.MvL0Y, cMb.RefIdxL0)
+            : (0, 0, -1);
+
+        int curRefIdx = cur.RefIdxL0;
+        int matchCount = (A.refIdx == curRefIdx ? 1 : 0)
+                       + (B.refIdx == curRefIdx ? 1 : 0)
+                       + (C.refIdx == curRefIdx ? 1 : 0);
+
+        if (matchCount == 1)
+        {
+            if (A.refIdx == curRefIdx) return (A.x, A.y);
+            if (B.refIdx == curRefIdx) return (B.x, B.y);
+            return (C.x, C.y);
+        }
+
+        return (Median3(A.x, B.x, C.x), Median3(A.y, B.y, C.y));
+    }
+
+    private static int Median3(int a, int b, int c)
+    {
+        // Median of three values.
+        int min = Math.Min(a, Math.Min(b, c));
+        int max = Math.Max(a, Math.Max(b, c));
+        return a + b + c - min - max;
     }
 }

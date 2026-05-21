@@ -30,7 +30,7 @@ public sealed class MacroblockParserTests
 
         Macroblock mb = MacroblockParser.Parse(
             ref slice, sps, pps, hdr,
-            leftMb: null, topMb: null,
+            leftMb: null, topMb: null, topRightMb: null, topLeftMb: null,
             mbAddress: mbAddress, qpYRunning: ref qpY);
 
         Assert.Equal(MbPartPredMode.Intra16x16, mb.Type.PredMode);

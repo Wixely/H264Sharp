@@ -125,6 +125,9 @@ public sealed class H264FrameDecoder
             Macroblock? topRightMb = (mbY > 0 && mbX + 1 < mbsPerRow)
                 ? mbs[addr - mbsPerRow + 1]
                 : null;
+            Macroblock? topLeftMb = (mbY > 0 && mbX > 0)
+                ? mbs[addr - mbsPerRow - 1]
+                : null;
 
             if (isPSlice && mbSkipRun > 0)
             {
@@ -138,7 +141,7 @@ public sealed class H264FrameDecoder
 
             Macroblock mb = MacroblockParser.Parse(
                 ref reader, sps, pps, header,
-                leftMb, topMb, addr, ref qpY);
+                leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY);
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
