@@ -6,3 +6,4 @@ tests/H264Decoder.Tests/Fixtures/Samples/
 *.yuv
 *.h264
 !tests/**/Samples/.gitkeep
+tmp_v/

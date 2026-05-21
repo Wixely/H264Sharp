@@ -34,6 +34,9 @@ public sealed class SequenceParameterSet
 
     public required bool VuiParametersPresentFlag { get; init; }
 
+    /// <summary>VUI subset that affects display / colour conversion (spec §E.1.1). Null when VuiParametersPresentFlag is false.</summary>
+    public VuiParameters? Vui { get; init; }
+
     // Derived (chroma_format_idc defaults to 1 for Baseline -> 4:2:0; bit depth defaults to 8)
     public uint ChromaFormatIdc => 1;
     public uint BitDepthY => 8;
@@ -109,7 +112,7 @@ public sealed class SequenceParameterSet
             cropB = ExpGolomb.ReadUe(ref r);
         }
         bool vui = r.ReadBit() == 1;
-        // We deliberately do not parse VUI — not needed for sample reconstruction.
+        VuiParameters? vuiParams = vui ? VuiParameters.Parse(ref r) : null;
 
         return new SequenceParameterSet
         {
@@ -135,6 +138,7 @@ public sealed class SequenceParameterSet
             FrameCropTopOffset = cropT,
             FrameCropBottomOffset = cropB,
             VuiParametersPresentFlag = vui,
+            Vui = vuiParams,
         };
     }
 }
