@@ -128,21 +128,12 @@ public sealed class H264FrameDecoder
 
             if (isPSlice && mbSkipRun > 0)
             {
-                // P_Skip: copy from reference picture at MV(0,0). MV prediction for
-                // skip is zero when either neighbor is missing or has refIdx/MV=0;
-                // for our minimum case we cover only the all-(0,0)-MV scenario and
-                // throw otherwise.
                 CopySkipMacroblockFromReference(picture, referencePicture!, mbX, mbY);
                 mbs[addr] = SkipPlaceholder(addr);
                 mbSkipRun--;
                 addr++;
+                // After consuming the run, read mb_type for the next MB (unless we're done)
                 continue;
-            }
-
-            if (isPSlice)
-            {
-                throw new NotSupportedException(
-                    "non-skip P-slice macroblocks not yet supported (only P_Skip in this phase)");
             }
 
             Macroblock mb = MacroblockParser.Parse(
@@ -151,9 +142,15 @@ public sealed class H264FrameDecoder
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb);
+                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, referencePicture);
 
             addr++;
+
+            // In CAVLC P-slices, after each non-skipped MB we read another mb_skip_run.
+            if (isPSlice && addr < totalMbs)
+            {
+                mbSkipRun = (int)ExpGolomb.ReadUe(ref reader);
+            }
         }
 
         if (header.DisableDeblockingFilterIdc != 1 && !isPSlice)
@@ -196,12 +193,15 @@ public sealed class H264FrameDecoder
         }
     }
 
-    /// <summary>Placeholder Macroblock for tracking that this addr was a skip (for neighbor lookups).</summary>
+    /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with MV=(0,0), refIdx=0.</summary>
     private static Macroblock SkipPlaceholder(int addr) =>
         new()
         {
             MbAddress = addr,
-            Type = new IntraMbType(0, MbPartPredMode.Intra16x16, default, 0, 0), // sentinel
+            Type = new IntraMbType(0, MbPartPredMode.PredL0, default, 0, 0),
+            RefIdxL0 = 0,
+            MvL0X = 0,
+            MvL0Y = 0,
         };
 
     /// <summary>Advance the bit reader past the slice header (mirrors SliceHeader.Parse).</summary>

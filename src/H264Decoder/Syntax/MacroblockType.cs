@@ -5,6 +5,7 @@ public enum MbPartPredMode
     Intra4x4,
     Intra16x16,
     IPcm,
+    PredL0,       // single 16x16 inter partition, L0 reference
 }
 
 public enum Intra16x16PredMode
@@ -34,6 +35,30 @@ public readonly record struct IntraMbType(
     int CbpLuma,
     int CbpChroma)
 {
+    /// <summary>
+    /// P-slice mb_type decoding (spec Table 7-13). Returns the mapped type plus,
+    /// for P_L0_16x16 (mb_type=0), the PredL0 partition. For mb_type values >= 5
+    /// in a P-slice, they encode I-slice types (with offset 5).
+    /// </summary>
+    public static IntraMbType FromPSliceCodeword(uint mbType)
+    {
+        // Table 7-13: 0=P_L0_16x16, 1=P_L0_L0_16x8, 2=P_L0_L0_8x16, 3=P_8x8, 4=P_8x8ref0
+        if (mbType == 0)
+        {
+            return new IntraMbType((int)mbType, MbPartPredMode.PredL0, default, 0, 0);
+        }
+        if (mbType >= 1 && mbType <= 4)
+        {
+            throw new NotSupportedException($"P-slice mb_type {mbType} (multi-partition) not yet supported");
+        }
+        if (mbType >= 5 && mbType <= 30)
+        {
+            // Intra MB inside P-slice — offset is 5.
+            return FromISliceCodeword(mbType - 5);
+        }
+        throw new InvalidDataException($"P-slice mb_type {mbType} out of range");
+    }
+
     public static IntraMbType FromISliceCodeword(uint mbType)
     {
         if (mbType == 0)

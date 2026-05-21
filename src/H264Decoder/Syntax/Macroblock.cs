@@ -38,4 +38,13 @@ public sealed class Macroblock
 
     /// <summary>Per-block chroma AC non-zero count.</summary>
     public int[,] NonZeroCountChromaAc { get; } = new int[2, 4];
+
+    // ---- P-slice inter fields (for P_L0_16x16 currently) ----
+
+    /// <summary>L0 reference index for inter MBs (P_L0_16x16). 0 for the default single-ref case.</summary>
+    public int RefIdxL0 { get; set; }
+
+    /// <summary>Motion vector L0 in quarter-pixel units. (X, Y).</summary>
+    public int MvL0X { get; set; }
+    public int MvL0Y { get; set; }
 }

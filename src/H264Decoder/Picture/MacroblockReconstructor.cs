@@ -34,7 +34,8 @@ internal static class MacroblockReconstructor
         int chromaQpIndexOffset,
         Macroblock? leftMb,
         Macroblock? topMb,
-        Macroblock? topRightMb)
+        Macroblock? topRightMb,
+        DecodedPicture? referencePicture = null)
     {
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
         {
@@ -44,13 +45,28 @@ internal static class MacroblockReconstructor
         {
             ReconstructLumaIntra4x4(mb, picture, mbX, mbY, leftMb, topMb, topRightMb);
         }
+        else if (mb.Type.PredMode == MbPartPredMode.PredL0)
+        {
+            if (referencePicture is null)
+                throw new InvalidOperationException("PredL0 reconstruction requires a reference picture");
+            ReconstructLumaInterP16x16(mb, picture, referencePicture, mbX, mbY);
+        }
         else
         {
             throw new NotSupportedException($"MacroblockReconstructor: PredMode {mb.Type.PredMode} not supported");
         }
 
         int qPc = ChromaQp(mb.QpY, chromaQpIndexOffset);
-        ReconstructChroma(mb, picture, mbX, mbY, qPc);
+        if (mb.Type.PredMode == MbPartPredMode.PredL0)
+        {
+            if (referencePicture is null)
+                throw new InvalidOperationException("PredL0 chroma reconstruction requires a reference picture");
+            ReconstructChromaInter(mb, picture, referencePicture, mbX, mbY, qPc);
+        }
+        else
+        {
+            ReconstructChroma(mb, picture, mbX, mbY, qPc);
+        }
     }
 
     // ---------------- Luma (Intra_16x16) ----------------
@@ -314,6 +330,162 @@ internal static class MacroblockReconstructor
 
         // Otherwise the TR block is within the same MB and already decoded.
         return true;
+    }
+
+    // ---------------- Luma (PredL0 / P_L0_16x16) ----------------
+    private static void ReconstructLumaInterP16x16(
+        Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY)
+    {
+        // NOTE: P_L0_16x16 with non-zero MV needs proper MV-prediction (spec §8.4.1.3
+        // median over A/B/C with refIdx-equality rules + 16x8/8x16 overrides). The
+        // current implementation gives wrong results vs ffmpeg for non-skip MVs.
+        // Until that's fixed, we only handle MV=(0,0) (which matches the P_Skip path).
+        if (mb.MvL0X != 0 || mb.MvL0Y != 0)
+        {
+            throw new NotSupportedException(
+                $"P_L0_16x16 with non-zero MV ({mb.MvL0X}, {mb.MvL0Y}) not yet implemented; " +
+                "needs median MV prediction over A/B/C neighbors (spec §8.4.1.3)");
+        }
+        int dx = mb.MvL0X >> 2;
+        int dy = mb.MvL0Y >> 2;
+
+        Span<byte> predBlock = stackalloc byte[256];
+        CopyLumaWithEdgeReplication(refPic, mbX * 16 + dx, mbY * 16 + dy, predBlock);
+
+        // Now add residual per 4x4 block (CBP-gated, full 16-coeff blocks).
+        Span<int> coeffsScan = stackalloc int[16];
+        Span<int> coeffsRaster = stackalloc int[16];
+
+        for (int i = 0; i < 16; i++)
+        {
+            (int bx, int by) = MacroblockParser.LumaBlockPos[i];
+            int px0 = mbX * 16 + bx * 4;
+            int py0 = mbY * 16 + by * 4;
+
+            bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+            if (coded)
+            {
+                for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
+                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
+                InverseTransform.Inverse4x4(coeffsRaster);
+            }
+            else
+            {
+                coeffsRaster.Clear();
+            }
+
+            for (int yy = 0; yy < 4; yy++)
+                for (int xx = 0; xx < 4; xx++)
+                {
+                    int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
+                    int v = pred + coeffsRaster[yy * 4 + xx];
+                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                }
+        }
+    }
+
+    /// <summary>Copy 16x16 luma block from reference picture starting at (srcX, srcY) using edge replication for off-picture samples.</summary>
+    private static void CopyLumaWithEdgeReplication(DecodedPicture src, int srcX, int srcY, Span<byte> dst16x16)
+    {
+        int W = src.Width, H = src.Height;
+        for (int yy = 0; yy < 16; yy++)
+        {
+            int yy2 = srcY + yy;
+            if (yy2 < 0) yy2 = 0; else if (yy2 >= H) yy2 = H - 1;
+            for (int xx = 0; xx < 16; xx++)
+            {
+                int xx2 = srcX + xx;
+                if (xx2 < 0) xx2 = 0; else if (xx2 >= W) xx2 = W - 1;
+                dst16x16[yy * 16 + xx] = src.Y[yy2 * W + xx2];
+            }
+        }
+    }
+
+    /// <summary>Reconstruct chroma for an inter MB. Chroma MV is derived from luma MV.</summary>
+    private static void ReconstructChromaInter(
+        Macroblock mb, DecodedPicture picture, DecodedPicture refPic, int mbX, int mbY, int qPc)
+    {
+        // Same restriction as luma: only MV=(0,0) is supported at this scaffolding stage.
+        if (mb.MvL0X != 0 || mb.MvL0Y != 0)
+        {
+            throw new NotSupportedException(
+                $"P inter chroma with non-zero MV not yet implemented");
+        }
+        int cdx = mb.MvL0X >> 3;
+        int cdy = mb.MvL0Y >> 3;
+
+        Span<byte> predBlock = stackalloc byte[64];
+        Span<int> dc = stackalloc int[4];
+        Span<int> coeffsScan = stackalloc int[16];
+        Span<int> coeffsRaster = stackalloc int[16];
+
+        for (int comp = 0; comp < 2; comp++)
+        {
+            byte[] refPlane = comp == 0 ? refPic.U : refPic.V;
+            byte[] plane = comp == 0 ? picture.U : picture.V;
+            int stride = picture.ChromaWidth;
+            int srcXBase = mbX * 8 + cdx;
+            int srcYBase = mbY * 8 + cdy;
+            CopyChromaWithEdgeReplication(refPlane, refPic.ChromaWidth, refPic.ChromaHeight,
+                                          srcXBase, srcYBase, predBlock);
+
+            dc.Clear();
+            if ((mb.CbpChroma & 3) != 0)
+            {
+                for (int k = 0; k < 4; k++) dc[k] = mb.ChromaDc[comp, k];
+            }
+            InverseTransform.InverseHadamard2x2(dc);
+            Quantization.DequantChromaDc(dc, qPc);
+
+            for (int b = 0; b < 4; b++)
+            {
+                int subX = b & 1;
+                int subY = (b >> 1) & 1;
+                int dcValue = dc[subY * 2 + subX];
+                bool acCoded = (mb.CbpChroma & 2) != 0;
+                coeffsScan[0] = dcValue;
+                if (acCoded)
+                {
+                    for (int k = 0; k < 15; k++) coeffsScan[k + 1] = mb.ChromaAc[comp, b, k];
+                }
+                else
+                {
+                    for (int k = 1; k < 16; k++) coeffsScan[k] = 0;
+                }
+                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                int dcSaved = coeffsRaster[0];
+                coeffsRaster[0] = 0;
+                Quantization.Dequant4x4Ac(coeffsRaster, qPc);
+                coeffsRaster[0] = dcSaved;
+                InverseTransform.Inverse4x4(coeffsRaster);
+
+                int px0 = mbX * 8 + subX * 4;
+                int py0 = mbY * 8 + subY * 4;
+                for (int yy = 0; yy < 4; yy++)
+                    for (int xx = 0; xx < 4; xx++)
+                    {
+                        int pred = predBlock[(subY * 4 + yy) * 8 + (subX * 4 + xx)];
+                        int v = pred + coeffsRaster[yy * 4 + xx];
+                        plane[(py0 + yy) * stride + (px0 + xx)] = ClipByte(v);
+                    }
+            }
+        }
+    }
+
+    private static void CopyChromaWithEdgeReplication(byte[] src, int W, int H, int srcX, int srcY, Span<byte> dst8x8)
+    {
+        for (int yy = 0; yy < 8; yy++)
+        {
+            int yy2 = srcY + yy;
+            if (yy2 < 0) yy2 = 0; else if (yy2 >= H) yy2 = H - 1;
+            for (int xx = 0; xx < 8; xx++)
+            {
+                int xx2 = srcX + xx;
+                if (xx2 < 0) xx2 = 0; else if (xx2 >= W) xx2 = W - 1;
+                dst8x8[yy * 8 + xx] = src[yy2 * W + xx2];
+            }
+        }
     }
 
     // ---------------- Chroma ----------------
