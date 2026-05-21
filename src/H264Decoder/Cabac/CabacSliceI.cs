@@ -20,10 +20,43 @@ internal static class CabacSliceI
         int mbTypeCode = DecodeMbTypeI(cabac, leftMb, topMb);
         if (mbTypeCode == 25)
         {
-            throw new NotSupportedException("CABAC I_PCM not yet implemented");
+            return ParsePcmMb(cabac, mbAddress, qpYRunning, ref prevMbQpDeltaState);
         }
         return ParseIntraMbBody(cabac, mbTypeCode, leftMb, topMb, mbAddress,
                                 ref qpYRunning, ref prevMbQpDeltaState);
+    }
+
+    /// <summary>
+    /// Parse an I_PCM macroblock (spec §7.3.5.1 + §9.3.1.2): byte-align, read 256+64+64 raw
+    /// samples, then re-initialize the arithmetic engine. QpY is unchanged.
+    /// </summary>
+    public static Macroblock ParsePcmMb(
+        CabacDecoder cabac, int mbAddress, int qpYRunning, ref int prevMbQpDeltaState)
+    {
+        var mb = new Macroblock
+        {
+            MbAddress = mbAddress,
+            Type = IntraMbType.FromISliceCodeword(25),
+            IsPcm = true,
+            QpY = qpYRunning,
+        };
+        cabac.ByteAlignBits();
+        for (int i = 0; i < 256; i++) mb.PcmLuma[i] = cabac.ReadAlignedByte();
+        for (int i = 0; i < 64; i++)  mb.PcmCb[i]   = cabac.ReadAlignedByte();
+        for (int i = 0; i < 64; i++)  mb.PcmCr[i]   = cabac.ReadAlignedByte();
+        cabac.Reinitialize();
+
+        // Neighbor context: all NZC/cbf treated as maximum for I_PCM MBs.
+        for (int i = 0; i < 16; i++) { mb.NonZeroCountLuma[i] = 16; mb.LumaAcCbf[i] = true; }
+        mb.LumaDcCbf = true;
+        for (int c = 0; c < 2; c++)
+        {
+            mb.ChromaDcCbf[c] = true;
+            for (int i = 0; i < 4; i++) { mb.NonZeroCountChromaAc[c, i] = 16; mb.ChromaAcCbf[c, i] = true; }
+        }
+        // No mb_qp_delta consumed for I_PCM; reset the CABAC prev-state per spec.
+        prevMbQpDeltaState = 0;
+        return mb;
     }
 
     /// <summary>

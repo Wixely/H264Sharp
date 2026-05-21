@@ -31,6 +31,34 @@ internal sealed class CabacDecoder
 
     public int CurrentBitPos => _bitPos;
 
+    /// <summary>Manually advance the underlying bit position (used to skip raw I_PCM bytes).</summary>
+    public void AdvanceBits(int n)
+    {
+        if (n < 0) throw new ArgumentOutOfRangeException(nameof(n));
+        _bitPos += n;
+    }
+
+    /// <summary>Spec §9.3.1.2: re-initialize the arithmetic engine after an I_PCM macroblock.
+    /// Sets codIRange=510 and reads 9 bits for codIOffset from the current (byte-aligned) position.</summary>
+    public void Reinitialize()
+    {
+        _codIRange = 510;
+        _codIOffset = ReadBits(9);
+    }
+
+    /// <summary>Byte-align <c>_bitPos</c> by skipping bits (used before raw PCM samples).</summary>
+    public void ByteAlignBits()
+    {
+        int rem = _bitPos & 7;
+        if (rem != 0) _bitPos += 8 - rem;
+    }
+
+    /// <summary>Read a single 8-bit byte directly from the underlying bit position (no arithmetic decoding).</summary>
+    public byte ReadAlignedByte()
+    {
+        return (byte)ReadBits(8);
+    }
+
     private uint ReadBit()
     {
         if (_bitPos >= _data.Length * 8)

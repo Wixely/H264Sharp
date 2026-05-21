@@ -16,6 +16,18 @@ public sealed class Macroblock
 
     /// <summary>True when this MB is a P_Skip (P-slice only): no syntax was read; MV derived per §8.4.1.1.</summary>
     public bool IsSkipped { get; init; }
+
+    /// <summary>True when this MB is I_PCM (raw samples; no prediction/transform).</summary>
+    public bool IsPcm { get; set; }
+
+    /// <summary>I_PCM raw luma samples (16x16 raster order). Valid only when <see cref="IsPcm"/>.</summary>
+    public byte[] PcmLuma { get; } = new byte[256];
+
+    /// <summary>I_PCM raw Cb samples (8x8 raster order). Valid only when <see cref="IsPcm"/>.</summary>
+    public byte[] PcmCb { get; } = new byte[64];
+
+    /// <summary>I_PCM raw Cr samples (8x8 raster order). Valid only when <see cref="IsPcm"/>.</summary>
+    public byte[] PcmCr { get; } = new byte[64];
     public IntraChromaPredMode ChromaPredMode { get; set; }
     public int CbpLuma { get; set; }
     public int CbpChroma { get; set; }

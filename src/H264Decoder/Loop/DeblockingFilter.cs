@@ -54,18 +54,22 @@ public static class DeblockingFilter
         {
             var mb = mbs[addr];
             if (mb is null) continue;
+            // I_PCM MBs are not filtered (spec §8.7.5: samples bypass the in-loop filter).
+            if (mb.IsPcm) continue;
             int mbX = addr % mbsPerRow;
             int mbY = addr / mbsPerRow;
 
             int qPLeft = mbX > 0 ? mbs[addr - 1]!.QpY : mb.QpY;
             int qPTop = mbY > 0 ? mbs[addr - mbsPerRow]!.QpY : mb.QpY;
+            bool leftIsPcm = mbX > 0 && mbs[addr - 1]!.IsPcm;
+            bool topIsPcm  = mbY > 0 && mbs[addr - mbsPerRow]!.IsPcm;
 
             // Luma vertical edges (left edges of MB cols 0, 4, 8, 12).
             // x==0 is the MB boundary; only filter if there is a left neighbor.
             for (int x = 0; x < 16; x += 4)
             {
                 bool isMbEdge = x == 0;
-                if (isMbEdge && (mbX == 0 || !filterMbEdges)) continue;
+                if (isMbEdge && (mbX == 0 || !filterMbEdges || leftIsPcm)) continue;
                 int qPp = isMbEdge ? qPLeft : mb.QpY;
                 int qPq = mb.QpY;
                 int qPavg = (qPp + qPq + 1) >> 1;
@@ -77,7 +81,7 @@ public static class DeblockingFilter
             for (int y = 0; y < 16; y += 4)
             {
                 bool isMbEdge = y == 0;
-                if (isMbEdge && (mbY == 0 || !filterMbEdges)) continue;
+                if (isMbEdge && (mbY == 0 || !filterMbEdges || topIsPcm)) continue;
                 int qPp = isMbEdge ? qPTop : mb.QpY;
                 int qPq = mb.QpY;
                 int qPavg = (qPp + qPq + 1) >> 1;
@@ -97,7 +101,7 @@ public static class DeblockingFilter
                 for (int x = 0; x < 8; x += 4)
                 {
                     bool isMbEdge = x == 0;
-                    if (isMbEdge && (mbX == 0 || !filterMbEdges)) continue;
+                    if (isMbEdge && (mbX == 0 || !filterMbEdges || leftIsPcm)) continue;
                     int qPavg = ((isMbEdge ? qPcLeft : qPc) + qPc + 1) >> 1;
                     int bS = isMbEdge ? 4 : 3;
                     FilterChromaVertical(plane, stride, mbX * 8 + x, mbY * 8, qPavg, bS,
@@ -106,7 +110,7 @@ public static class DeblockingFilter
                 for (int y = 0; y < 8; y += 4)
                 {
                     bool isMbEdge = y == 0;
-                    if (isMbEdge && (mbY == 0 || !filterMbEdges)) continue;
+                    if (isMbEdge && (mbY == 0 || !filterMbEdges || topIsPcm)) continue;
                     int qPavg = ((isMbEdge ? qPcTop : qPc) + qPc + 1) >> 1;
                     int bS = isMbEdge ? 4 : 3;
                     FilterChromaHorizontal(plane, stride, mbX * 8, mbY * 8 + y, qPavg, bS,

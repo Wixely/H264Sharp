@@ -53,7 +53,29 @@ public static class MacroblockParser
             : IntraMbType.FromISliceCodeword(mbTypeCode);
         if (type.PredMode == MbPartPredMode.IPcm)
         {
-            throw new NotSupportedException("I_PCM macroblocks not yet supported");
+            var pcmMb = new Macroblock
+            {
+                MbAddress = mbAddress,
+                Type = type,
+                ParseStartBit = startBit,
+                IsPcm = true,
+                QpY = qpYRunning,
+            };
+            // pcm_alignment_zero_bit loop: read zero bits until byte-aligned.
+            reader.ByteAlign();
+            for (int i = 0; i < 256; i++) pcmMb.PcmLuma[i] = (byte)reader.ReadBits(8);
+            for (int i = 0; i < 64; i++)  pcmMb.PcmCb[i]   = (byte)reader.ReadBits(8);
+            for (int i = 0; i < 64; i++)  pcmMb.PcmCr[i]   = (byte)reader.ReadBits(8);
+            // Spec rule: neighbor NZC / cbf values for an I_PCM MB are treated as maximum.
+            for (int i = 0; i < 16; i++) { pcmMb.NonZeroCountLuma[i] = 16; pcmMb.LumaAcCbf[i] = true; }
+            pcmMb.LumaDcCbf = true;
+            for (int c = 0; c < 2; c++)
+            {
+                pcmMb.ChromaDcCbf[c] = true;
+                for (int i = 0; i < 4; i++) { pcmMb.NonZeroCountChromaAc[c, i] = 16; pcmMb.ChromaAcCbf[c, i] = true; }
+            }
+            pcmMb.ParseEndBit = reader.BitPosition;
+            return pcmMb;
         }
 
         var mb = new Macroblock

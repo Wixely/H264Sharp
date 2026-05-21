@@ -327,7 +327,7 @@ public sealed class SingleFrameDecodeTests
         }
     }
 
-    [Fact(Skip = "Pending: P-frame frame 1 diverges by ~234 luma — orthogonal CABAC gap beyond Intra_4x4 (likely related to inter-MB residual/QP path with subme=8 partitions=p8x8).")]
+    [Fact(Skip = "Pending: P-frame frame 1 diverges by ~234 luma. Investigation showed errors accumulate from MB#6 onwards (the first P_8x8 MB). MB#10 reads mvdY=-240 — a clear CABAC mis-sync from earlier bins. Bug is in CABAC P-slice parsing of P_8x8 sub-MB partitions (likely a context or bin-count error in mvd/sub_mb_type/residual reading) but the exact desync point was not isolated.")]
     public void DecodeCabacTwoFramesAllPartitions_AllShapes()
     {
         var sample = FfmpegFixture.TwoFramesAllPartitions128x96Cabac();

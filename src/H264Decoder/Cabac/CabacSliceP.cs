@@ -28,7 +28,7 @@ internal static class CabacSliceP
             int iMbType = CabacSliceI.DecodeIntraMbTypeAtOffset(cabac, ctxIdxOffset: 17);
             if (iMbType == 25)
             {
-                throw new NotSupportedException("CABAC I_PCM inside P-slice not yet supported");
+                return CabacSliceI.ParsePcmMb(cabac, mbAddress, qpYRunning, ref prevMbQpDeltaState);
             }
             return CabacSliceI.ParseIntraMbBody(cabac, iMbType, leftMb, topMb, mbAddress,
                                                 ref qpYRunning, ref prevMbQpDeltaState);
@@ -498,9 +498,7 @@ internal static class CabacSliceP
                 int bit = (cbpSoFar >> nbIdx) & 1;
                 return bit == 0 ? 1 : 0;
             }
-            // External left neighbor MB.
             if (leftMb == null || leftMb.IsSkipped) return 0;
-            // Take right column of left MB (nx=1, ny=cy → block idx ny*2+1).
             int extBit = (leftMb.CbpLuma >> (cy * 2 + 1)) & 1;
             return extBit == 0 ? 1 : 0;
         }

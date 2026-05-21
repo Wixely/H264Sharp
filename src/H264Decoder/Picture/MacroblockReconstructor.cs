@@ -37,6 +37,11 @@ internal static class MacroblockReconstructor
         Macroblock? topRightMb,
         IReadOnlyList<DecodedPicture>? refPicListL0 = null)
     {
+        if (mb.IsPcm)
+        {
+            ReconstructPcm(mb, picture, mbX, mbY);
+            return;
+        }
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
         {
             ReconstructLumaIntra16x16(mb, picture, mbX, mbY);
@@ -67,6 +72,23 @@ internal static class MacroblockReconstructor
         {
             ReconstructChroma(mb, picture, mbX, mbY, qPc);
         }
+    }
+
+    // ---------------- I_PCM ----------------
+    private static void ReconstructPcm(Macroblock mb, DecodedPicture picture, int mbX, int mbY)
+    {
+        int px0 = mbX * 16, py0 = mbY * 16;
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 16; x++)
+                picture.Y[(py0 + y) * picture.Width + (px0 + x)] = mb.PcmLuma[y * 16 + x];
+        int cx0 = mbX * 8, cy0 = mbY * 8;
+        int cStride = picture.ChromaWidth;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                picture.U[(cy0 + y) * cStride + (cx0 + x)] = mb.PcmCb[y * 8 + x];
+                picture.V[(cy0 + y) * cStride + (cx0 + x)] = mb.PcmCr[y * 8 + x];
+            }
     }
 
     // ---------------- Luma (Intra_16x16) ----------------
