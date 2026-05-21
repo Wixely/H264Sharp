@@ -11,13 +11,40 @@ public sealed class H264FrameDecoder
     public Macroblock[]? LastMacroblocks { get; private set; }
 
     /// <summary>
-    /// Decode the first I-frame from an Annex-B byte stream. Returns the reconstructed
-    /// YUV 4:2:0 picture. Deblocking is NOT applied at this stage.
+    /// Decode the first I-frame from a byte stream. Accepts either Annex-B
+    /// (start-code framed) or AVCC (4-byte length prefixed). The framing is
+    /// auto-detected: a leading zero byte indicates Annex-B; anything else is
+    /// treated as AVCC.
     /// </summary>
-    public DecodedPicture DecodeFirstIFrame(ReadOnlySpan<byte> annexB)
+    public DecodedPicture DecodeFirstIFrame(ReadOnlySpan<byte> bytes)
     {
-        List<NalUnit> nals = AnnexBReader.SplitNalUnits(annexB);
+        List<NalUnit> nals = LooksLikeAnnexB(bytes)
+            ? AnnexBReader.SplitNalUnits(bytes)
+            : AvccReader.SplitNalUnits(bytes);
+        return DecodeFirstIFrame(nals);
+    }
 
+    /// <summary>Detects Annex-B framing by looking for a leading zero byte (start code).</summary>
+    private static bool LooksLikeAnnexB(ReadOnlySpan<byte> bytes)
+    {
+        // Annex-B streams always start with 0x000001 or 0x00000001 (or padding zeros).
+        // AVCC streams start with a non-zero length-prefix high byte for any NAL of
+        // length >= 256 bytes; for tiny streams length might begin with 0x00 too, but
+        // that's a 3-byte length 0x0000nn — impossible in standard AVCC (length must
+        // be ≥ 1). So we look at the *first non-zero byte*: if it's 0x01 within the
+        // first 4 bytes, this is Annex-B.
+        for (int i = 0; i < Math.Min(4, bytes.Length); i++)
+        {
+            if (bytes[i] == 0) continue;
+            return bytes[i] == 1;
+        }
+        return false;
+    }
+
+    /// <summary>Decode from pre-parsed NAL units. Use this if you already have a List&lt;NalUnit&gt;
+    /// (e.g. extracted from an MP4 avcC + mdat).</summary>
+    public DecodedPicture DecodeFirstIFrame(List<NalUnit> nals)
+    {
         SequenceParameterSet? sps = null;
         PictureParameterSet? pps = null;
         NalUnit? idr = null;
