@@ -196,6 +196,21 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>128x96 mandelbrot encoded with High profile + 8x8dct=1 + partitions=i8x8.
+    /// PPS carries transform_8x8_mode_flag=1 and most I-MBs select Intra_8x8 prediction.</summary>
+    public static Sample Mandelbrot128x96High8x8Dct()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "mandelbrot_128x96_high_8x8dct.h264");
+        string yuv = Path.Combine(SamplesDirectory, "mandelbrot_128x96_high_8x8dct.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i mandelbrot=s={W}x{H},format=yuv420p -frames:v 1 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v high -bf 0 -g 1 -coder 1 -an -qp 10 -x264-params \"no-deblock=1:8x8dct=1:partitions=i8x8\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>4-color 32x32 (2x2 MBs) — exercises multi-MB decoding with intra prediction.</summary>
     public static Sample FourQuadrants32x32()
     {

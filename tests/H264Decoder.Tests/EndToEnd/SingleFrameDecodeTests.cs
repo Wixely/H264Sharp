@@ -23,6 +23,20 @@ public sealed class SingleFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeHigh8x8DctClip_ThrowsNotSupported()
+    {
+        // Stage-(1) plumbing: PPS parses transform_8x8_mode_flag, MB parser reads
+        // transform_size_8x8_flag and throws when it is 1 (rather than silently
+        // mis-decoding the residual). Once stages (2)-(5) land, this should flip
+        // to a byte-exact decode test.
+        var sample = FfmpegFixture.Mandelbrot128x96High8x8Dct();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        var decoder = new H264FrameDecoder();
+        var ex = Assert.Throws<NotSupportedException>(() => decoder.DecodeFirstIFrame(stream));
+        Assert.Contains("transform_size_8x8_flag", ex.Message);
+    }
+
+    [Fact]
     public void DecodeSingleRed16x16_MatchesFfmpegReferenceYuv()
     {
         var sample = FfmpegFixture.SingleRed16x16();

@@ -18,7 +18,8 @@ internal static class CabacSliceP
         Macroblock? topLeftMb,
         int mbAddress,
         ref int qpYRunning,
-        ref int prevMbQpDeltaState)
+        ref int prevMbQpDeltaState,
+        bool transform8x8ModeFlag = false)
     {
         int mbTypeCode = DecodeMbTypeP(cabac, leftMb, topMb);
         if (mbTypeCode >= 5)
@@ -31,7 +32,8 @@ internal static class CabacSliceP
                 return CabacSliceI.ParsePcmMb(cabac, mbAddress, qpYRunning, ref prevMbQpDeltaState);
             }
             return CabacSliceI.ParseIntraMbBody(cabac, iMbType, leftMb, topMb, mbAddress,
-                                                ref qpYRunning, ref prevMbQpDeltaState);
+                                                ref qpYRunning, ref prevMbQpDeltaState,
+                                                transform8x8ModeFlag);
         }
         if (mbTypeCode == 4)
         {
@@ -55,6 +57,24 @@ internal static class CabacSliceP
         mb.CbpLuma = cbpLuma;
         mb.CbpChroma = cbpChroma;
 
+        // transform_size_8x8_flag (inter MB: only when all sub-mbs are 8x8 AND CBP-luma > 0).
+        if (transform8x8ModeFlag && cbpLuma > 0)
+        {
+            int rawMbType = type.RawMbType;
+            bool eligible = rawMbType <= 2 || (rawMbType == 3 && AllSubMbsAre8x8(mb));
+            if (eligible)
+            {
+                int ctxA = (leftMb != null && leftMb.TransformSize8x8) ? 1 : 0;
+                int ctxB = (topMb != null && topMb.TransformSize8x8) ? 1 : 0;
+                int flag = cabac.DecodeBin(399 + ctxA + ctxB);
+                mb.TransformSize8x8 = flag == 1;
+                if (mb.TransformSize8x8)
+                {
+                    throw new NotSupportedException("CABAC transform_size_8x8_flag=1 (inter) not yet supported");
+                }
+            }
+        }
+
         // ---- mb_qp_delta + residual (only if any CBP bit is set) ----
         if (cbpLuma != 0 || cbpChroma != 0)
         {
@@ -70,6 +90,16 @@ internal static class CabacSliceP
             prevMbQpDeltaState = 0;
         }
         return mb;
+    }
+
+    private static bool AllSubMbsAre8x8(Macroblock mb)
+    {
+        if (mb.InterPartitions.Count != 4) return false;
+        foreach (var p in mb.InterPartitions)
+        {
+            if (p.Width != 8 || p.Height != 8) return false;
+        }
+        return true;
     }
 
     // ---------------------------------------------------------------------

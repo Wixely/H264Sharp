@@ -23,6 +23,14 @@ public sealed class PictureParameterSet
     public required bool ConstrainedIntraPredFlag { get; init; }
     public required bool RedundantPicCntPresentFlag { get; init; }
 
+    /// <summary>High-profile-only: when true, an MB may signal transform_size_8x8_flag.
+    /// False for Baseline PPSes (where the field is absent in the bitstream).</summary>
+    public bool Transform8x8ModeFlag { get; init; }
+
+    /// <summary>High-profile-only: chroma_qp_index_offset for Cr (Cb still uses ChromaQpIndexOffset).
+    /// Defaults to ChromaQpIndexOffset when the High extension is absent.</summary>
+    public int SecondChromaQpIndexOffset { get; init; }
+
     public static PictureParameterSet Parse(ReadOnlySpan<byte> rbsp)
     {
         var r = new BitReader(rbsp);
@@ -45,7 +53,20 @@ public sealed class PictureParameterSet
         bool deblockingFilterControl = r.ReadBit() == 1;
         bool constrainedIntra = r.ReadBit() == 1;
         bool redundantPicCnt = r.ReadBit() == 1;
-        // Baseline stops here; transform_8x8_mode etc. belong to High profile.
+
+        // High-profile extension (spec §7.3.2.2): only present when more_rbsp_data() is true.
+        bool transform8x8Mode = false;
+        int secondChromaQpOffset = chromaQpOffset;
+        if (r.MoreRbspData())
+        {
+            transform8x8Mode = r.ReadBit() == 1;
+            bool picScalingMatrixPresent = r.ReadBit() == 1;
+            if (picScalingMatrixPresent)
+            {
+                throw new NotSupportedException("PPS pic_scaling_matrix_present_flag=1 not supported (custom scaling lists)");
+            }
+            secondChromaQpOffset = ExpGolomb.ReadSe(ref r);
+        }
 
         return new PictureParameterSet
         {
@@ -64,6 +85,8 @@ public sealed class PictureParameterSet
             DeblockingFilterControlPresentFlag = deblockingFilterControl,
             ConstrainedIntraPredFlag = constrainedIntra,
             RedundantPicCntPresentFlag = redundantPicCnt,
+            Transform8x8ModeFlag = transform8x8Mode,
+            SecondChromaQpIndexOffset = secondChromaQpOffset,
         };
     }
 }

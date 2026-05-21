@@ -15,7 +15,8 @@ internal static class CabacSliceI
         Macroblock? topMb,
         int mbAddress,
         ref int qpYRunning,
-        ref int prevMbQpDeltaState)
+        ref int prevMbQpDeltaState,
+        bool transform8x8ModeFlag = false)
     {
         int mbTypeCode = DecodeMbTypeI(cabac, leftMb, topMb);
         if (mbTypeCode == 25)
@@ -23,7 +24,7 @@ internal static class CabacSliceI
             return ParsePcmMb(cabac, mbAddress, qpYRunning, ref prevMbQpDeltaState);
         }
         return ParseIntraMbBody(cabac, mbTypeCode, leftMb, topMb, mbAddress,
-                                ref qpYRunning, ref prevMbQpDeltaState);
+                                ref qpYRunning, ref prevMbQpDeltaState, transform8x8ModeFlag);
     }
 
     /// <summary>
@@ -70,7 +71,8 @@ internal static class CabacSliceI
         Macroblock? topMb,
         int mbAddress,
         ref int qpYRunning,
-        ref int prevMbQpDeltaState)
+        ref int prevMbQpDeltaState,
+        bool transform8x8ModeFlag = false)
     {
         var type = IntraMbType.FromISliceCodeword((uint)mbTypeCode);
         var mb = new Macroblock
@@ -78,6 +80,20 @@ internal static class CabacSliceI
             MbAddress = mbAddress,
             Type = type,
         };
+
+        if (type.PredMode == MbPartPredMode.Intra4x4 && transform8x8ModeFlag)
+        {
+            // For I_NxN, transform_size_8x8_flag is read BEFORE prediction codewords
+            // (spec §7.3.5.1) since it controls 16 Intra_4x4 vs 4 Intra_8x8 codewords.
+            int ctxA = (leftMb != null && leftMb.TransformSize8x8) ? 1 : 0;
+            int ctxB = (topMb != null && topMb.TransformSize8x8) ? 1 : 0;
+            int flag = cabac.DecodeBin(399 + ctxA + ctxB);
+            mb.TransformSize8x8 = flag == 1;
+            if (mb.TransformSize8x8)
+            {
+                throw new NotSupportedException("CABAC transform_size_8x8_flag=1 (I_NxN) not yet supported");
+            }
+        }
 
         if (type.PredMode == MbPartPredMode.Intra4x4)
         {

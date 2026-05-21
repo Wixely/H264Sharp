@@ -85,6 +85,18 @@ public static class MacroblockParser
             ParseStartBit = startBit,
         };
 
+        // For I_NxN, transform_size_8x8_flag is read BEFORE mb_pred (spec §7.3.5.1)
+        // because it controls whether prediction codewords are 16x Intra_4x4 or 4x Intra_8x8.
+        if (type.PredMode == MbPartPredMode.Intra4x4 && pps.Transform8x8ModeFlag)
+        {
+            bool flag = reader.ReadBit() == 1;
+            mb.TransformSize8x8 = flag;
+            if (flag)
+            {
+                throw new NotSupportedException("transform_size_8x8_flag=1 (I_NxN) not yet supported");
+            }
+        }
+
         // mb_pred
         if (type.PredMode == MbPartPredMode.Intra4x4)
         {
@@ -129,6 +141,24 @@ public static class MacroblockParser
             mb.CbpChroma = type.CbpChroma;
         }
 
+        // transform_size_8x8_flag for inter MBs (spec §7.3.5.1) — read AFTER CBP.
+        // Only when PPS allows it AND luma CBP > 0 AND all sub-partitions >= 8x8.
+        if (pps.Transform8x8ModeFlag && mb.CbpLuma > 0
+            && type.PredMode == MbPartPredMode.PredL0)
+        {
+            int rawMbType = type.RawMbType;
+            bool eligible = rawMbType <= 2 || ((rawMbType == 3 || rawMbType == 4) && AllSubMbsAre8x8(mb));
+            if (eligible)
+            {
+                bool flag = reader.ReadBit() == 1;
+                mb.TransformSize8x8 = flag;
+                if (flag)
+                {
+                    throw new NotSupportedException("transform_size_8x8_flag=1 (inter) not yet supported");
+                }
+            }
+        }
+
         // mb_qp_delta + residual: present iff any luma/chroma bits set OR Intra_16x16
         bool hasResidual = mb.CbpLuma != 0 || mb.CbpChroma != 0
                            || type.PredMode == MbPartPredMode.Intra16x16;
@@ -146,6 +176,16 @@ public static class MacroblockParser
 
         mb.ParseEndBit = reader.BitPosition;
         return mb;
+    }
+
+    private static bool AllSubMbsAre8x8(Macroblock mb)
+    {
+        if (mb.InterPartitions.Count != 4) return false;
+        foreach (var p in mb.InterPartitions)
+        {
+            if (p.Width != 8 || p.Height != 8) return false;
+        }
+        return true;
     }
 
     private static int Mod52(int v)

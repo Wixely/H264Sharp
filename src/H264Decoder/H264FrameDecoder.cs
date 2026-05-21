@@ -302,7 +302,7 @@ public sealed class H264FrameDecoder
             {
                 // I-slice macroblock (no mb_skip_flag exists for I-slices).
                 Macroblock mb = CabacSliceI.ParseMb(cabac, leftMb, topMb, addr,
-                    ref qpY, ref prevMbQpDeltaState);
+                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                     pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
@@ -312,7 +312,7 @@ public sealed class H264FrameDecoder
                 // P-slice non-skip MB.
                 Macroblock mb = CabacSliceP.ParseMb(cabac, header,
                     leftMb, topMb, topRightMb, topLeftMb, addr,
-                    ref qpY, ref prevMbQpDeltaState);
+                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                     pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);

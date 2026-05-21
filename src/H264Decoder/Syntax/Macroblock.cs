@@ -28,6 +28,10 @@ public sealed class Macroblock
 
     /// <summary>I_PCM raw Cr samples (8x8 raster order). Valid only when <see cref="IsPcm"/>.</summary>
     public byte[] PcmCr { get; } = new byte[64];
+    /// <summary>transform_size_8x8_flag (spec §7.3.5.1). When true, luma residual uses 4 8x8 blocks
+    /// and (for I_NxN) Intra_8x8 prediction. Stage-(1) plumbing only — decoder currently rejects true.</summary>
+    public bool TransformSize8x8 { get; set; }
+
     public IntraChromaPredMode ChromaPredMode { get; set; }
     public int CbpLuma { get; set; }
     public int CbpChroma { get; set; }
