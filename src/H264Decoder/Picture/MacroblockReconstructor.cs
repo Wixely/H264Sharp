@@ -48,7 +48,14 @@ internal static class MacroblockReconstructor
         }
         else if (mb.Type.PredMode == MbPartPredMode.Intra4x4)
         {
-            ReconstructLumaIntra4x4(mb, picture, mbX, mbY, leftMb, topMb, topRightMb);
+            if (mb.TransformSize8x8)
+            {
+                ReconstructLumaIntra8x8(mb, picture, mbX, mbY, leftMb, topMb, topRightMb);
+            }
+            else
+            {
+                ReconstructLumaIntra4x4(mb, picture, mbX, mbY, leftMb, topMb, topRightMb);
+            }
         }
         else if (mb.Type.PredMode == MbPartPredMode.PredL0)
         {
@@ -270,6 +277,136 @@ internal static class MacroblockReconstructor
                     picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
                 }
         }
+    }
+
+    // ---------------- Luma (I_NxN / Intra_8x8) ----------------
+    private static void ReconstructLumaIntra8x8(
+        Macroblock mb, DecodedPicture picture, int mbX, int mbY,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb)
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        Span<byte> predBlock = stackalloc byte[64];
+        Span<int> coeffsScan = stackalloc int[64];
+        Span<int> coeffsRaster = stackalloc int[64];
+
+        for (int i8 = 0; i8 < 4; i8++)
+        {
+            int bx = i8 & 1;       // 8x8 block x within MB (0 or 1)
+            int by = (i8 >> 1) & 1; // 8x8 block y within MB
+            int px0 = mbX * 16 + bx * 8;
+            int py0 = mbY * 16 + by * 8;
+
+            bool topAvail = py0 > 0;
+            bool leftAvail = px0 > 0;
+            bool topLeftAvail = topAvail && leftAvail;
+            // Top-right availability for 8x8 blocks within an MB:
+            //   i8 == 0 (TL): TR samples are in top MB (row above), available iff topMb exists.
+            //   i8 == 1 (TR): TR samples are in top-right MB, available iff topRightMb exists.
+            //   i8 == 2 (BL): TR samples are within current MB (already-decoded TR 8x8 block).
+            //   i8 == 3 (BR): TR samples are in the right-neighbor MB, not yet decoded.
+            bool topRightAvail;
+            if (i8 == 0) topRightAvail = topMb != null;
+            else if (i8 == 1) topRightAvail = topRightMb != null && mbX * 16 + 16 < picture.Width;
+            else if (i8 == 2) topRightAvail = true;
+            else topRightAvail = false;
+
+            // Gather neighbor samples from the already-reconstructed picture.
+            if (topAvail)
+            {
+                int srcY = py0 - 1;
+                for (int k = 0; k < 8; k++) top[k] = picture.Y[srcY * picture.Width + px0 + k];
+                if (topRightAvail)
+                {
+                    for (int k = 0; k < 8; k++) top[8 + k] = picture.Y[srcY * picture.Width + px0 + 8 + k];
+                }
+                else
+                {
+                    byte fill = top[7];
+                    for (int k = 0; k < 8; k++) top[8 + k] = fill;
+                }
+            }
+            if (leftAvail)
+            {
+                int srcX = px0 - 1;
+                for (int k = 0; k < 8; k++) left[k] = picture.Y[(py0 + k) * picture.Width + srcX];
+            }
+            byte topLeft = topLeftAvail ? picture.Y[(py0 - 1) * picture.Width + (px0 - 1)] : (byte)0;
+
+            // Mandatory [1,2,1]/4 filter on neighbor samples.
+            IntraPrediction.Intra8x8PredFilter(
+                top, topAvail, topRightAvail,
+                left, leftAvail,
+                topLeft, topLeftAvail,
+                ft, fl, out byte ftl);
+
+            // Resolve prediction mode from neighbor 8x8 blocks (spec §8.3.1.1 generalized).
+            int predicted = PredictIntra8x8Mode(mb, leftMb, topMb, bx, by);
+            int raw = mb.Intra8x8PredMode[i8];
+            int actual = raw < 0
+                ? predicted
+                : (raw < predicted ? raw : raw + 1);
+            mb.Intra8x8Mode[i8] = actual;
+
+            IntraPrediction.PredictIntra8x8(
+                (IntraPrediction.Intra8x8Mode)actual,
+                ft, topAvail, fl, leftAvail, ftl, topLeftAvail, predBlock);
+
+            bool coded = (mb.CbpLuma & (1 << i8)) != 0;
+            if (coded)
+            {
+                for (int k = 0; k < 64; k++) coeffsScan[k] = mb.Luma8x8[i8, k];
+                ScanOrder.Unzigzag8x8(coeffsScan, coeffsRaster);
+                Quantization.Dequant8x8(coeffsRaster, mb.QpY);
+                InverseTransform.Inverse8x8(coeffsRaster);
+            }
+            else
+            {
+                coeffsRaster.Clear();
+            }
+
+            for (int yy = 0; yy < 8; yy++)
+                for (int xx = 0; xx < 8; xx++)
+                {
+                    int v = predBlock[yy * 8 + xx] + coeffsRaster[yy * 8 + xx];
+                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                }
+        }
+    }
+
+    /// <summary>Predicted Intra_8x8 mode from neighbor 8x8 blocks (spec §8.3.1.1 adapted).</summary>
+    private static int PredictIntra8x8Mode(
+        Macroblock mb, Macroblock? leftMb, Macroblock? topMb, int bx, int by)
+    {
+        int leftMode = NeighborIntra8x8Mode(mb, leftMb, topMb, bx - 1, by);
+        int topMode = NeighborIntra8x8Mode(mb, leftMb, topMb, bx, by - 1);
+        if (leftMode < 0 || topMode < 0) return 2; // DC fallback
+        return leftMode < topMode ? leftMode : topMode;
+    }
+
+    private static int NeighborIntra8x8Mode(
+        Macroblock cur, Macroblock? leftMb, Macroblock? topMb, int bx, int by)
+    {
+        if (bx >= 0 && by >= 0)
+        {
+            return cur.Intra8x8Mode[by * 2 + bx];
+        }
+        if (bx < 0)
+        {
+            if (leftMb is null) return -1;
+            // Neighbor MB's right column of 8x8 blocks (bx=1 in that MB).
+            if (leftMb.Type.PredMode != MbPartPredMode.Intra4x4 || !leftMb.TransformSize8x8) return 2;
+            return leftMb.Intra8x8Mode[by * 2 + 1];
+        }
+        if (by < 0)
+        {
+            if (topMb is null) return -1;
+            if (topMb.Type.PredMode != MbPartPredMode.Intra4x4 || !topMb.TransformSize8x8) return 2;
+            return topMb.Intra8x8Mode[1 * 2 + bx];
+        }
+        return -1;
     }
 
     /// <summary>

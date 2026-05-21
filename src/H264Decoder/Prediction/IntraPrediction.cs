@@ -508,13 +508,183 @@ public static class IntraPrediction
                 }
 
             case Intra8x8Mode.VerticalRight:
+                {
+                    if (!topAvail || !leftAvail || !topLeftAvail)
+                        throw new InvalidDataException("Intra_8x8 VR: neighbors not available");
+                    Intra8x8VR(filteredTop, filteredLeft, filteredTopLeft, output);
+                    break;
+                }
+
             case Intra8x8Mode.HorizontalDown:
+                {
+                    if (!topAvail || !leftAvail || !topLeftAvail)
+                        throw new InvalidDataException("Intra_8x8 HD: neighbors not available");
+                    Intra8x8HD(filteredTop, filteredLeft, filteredTopLeft, output);
+                    break;
+                }
+
             case Intra8x8Mode.HorizontalUp:
-                // VR/HD/HU modes are non-trivial (zVR/zHD position-classified per spec eq 8-104..8-119).
-                // Stubbed to avoid shipping subtly wrong code; will be filled in alongside Stage 4 when
-                // there is an end-to-end byte-exact fixture to validate against.
-                throw new NotSupportedException($"Intra_8x8 mode {mode} not yet implemented (stage 4)");
+                {
+                    if (!leftAvail) throw new InvalidDataException("Intra_8x8 HU: left not available");
+                    Intra8x8HU(filteredLeft, output);
+                    break;
+                }
         }
+    }
+
+    // ---- Intra_8x8 VR/HD/HU table-driven implementations ----
+    // Reference samples are named per JM spec figures: Z = topLeft, A..H = filteredTop[0..7],
+    // I..P = filteredTop[8..15], Q..X = filteredLeft[0..7].
+
+    private static void Intra8x8VR(ReadOnlySpan<byte> ft, ReadOnlySpan<byte> fl, byte Z, Span<byte> o)
+    {
+        // Spec §8.3.2.2.6 — VerticalRight.
+        // 2-tap top averages (zVR even, 0..12):
+        int aa = (Z + ft[0] + 1) >> 1;
+        int bb = (ft[0] + ft[1] + 1) >> 1;
+        int cc = (ft[1] + ft[2] + 1) >> 1;
+        int dd = (ft[2] + ft[3] + 1) >> 1;
+        int ee = (ft[3] + ft[4] + 1) >> 1;
+        int ff = (ft[4] + ft[5] + 1) >> 1;
+        int gg = (ft[5] + ft[6] + 1) >> 1;
+        int hh = (ft[6] + ft[7] + 1) >> 1;
+        // 3-tap top (zVR odd, -1..13):
+        int i = (fl[0] + 2 * Z + ft[0] + 2) >> 2;
+        int j = (Z + 2 * ft[0] + ft[1] + 2) >> 2;
+        int k = (ft[0] + 2 * ft[1] + ft[2] + 2) >> 2;
+        int l = (ft[1] + 2 * ft[2] + ft[3] + 2) >> 2;
+        int m = (ft[2] + 2 * ft[3] + ft[4] + 2) >> 2;
+        int n = (ft[3] + 2 * ft[4] + ft[5] + 2) >> 2;
+        int oo = (ft[4] + 2 * ft[5] + ft[6] + 2) >> 2;
+        int p = (ft[5] + 2 * ft[6] + ft[7] + 2) >> 2;
+        // 3-tap left (zVR negative even):
+        int q = (Z + 2 * fl[0] + fl[1] + 2) >> 2;
+        int r = (fl[0] + 2 * fl[1] + fl[2] + 2) >> 2;
+        int s = (fl[1] + 2 * fl[2] + fl[3] + 2) >> 2;
+        int t = (fl[2] + 2 * fl[3] + fl[4] + 2) >> 2;
+        int u = (fl[3] + 2 * fl[4] + fl[5] + 2) >> 2;
+        int vv = (fl[4] + 2 * fl[5] + fl[6] + 2) >> 2;
+
+        // Output map. Rows top→bottom.
+        // Row 0: aa bb cc dd ee ff gg hh
+        // Row 1:  i  j  k  l  m  n  o  p
+        // Row 2:  q aa bb cc dd ee ff gg
+        // Row 3:  r  i  j  k  l  m  n  o
+        // Row 4:  s  q aa bb cc dd ee ff
+        // Row 5:  t  r  i  j  k  l  m  n
+        // Row 6:  u  s  q aa bb cc dd ee
+        // Row 7:  v  t  r  i  j  k  l  m
+        int[] row = {
+            aa,bb,cc,dd,ee,ff,gg,hh,
+            i, j, k, l, m, n, oo, p,
+            q, aa,bb,cc,dd,ee,ff,gg,
+            r, i, j, k, l, m, n, oo,
+            s, q, aa,bb,cc,dd,ee,ff,
+            t, r, i, j, k, l, m, n,
+            u, s, q, aa,bb,cc,dd,ee,
+            vv,t, r, i, j, k, l, m,
+        };
+        for (int idx = 0; idx < 64; idx++) o[idx] = (byte)row[idx];
+    }
+
+    private static void Intra8x8HD(ReadOnlySpan<byte> ft, ReadOnlySpan<byte> fl, byte Z, Span<byte> o)
+    {
+        // Spec §8.3.2.2.7 — HorizontalDown. Symmetric/transpose of VR.
+        // 2-tap left averages (zHD even):
+        int aa = (Z + fl[0] + 1) >> 1;
+        int bb = (fl[0] + fl[1] + 1) >> 1;
+        int cc = (fl[1] + fl[2] + 1) >> 1;
+        int dd = (fl[2] + fl[3] + 1) >> 1;
+        int ee = (fl[3] + fl[4] + 1) >> 1;
+        int ff = (fl[4] + fl[5] + 1) >> 1;
+        int gg = (fl[5] + fl[6] + 1) >> 1;
+        int hh = (fl[6] + fl[7] + 1) >> 1;
+        // 3-tap left (zHD odd):
+        int i = (ft[0] + 2 * Z + fl[0] + 2) >> 2;
+        int j = (Z + 2 * fl[0] + fl[1] + 2) >> 2;
+        int k = (fl[0] + 2 * fl[1] + fl[2] + 2) >> 2;
+        int l = (fl[1] + 2 * fl[2] + fl[3] + 2) >> 2;
+        int m = (fl[2] + 2 * fl[3] + fl[4] + 2) >> 2;
+        int n = (fl[3] + 2 * fl[4] + fl[5] + 2) >> 2;
+        int oo = (fl[4] + 2 * fl[5] + fl[6] + 2) >> 2;
+        int p = (fl[5] + 2 * fl[6] + fl[7] + 2) >> 2;
+        // 3-tap top (zHD negative):
+        int q = (Z + 2 * ft[0] + ft[1] + 2) >> 2;
+        int r = (ft[0] + 2 * ft[1] + ft[2] + 2) >> 2;
+        int s = (ft[1] + 2 * ft[2] + ft[3] + 2) >> 2;
+        int t = (ft[2] + 2 * ft[3] + ft[4] + 2) >> 2;
+        int u = (ft[3] + 2 * ft[4] + ft[5] + 2) >> 2;
+        int vv = (ft[4] + 2 * ft[5] + ft[6] + 2) >> 2;
+
+        // HD is VR transposed (columns become rows). Output layout:
+        // Each row y, column x of HD = VR(x=y, y=x), i.e. transpose.
+        // Build via direct table:
+        // Row 0: aa  i  q  r  s  t  u  v
+        // Row 1: bb  j aa  i  q  r  s  t
+        // Row 2: cc  k bb  j aa  i  q  r
+        // Row 3: dd  l cc  k bb  j aa  i
+        // Row 4: ee  m dd  l cc  k bb  j
+        // Row 5: ff  n ee  m dd  l cc  k
+        // Row 6: gg oo  ff n  ee  m dd  l
+        // Row 7: hh  p gg oo  ff  n ee  m
+        int[] row = {
+            aa, i, q, r, s, t, u, vv,
+            bb, j, aa, i, q, r, s, t,
+            cc, k, bb, j, aa, i, q, r,
+            dd, l, cc, k, bb, j, aa, i,
+            ee, m, dd, l, cc, k, bb, j,
+            ff, n, ee, m, dd, l, cc, k,
+            gg, oo, ff, n, ee, m, dd, l,
+            hh, p, gg, oo, ff, n, ee, m,
+        };
+        for (int idx = 0; idx < 64; idx++) o[idx] = (byte)row[idx];
+    }
+
+    private static void Intra8x8HU(ReadOnlySpan<byte> fl, Span<byte> o)
+    {
+        // Spec §8.3.2.2.9 — HorizontalUp. Uses left column only.
+        // Per spec eq 8-122/8-123: zHU = x + 2*y; piecewise classification.
+        // Following JM impl pattern:
+        // 2-tap (zHU = 0,2,4,6,8,10,12):
+        int aa = (fl[0] + fl[1] + 1) >> 1;
+        int bb = (fl[1] + fl[2] + 1) >> 1;
+        int cc = (fl[2] + fl[3] + 1) >> 1;
+        int dd = (fl[3] + fl[4] + 1) >> 1;
+        int ee = (fl[4] + fl[5] + 1) >> 1;
+        int ff = (fl[5] + fl[6] + 1) >> 1;
+        int gg = (fl[6] + fl[7] + 1) >> 1;
+        // 3-tap (zHU = 1,3,5,7,9,11,13):
+        int i = (fl[0] + 2 * fl[1] + fl[2] + 2) >> 2;
+        int j = (fl[1] + 2 * fl[2] + fl[3] + 2) >> 2;
+        int k = (fl[2] + 2 * fl[3] + fl[4] + 2) >> 2;
+        int l = (fl[3] + 2 * fl[4] + fl[5] + 2) >> 2;
+        int m = (fl[4] + 2 * fl[5] + fl[6] + 2) >> 2;
+        int n = (fl[5] + 2 * fl[6] + fl[7] + 2) >> 2;
+        // zHU = 14:
+        int oo = (fl[6] + 3 * fl[7] + 2) >> 2;
+        // zHU >= 15:
+        int pp = fl[7];
+
+        // Output:
+        // Row 0: aa  i  bb  j  cc  k  dd  l
+        // Row 1: bb  j  cc  k  dd  l  ee  m
+        // Row 2: cc  k  dd  l  ee  m  ff  n
+        // Row 3: dd  l  ee  m  ff  n  gg oo
+        // Row 4: ee  m  ff  n  gg oo  pp pp
+        // Row 5: ff  n  gg oo  pp pp  pp pp
+        // Row 6: gg oo  pp pp  pp pp  pp pp
+        // Row 7: pp pp  pp pp  pp pp  pp pp
+        int[] row = {
+            aa, i, bb, j, cc, k, dd, l,
+            bb, j, cc, k, dd, l, ee, m,
+            cc, k, dd, l, ee, m, ff, n,
+            dd, l, ee, m, ff, n, gg, oo,
+            ee, m, ff, n, gg, oo, pp, pp,
+            ff, n, gg, oo, pp, pp, pp, pp,
+            gg, oo, pp, pp, pp, pp, pp, pp,
+            pp, pp, pp, pp, pp, pp, pp, pp,
+        };
+        for (int idx = 0; idx < 64; idx++) o[idx] = (byte)row[idx];
     }
 
     /// <summary>

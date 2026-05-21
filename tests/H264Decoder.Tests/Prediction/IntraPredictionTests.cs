@@ -135,25 +135,108 @@ public sealed class IntraPredictionTests
     }
 
     [Fact]
-    public void I8x8_VR_HD_HU_AreStubbed_Throw()
+    public void I8x8_VerticalRight_AllConstantNeighbors_ReturnsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 100;
+        for (int i = 0; i < 8; i++) left[i] = 100;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, true, 100, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.VerticalRight,
+            ft, true, fl, true, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(100, b);
+    }
+
+    [Fact]
+    public void I8x8_HorizontalDown_AllConstantNeighbors_ReturnsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) top[i] = 70;
+        for (int i = 0; i < 8; i++) left[i] = 70;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, true, true, left, true, 70, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.HorizontalDown,
+            ft, true, fl, true, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(70, b);
+    }
+
+    [Fact]
+    public void I8x8_HorizontalUp_AllConstantLeft_ReturnsConstant()
+    {
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[8];
+        for (int i = 0; i < 8; i++) left[i] = 60;
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        IntraPrediction.Intra8x8PredFilter(top, false, false, left, true, 60, true, ft, fl, out byte ftl);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.HorizontalUp,
+            ft, false, fl, true, ftl, true, output);
+        foreach (byte b in output) Assert.Equal(60, b);
+    }
+
+    [Fact]
+    public void I8x8_VerticalRight_AsymmetricCornerSample()
+    {
+        // Construct a known input where Z=0, top all 100, left all 0 — verifies the
+        // (0,0) sample (zVR=0) = (Z + ft[0] + 1) >> 1.
+        // Pre-filter would change values so we feed already-filtered samples directly.
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        for (int i = 0; i < 16; i++) ft[i] = 100;
+        for (int i = 0; i < 8; i++) fl[i] = 0;
+        byte Z = 50;
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.VerticalRight,
+            ft, true, fl, true, Z, true, output);
+        // (0,0) at zVR=0 -> (Z + ft[0] + 1) >> 1 = (50+100+1)>>1 = 75
+        Assert.Equal(75, output[0]);
+        // (1,0) at zVR=2 -> (ft[0]+ft[1]+1)>>1 = 100
+        Assert.Equal(100, output[1]);
+    }
+
+    [Fact]
+    public void I8x8_HorizontalDown_AsymmetricCornerSample()
     {
         Span<byte> ft = stackalloc byte[16];
         Span<byte> fl = stackalloc byte[8];
-        byte[] ftArr = ft.ToArray();
-        byte[] flArr = fl.ToArray();
-        var output = new byte[64];
-        Assert.Throws<NotSupportedException>(() =>
-            IntraPrediction.PredictIntra8x8(
-                IntraPrediction.Intra8x8Mode.VerticalRight,
-                ftArr, true, flArr, true, (byte)0, true, output));
-        Assert.Throws<NotSupportedException>(() =>
-            IntraPrediction.PredictIntra8x8(
-                IntraPrediction.Intra8x8Mode.HorizontalDown,
-                ftArr, true, flArr, true, (byte)0, true, output));
-        Assert.Throws<NotSupportedException>(() =>
-            IntraPrediction.PredictIntra8x8(
-                IntraPrediction.Intra8x8Mode.HorizontalUp,
-                ftArr, true, flArr, true, (byte)0, true, output));
+        for (int i = 0; i < 16; i++) ft[i] = 0;
+        for (int i = 0; i < 8; i++) fl[i] = 100;
+        byte Z = 50;
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.HorizontalDown,
+            ft, true, fl, true, Z, true, output);
+        // (0,0) at zHD=0 -> (Z + fl[0] + 1) >> 1 = 75
+        Assert.Equal(75, output[0]);
+        // (0,1) at zHD=2 -> (fl[0]+fl[1]+1)>>1 = 100
+        Assert.Equal(100, output[8]);
+    }
+
+    [Fact]
+    public void I8x8_HorizontalUp_AsymmetricCornerSample()
+    {
+        Span<byte> ft = stackalloc byte[16];
+        Span<byte> fl = stackalloc byte[8];
+        for (int i = 0; i < 8; i++) fl[i] = (byte)(10 + 10 * i);
+        Span<byte> output = stackalloc byte[64];
+        IntraPrediction.PredictIntra8x8(
+            IntraPrediction.Intra8x8Mode.HorizontalUp,
+            ft, false, fl, true, 0, false, output);
+        // (0,0) at zHU=0 -> (fl[0]+fl[1]+1)>>1 = (10+20+1)>>1 = 15
+        Assert.Equal(15, output[0]);
+        // last row should saturate to fl[7] = 80
+        for (int x = 0; x < 8; x++) Assert.Equal(80, output[7 * 8 + x]);
     }
 
     // ----- Intra_16x16 -----

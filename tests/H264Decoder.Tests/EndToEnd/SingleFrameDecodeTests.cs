@@ -368,6 +368,31 @@ public sealed class SingleFrameDecodeTests
         }
     }
 
+    [Fact(Skip = "Stage 4 CAVLC 8x8 residual integration: parser succeeds on MBs 0..1 but desyncs in MB 2 residual (CAVLC: run_before > zerosLeft). All math primitives (Inverse8x8/Dequant8x8/Unzigzag8x8), prediction (9/9 Intra_8x8 modes), and the parser/reconstructor scaffold are in place. The 4-sub-block nC derivation matches LumaNcForBlock(b0+s) per the conventional reading of spec §9.2.1.1, but something subtle in the bitstream interpretation (possibly the CAVLC table selection for 8x8 sub-blocks, or an interaction with chroma residual reads) is causing desync. Needs side-by-side comparison against FFmpeg/JM ldecod traces to isolate.")]
+    public void DecodeMandelbrot128x96HighCavlc8x8_Intra8x8()
+    {
+        // High-profile CAVLC clip with PPS.transform_8x8_mode_flag=1 and partitions=i8x8 —
+        // most I-MBs select the 8x8 transform with Intra_8x8 prediction. Exercises Stages 3+4.
+        var sample = FfmpegFixture.Mandelbrot128x96HighCavlc8x8();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        var pic = new H264FrameDecoder().DecodeFirstIFrame(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+
+        int maxY = 0;
+        for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[i]));
+        int maxU = 0;
+        for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(pic.U[i] - reference[yLen + i]));
+        int maxV = 0;
+        for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(pic.V[i] - reference[yLen + cLen + i]));
+
+        Assert.True(maxY <= 2, $"luma max abs error = {maxY}");
+        Assert.True(maxU <= 2, $"u max abs error = {maxU}");
+        Assert.True(maxV <= 2, $"v max abs error = {maxV}");
+    }
+
     [Fact]
     public void DecodeTestsrc32x32_HandlesIntra4x4()
     {

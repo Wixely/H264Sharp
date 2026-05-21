@@ -66,10 +66,13 @@ public static class DeblockingFilter
 
             // Luma vertical edges (left edges of MB cols 0, 4, 8, 12).
             // x==0 is the MB boundary; only filter if there is a left neighbor.
+            // When transform_size_8x8_flag is set, the internal 4x4 edges at x=4 and x=12
+            // are NOT filtered (only the 8x8-block boundary at x=8) per spec §8.7.
             for (int x = 0; x < 16; x += 4)
             {
                 bool isMbEdge = x == 0;
                 if (isMbEdge && (mbX == 0 || !filterMbEdges || leftIsPcm)) continue;
+                if (!isMbEdge && mb.TransformSize8x8 && (x == 4 || x == 12)) continue;
                 int qPp = isMbEdge ? qPLeft : mb.QpY;
                 int qPq = mb.QpY;
                 int qPavg = (qPp + qPq + 1) >> 1;
@@ -82,6 +85,7 @@ public static class DeblockingFilter
             {
                 bool isMbEdge = y == 0;
                 if (isMbEdge && (mbY == 0 || !filterMbEdges || topIsPcm)) continue;
+                if (!isMbEdge && mb.TransformSize8x8 && (y == 4 || y == 12)) continue;
                 int qPp = isMbEdge ? qPTop : mb.QpY;
                 int qPq = mb.QpY;
                 int qPavg = (qPp + qPq + 1) >> 1;

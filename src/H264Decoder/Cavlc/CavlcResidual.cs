@@ -64,6 +64,31 @@ internal static class CavlcResidual
         return totalCoeff;
     }
 
+    /// <summary>
+    /// Decode one 8x8 luma residual block (spec §7.3.5.3 / §9.2). The block is encoded as
+    /// 4 interleaved 4x4 sub-blocks; sub-block s contains scan positions s, s+4, s+8, ..., s+60
+    /// of the 8x8 zigzag scan. Output <paramref name="coeffs64"/> is filled in 8x8 zigzag scan order.
+    /// Returns the total non-zero count across all 4 sub-blocks.
+    /// </summary>
+    public static int ReadResidualBlock8x8(
+        ref BitReader r,
+        scoped Span<int> coeffs64,
+        int nC0, int nC1, int nC2, int nC3)
+    {
+        coeffs64.Clear();
+        Span<int> sub = stackalloc int[16];
+        int total = 0;
+        for (int s = 0; s < 4; s++)
+        {
+            int nC = s switch { 0 => nC0, 1 => nC1, 2 => nC2, _ => nC3 };
+            sub.Clear();
+            int nz = ReadResidualBlock(ref r, sub, maxNumCoeff: 16, nC, chromaDc: false);
+            total += nz;
+            for (int i = 0; i < 16; i++) coeffs64[s + i * 4] = sub[i];
+        }
+        return total;
+    }
+
     // ---------------------------------------------------------------------
     // coeff_token (TotalCoeff + TrailingOnes)
     // ---------------------------------------------------------------------

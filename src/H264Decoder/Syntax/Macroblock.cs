@@ -45,6 +45,20 @@ public sealed class Macroblock
     /// prediction-from-neighbors rule. Set by the reconstructor.</summary>
     public int[] Intra4x4Mode { get; } = new int[16];
 
+    /// <summary>4 entries — raw Intra_8x8 prediction codewords (I_NxN with 8x8 transform):
+    /// -1 means "use the neighbor-predicted mode", otherwise a 3-bit rem_mode value.</summary>
+    public int[] Intra8x8PredMode { get; } = new int[4];
+
+    /// <summary>4 entries — resolved Intra_8x8 modes (0..8) after applying the
+    /// prediction-from-neighbors rule. Set by the reconstructor.</summary>
+    public int[] Intra8x8Mode { get; } = new int[4];
+
+    /// <summary>4 8x8 luma residual blocks (64 coefficients each, 8x8 zigzag scan order).</summary>
+    public int[,] Luma8x8 { get; } = new int[4, 64];
+
+    /// <summary>Per-8x8-block non-zero count summed across the 4 CAVLC sub-blocks.</summary>
+    public int[] NonZeroCountLuma8x8 { get; } = new int[4];
+
     /// <summary>Intra_16x16 DC block — 16 DC coefficients in zig-zag scan order.</summary>
     public int[] LumaDc { get; } = new int[16];
 

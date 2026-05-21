@@ -91,25 +91,40 @@ public static class MacroblockParser
         {
             bool flag = reader.ReadBit() == 1;
             mb.TransformSize8x8 = flag;
-            if (flag)
-            {
-                throw new NotSupportedException("transform_size_8x8_flag=1 (I_NxN) not yet supported");
-            }
         }
 
         // mb_pred
         if (type.PredMode == MbPartPredMode.Intra4x4)
         {
-            for (int i = 0; i < 16; i++)
+            if (mb.TransformSize8x8)
             {
-                bool prev = reader.ReadBit() == 1;
-                if (prev)
+                // 4 Intra_8x8 prediction codewords (one per 8x8 luma block).
+                for (int i = 0; i < 4; i++)
                 {
-                    mb.Intra4x4PredMode[i] = -1; // signal "use predicted mode"
+                    bool prev = reader.ReadBit() == 1;
+                    if (prev)
+                    {
+                        mb.Intra8x8PredMode[i] = -1;
+                    }
+                    else
+                    {
+                        mb.Intra8x8PredMode[i] = (int)reader.ReadBits(3);
+                    }
                 }
-                else
+            }
+            else
+            {
+                for (int i = 0; i < 16; i++)
                 {
-                    mb.Intra4x4PredMode[i] = (int)reader.ReadBits(3);
+                    bool prev = reader.ReadBit() == 1;
+                    if (prev)
+                    {
+                        mb.Intra4x4PredMode[i] = -1; // signal "use predicted mode"
+                    }
+                    else
+                    {
+                        mb.Intra4x4PredMode[i] = (int)reader.ReadBits(3);
+                    }
                 }
             }
         }
@@ -224,6 +239,32 @@ public static class MacroblockParser
                 }
             }
             _ = dcCount;
+        }
+        else if (mb.TransformSize8x8) // Intra4x4 (I_NxN) or PredL0 with 8x8 transform
+        {
+            // 4 luma 8x8 blocks. Each contains 4 CAVLC sub-blocks (interleaved scan positions).
+            // nC for each sub-block uses the matching 4x4-block raster index.
+            Span<int> coeffs8 = stackalloc int[64];
+            Span<int> sub = stackalloc int[16];
+            for (int i8 = 0; i8 < 4; i8++)
+            {
+                if ((mb.CbpLuma & (1 << i8)) == 0) continue;
+                int b0 = i8 * 4;
+                coeffs8.Clear();
+                int total = 0;
+                for (int s = 0; s < 4; s++)
+                {
+                    // nC is recomputed each sub-block; uses just-updated NonZeroCountLuma entries.
+                    int nC = LumaNcForBlock(b0 + s, mb, leftMb, topMb);
+                    sub.Clear();
+                    int nz = CavlcResidual.ReadResidualBlock(ref reader, sub, 16, nC, chromaDc: false);
+                    mb.NonZeroCountLuma[b0 + s] = nz;
+                    total += nz;
+                    for (int i = 0; i < 16; i++) coeffs8[s + i * 4] = sub[i];
+                }
+                mb.NonZeroCountLuma8x8[i8] = total;
+                for (int j = 0; j < 64; j++) mb.Luma8x8[i8, j] = coeffs8[j];
+            }
         }
         else // Intra4x4 or PredL0 — both use 16 full 4x4 luma blocks
         {
