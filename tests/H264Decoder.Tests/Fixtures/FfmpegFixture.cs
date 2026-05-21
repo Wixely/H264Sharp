@@ -33,6 +33,20 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>32x32 ffmpeg testsrc — forces x264 to pick mostly Intra_4x4 (textured).</summary>
+    public static Sample Testsrc32x32()
+    {
+        const int W = 32, H = 32;
+        string h264 = Path.Combine(SamplesDirectory, "testsrc_32x32.h264");
+        string yuv = Path.Combine(SamplesDirectory, "testsrc_32x32.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i testsrc=size={W}x{H}:d=1 -frames:v 1 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v baseline -bf 0 -g 1 -coder 0 -an " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>4-color 32x32 (2x2 MBs) — exercises multi-MB decoding with intra prediction.</summary>
     public static Sample FourQuadrants32x32()
     {

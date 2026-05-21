@@ -318,111 +318,109 @@ public static class IntraPrediction
         }
     }
 
+    /// <summary>
+    /// Port of OpenH264's table-driven Intra_4x4 prediction for the
+    /// diagonal/oblique modes (VR, HD, VL, HU). Each computes a small list
+    /// of intermediate values then emits them at specific output positions
+    /// (matches WelsI4x4LumaPredVR_c / HD_c / VL_c / HU_c).
+    /// </summary>
     private static void Intra4x4Mixed(
         ReadOnlySpan<byte> t, ReadOnlySpan<byte> left, byte topLeft,
         Span<byte> output, Intra4x4Mode mode)
     {
         // P[x,y] inlined: y==-1 -> top row (t[x]), x==-1 -> left col (left[y]),
         // (-1,-1) -> topLeft. Negative indices into top mean topLeft.
+        // Common neighbor samples.
+        byte LT = topLeft;
+        byte L0 = left[0], L1 = left[1], L2 = left[2], L3 = left[3];
+        byte T0 = t[0], T1 = t[1], T2 = t[2], T3 = t[3];
+        byte T4 = t[4], T5 = t[5], T6 = t[6], T7 = t[7];
+
         switch (mode)
         {
             case Intra4x4Mode.VerticalRight:
                 {
-                    for (int y = 0; y < 4; y++)
-                        for (int x = 0; x < 4; x++)
-                        {
-                            int zVR = 2 * x - y;
-                            int xt = x - (y >> 1); // index into top row
-                            int v;
-                            if (zVR == 0 || zVR == 2 || zVR == 4 || zVR == 6)
-                            {
-                                int p1 = xt - 1 == -1 ? topLeft : t[xt - 1];
-                                v = (p1 + t[xt] + 1) >> 1;
-                            }
-                            else if (zVR == -1)
-                            {
-                                v = (left[0] + 2 * topLeft + t[0] + 2) >> 2;
-                            }
-                            else if (zVR == 1 || zVR == 3 || zVR == 5)
-                            {
-                                int p0 = xt - 2 == -1 ? topLeft : t[xt - 2];
-                                int p1 = xt - 1 == -1 ? topLeft : t[xt - 1];
-                                v = (p0 + 2 * p1 + t[xt] + 2) >> 2;
-                            }
-                            else // zVR == -2 or -3
-                            {
-                                int p0 = y - 2 == -1 ? topLeft : left[y - 2];
-                                int p1 = y - 1 == -1 ? topLeft : left[y - 1];
-                                v = (left[y] + 2 * p1 + p0 + 2) >> 2;
-                            }
-                            output[y * 4 + x] = (byte)v;
-                        }
+                    int VR0 = (LT + T0 + 1) >> 1;
+                    int VR1 = (T0 + T1 + 1) >> 1;
+                    int VR2 = (T1 + T2 + 1) >> 1;
+                    int VR3 = (T2 + T3 + 1) >> 1;
+                    int VR4 = (L0 + 2 * LT + T0 + 2) >> 2;
+                    int VR5 = (LT + 2 * T0 + T1 + 2) >> 2;
+                    int VR6 = (T0 + 2 * T1 + T2 + 2) >> 2;
+                    int VR7 = (T1 + 2 * T2 + T3 + 2) >> 2;
+                    int VR8 = (LT + 2 * L0 + L1 + 2) >> 2;
+                    int VR9 = (L0 + 2 * L1 + L2 + 2) >> 2;
+                    // Row 0: VR0 VR1 VR2 VR3
+                    // Row 1: VR4 VR5 VR6 VR7
+                    // Row 2: VR8 VR0 VR1 VR2
+                    // Row 3: VR9 VR4 VR5 VR6
+                    output[0] = (byte)VR0; output[1] = (byte)VR1; output[2] = (byte)VR2; output[3] = (byte)VR3;
+                    output[4] = (byte)VR4; output[5] = (byte)VR5; output[6] = (byte)VR6; output[7] = (byte)VR7;
+                    output[8] = (byte)VR8; output[9] = (byte)VR0; output[10] = (byte)VR1; output[11] = (byte)VR2;
+                    output[12] = (byte)VR9; output[13] = (byte)VR4; output[14] = (byte)VR5; output[15] = (byte)VR6;
                     break;
                 }
             case Intra4x4Mode.HorizontalDown:
                 {
-                    for (int y = 0; y < 4; y++)
-                        for (int x = 0; x < 4; x++)
-                        {
-                            int zHD = 2 * y - x;
-                            int yl = y - (x >> 1);
-                            int v;
-                            if (zHD == 0 || zHD == 2 || zHD == 4 || zHD == 6)
-                            {
-                                int p1 = yl - 1 == -1 ? topLeft : left[yl - 1];
-                                v = (p1 + left[yl] + 1) >> 1;
-                            }
-                            else if (zHD == -1)
-                            {
-                                v = (left[0] + 2 * topLeft + t[0] + 2) >> 2;
-                            }
-                            else if (zHD == 1 || zHD == 3 || zHD == 5)
-                            {
-                                int p0 = yl - 2 == -1 ? topLeft : left[yl - 2];
-                                int p1 = yl - 1 == -1 ? topLeft : left[yl - 1];
-                                v = (p0 + 2 * p1 + left[yl] + 2) >> 2;
-                            }
-                            else // zHD == -2 or -3
-                            {
-                                int p0 = x - 2 == -1 ? topLeft : t[x - 2];
-                                int p1 = x - 1 == -1 ? topLeft : t[x - 1];
-                                v = (t[x] + 2 * p1 + p0 + 2) >> 2;
-                            }
-                            output[y * 4 + x] = (byte)v;
-                        }
+                    int HD0 = (LT + L0 + 1) >> 1;
+                    int HD1 = (L0 + 2 * LT + T0 + 2) >> 2;
+                    int HD2 = (LT + 2 * T0 + T1 + 2) >> 2;
+                    int HD3 = (T0 + 2 * T1 + T2 + 2) >> 2;
+                    int HD4 = (L0 + L1 + 1) >> 1;
+                    int HD5 = (LT + 2 * L0 + L1 + 2) >> 2;
+                    int HD6 = (L1 + L2 + 1) >> 1;
+                    int HD7 = (L0 + 2 * L1 + L2 + 2) >> 2;
+                    int HD8 = (L2 + L3 + 1) >> 1;
+                    int HD9 = (L1 + 2 * L2 + L3 + 2) >> 2;
+                    // Row 0: HD0 HD1 HD2 HD3
+                    // Row 1: HD4 HD5 HD0 HD1
+                    // Row 2: HD6 HD7 HD4 HD5
+                    // Row 3: HD8 HD9 HD6 HD7
+                    output[0] = (byte)HD0; output[1] = (byte)HD1; output[2] = (byte)HD2; output[3] = (byte)HD3;
+                    output[4] = (byte)HD4; output[5] = (byte)HD5; output[6] = (byte)HD0; output[7] = (byte)HD1;
+                    output[8] = (byte)HD6; output[9] = (byte)HD7; output[10] = (byte)HD4; output[11] = (byte)HD5;
+                    output[12] = (byte)HD8; output[13] = (byte)HD9; output[14] = (byte)HD6; output[15] = (byte)HD7;
                     break;
                 }
             case Intra4x4Mode.VerticalLeft:
                 {
-                    for (int y = 0; y < 4; y++)
-                        for (int x = 0; x < 4; x++)
-                        {
-                            int i = x + (y >> 1);
-                            int v = ((y & 1) == 0)
-                                ? (t[i] + t[i + 1] + 1) >> 1
-                                : (t[i] + 2 * t[i + 1] + t[i + 2] + 2) >> 2;
-                            output[y * 4 + x] = (byte)v;
-                        }
+                    int VL0 = (T0 + T1 + 1) >> 1;
+                    int VL1 = (T1 + T2 + 1) >> 1;
+                    int VL2 = (T2 + T3 + 1) >> 1;
+                    int VL3 = (T3 + T4 + 1) >> 1;
+                    int VL4 = (T4 + T5 + 1) >> 1;
+                    int VL5 = (T0 + 2 * T1 + T2 + 2) >> 2;
+                    int VL6 = (T1 + 2 * T2 + T3 + 2) >> 2;
+                    int VL7 = (T2 + 2 * T3 + T4 + 2) >> 2;
+                    int VL8 = (T3 + 2 * T4 + T5 + 2) >> 2;
+                    int VL9 = (T4 + 2 * T5 + T6 + 2) >> 2;
+                    // Row 0: VL0 VL1 VL2 VL3
+                    // Row 1: VL5 VL6 VL7 VL8
+                    // Row 2: VL1 VL2 VL3 VL4
+                    // Row 3: VL6 VL7 VL8 VL9
+                    output[0] = (byte)VL0; output[1] = (byte)VL1; output[2] = (byte)VL2; output[3] = (byte)VL3;
+                    output[4] = (byte)VL5; output[5] = (byte)VL6; output[6] = (byte)VL7; output[7] = (byte)VL8;
+                    output[8] = (byte)VL1; output[9] = (byte)VL2; output[10] = (byte)VL3; output[11] = (byte)VL4;
+                    output[12] = (byte)VL6; output[13] = (byte)VL7; output[14] = (byte)VL8; output[15] = (byte)VL9;
+                    _ = T7; // T7 unused for VL
                     break;
                 }
             case Intra4x4Mode.HorizontalUp:
                 {
-                    for (int y = 0; y < 4; y++)
-                        for (int x = 0; x < 4; x++)
-                        {
-                            int zHU = x + 2 * y;
-                            int i = y + (x >> 1);
-                            int v;
-                            if (zHU == 0 || zHU == 2 || zHU == 4)
-                                v = (left[i] + left[i + 1] + 1) >> 1;
-                            else if (zHU == 1 || zHU == 3)
-                                v = (left[i] + 2 * left[i + 1] + left[Math.Min(i + 2, 3)] + 2) >> 2;
-                            else if (zHU == 5)
-                                v = (left[2] + 3 * left[3] + 2) >> 2;
-                            else
-                                v = left[3];
-                            output[y * 4 + x] = (byte)v;
-                        }
+                    int HU0 = (L0 + L1 + 1) >> 1;
+                    int HU1 = (L0 + 2 * L1 + L2 + 2) >> 2;
+                    int HU2 = (L1 + L2 + 1) >> 1;
+                    int HU3 = (L1 + 2 * L2 + L3 + 2) >> 2;
+                    int HU4 = (L2 + L3 + 1) >> 1;
+                    int HU5 = (L2 + 3 * L3 + 2) >> 2;
+                    // Row 0: HU0 HU1 HU2 HU3
+                    // Row 1: HU2 HU3 HU4 HU5
+                    // Row 2: HU4 HU5 L3  L3
+                    // Row 3: L3  L3  L3  L3
+                    output[0] = (byte)HU0; output[1] = (byte)HU1; output[2] = (byte)HU2; output[3] = (byte)HU3;
+                    output[4] = (byte)HU2; output[5] = (byte)HU3; output[6] = (byte)HU4; output[7] = (byte)HU5;
+                    output[8] = (byte)HU4; output[9] = (byte)HU5; output[10] = L3; output[11] = L3;
+                    output[12] = L3; output[13] = L3; output[14] = L3; output[15] = L3;
                     break;
                 }
         }

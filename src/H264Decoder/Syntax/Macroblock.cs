@@ -13,8 +13,13 @@ public sealed class Macroblock
     public int CbpChroma { get; set; }
     public int QpY { get; set; }
 
-    /// <summary>16 entries — Intra_4x4 prediction modes (I_NxN only).</summary>
+    /// <summary>16 entries — raw Intra_4x4 prediction codewords (I_NxN only):
+    /// -1 means "use the neighbor-predicted mode", otherwise a 3-bit rem_mode value (0..7).</summary>
     public int[] Intra4x4PredMode { get; } = new int[16];
+
+    /// <summary>16 entries — resolved Intra_4x4 modes (0..8) after applying the
+    /// prediction-from-neighbors rule. Set by the reconstructor.</summary>
+    public int[] Intra4x4Mode { get; } = new int[16];
 
     /// <summary>Intra_16x16 DC block — 16 DC coefficients in zig-zag scan order.</summary>
     public int[] LumaDc { get; } = new int[16];

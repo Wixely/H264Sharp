@@ -7,6 +7,9 @@ namespace H264Decoder;
 
 public sealed class H264FrameDecoder
 {
+    /// <summary>For testing/debugging: the per-MB parse state from the most recent decode.</summary>
+    public Macroblock[]? LastMacroblocks { get; private set; }
+
     /// <summary>
     /// Decode the first I-frame from an Annex-B byte stream. Returns the reconstructed
     /// YUV 4:2:0 picture. Deblocking is NOT applied at this stage.
@@ -61,13 +64,17 @@ public sealed class H264FrameDecoder
 
             Macroblock? leftMb = mbX > 0 ? mbs[addr - 1] : null;
             Macroblock? topMb = mbY > 0 ? mbs[addr - mbsPerRow] : null;
+            Macroblock? topRightMb = (mbY > 0 && mbX + 1 < mbsPerRow)
+                ? mbs[addr - mbsPerRow + 1]
+                : null;
 
             Macroblock mb = MacroblockParser.Parse(
                 ref reader, sps, pps, header,
                 leftMb, topMb, addr, ref qpY);
             mbs[addr] = mb;
 
-            MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY, pps.ChromaQpIndexOffset);
+            MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
+                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb);
         }
 
         if (header.DisableDeblockingFilterIdc != 1)
@@ -80,6 +87,7 @@ public sealed class H264FrameDecoder
                 filterMbEdges);
         }
 
+        LastMacroblocks = mbs;
         return picture;
     }
 

@@ -19,6 +19,8 @@ public static class MacroblockParser
 
     private static readonly int[] _spatialToRaster = BuildSpatialToRaster();
 
+    public static int SpatialToRaster(int x, int y) => _spatialToRaster[y * 4 + x];
+
     private static int[] BuildSpatialToRaster()
     {
         var r = new int[16];

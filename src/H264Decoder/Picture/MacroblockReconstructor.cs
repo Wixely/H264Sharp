@@ -31,14 +31,23 @@ internal static class MacroblockReconstructor
         Macroblock mb,
         DecodedPicture picture,
         int mbX, int mbY,
-        int chromaQpIndexOffset)
+        int chromaQpIndexOffset,
+        Macroblock? leftMb,
+        Macroblock? topMb,
+        Macroblock? topRightMb)
     {
-        if (mb.Type.PredMode != MbPartPredMode.Intra16x16)
+        if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
         {
-            throw new NotSupportedException("MacroblockReconstructor: only Intra_16x16 supported (Stage 10 phase 1)");
+            ReconstructLumaIntra16x16(mb, picture, mbX, mbY);
         }
-
-        ReconstructLumaIntra16x16(mb, picture, mbX, mbY);
+        else if (mb.Type.PredMode == MbPartPredMode.Intra4x4)
+        {
+            ReconstructLumaIntra4x4(mb, picture, mbX, mbY, leftMb, topMb, topRightMb);
+        }
+        else
+        {
+            throw new NotSupportedException($"MacroblockReconstructor: PredMode {mb.Type.PredMode} not supported");
+        }
 
         int qPc = ChromaQp(mb.QpY, chromaQpIndexOffset);
         ReconstructChroma(mb, picture, mbX, mbY, qPc);
@@ -136,6 +145,175 @@ internal static class MacroblockReconstructor
                     picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
                 }
         }
+    }
+
+    // ---------------- Luma (I_NxN / Intra_4x4) ----------------
+    private static void ReconstructLumaIntra4x4(
+        Macroblock mb, DecodedPicture picture, int mbX, int mbY,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb)
+    {
+        Span<byte> top = stackalloc byte[8];
+        Span<byte> left = stackalloc byte[4];
+        Span<byte> predBlock = stackalloc byte[16];
+        Span<int> coeffsScan = stackalloc int[16];
+        Span<int> coeffsRaster = stackalloc int[16];
+
+        for (int i = 0; i < 16; i++)
+        {
+            (int bx, int by) = MacroblockParser.LumaBlockPos[i];
+            int px0 = mbX * 16 + bx * 4;
+            int py0 = mbY * 16 + by * 4;
+
+            // Resolve actual prediction mode from neighbor blocks (spec §8.3.1.1).
+            int predicted = PredictIntra4x4Mode(mb, leftMb, topMb, bx, by);
+            int raw = mb.Intra4x4PredMode[i];
+            int actual = raw < 0
+                ? predicted
+                : (raw < predicted ? raw : raw + 1);
+            mb.Intra4x4Mode[i] = actual;
+
+            // Gather neighbor samples (top, top-right, left, top-left).
+            bool topAvail = py0 > 0;
+            bool leftAvail = px0 > 0;
+            bool topLeftAvail = topAvail && leftAvail;
+            bool topRightAvail = ComputeTopRightAvail(i, bx, by, mbX, mbY,
+                picture.Width, leftMb, topMb, topRightMb);
+
+            if (topAvail)
+            {
+                int srcY = py0 - 1;
+                for (int k = 0; k < 4; k++) top[k] = picture.Y[srcY * picture.Width + px0 + k];
+                if (topRightAvail)
+                {
+                    for (int k = 0; k < 4; k++) top[4 + k] = picture.Y[srcY * picture.Width + px0 + 4 + k];
+                }
+                else
+                {
+                    byte fill = top[3];
+                    top[4] = fill; top[5] = fill; top[6] = fill; top[7] = fill;
+                }
+            }
+            if (leftAvail)
+            {
+                int srcX = px0 - 1;
+                for (int k = 0; k < 4; k++) left[k] = picture.Y[(py0 + k) * picture.Width + srcX];
+            }
+            byte topLeft = topLeftAvail
+                ? picture.Y[(py0 - 1) * picture.Width + (px0 - 1)]
+                : (byte)0;
+
+            // Predict
+            IntraPrediction.PredictIntra4x4(
+                (IntraPrediction.Intra4x4Mode)actual,
+                top, topAvail, topRightAvail,
+                left, leftAvail,
+                topLeft, topLeftAvail,
+                predBlock);
+
+            // Residual: 16 zigzag-scanned coefficients in mb.Luma[i, 0..15]
+            bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+            if (coded)
+            {
+                for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
+                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
+                InverseTransform.Inverse4x4(coeffsRaster);
+            }
+            else
+            {
+                coeffsRaster.Clear();
+            }
+
+            // Add prediction + residual, clip, write to picture.
+            for (int yy = 0; yy < 4; yy++)
+                for (int xx = 0; xx < 4; xx++)
+                {
+                    int v = predBlock[yy * 4 + xx] + coeffsRaster[yy * 4 + xx];
+                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                }
+        }
+    }
+
+    /// <summary>
+    /// Predicted Intra_4x4 mode from neighbor blocks (spec §8.3.1.1).
+    /// Returns 2 (DC) if either neighbor is unavailable or non-Intra_4x4.
+    /// </summary>
+    private static int PredictIntra4x4Mode(
+        Macroblock mb, Macroblock? leftMb, Macroblock? topMb, int bx, int by)
+    {
+        int leftMode = NeighborIntra4x4Mode(mb, leftMb, topMb, bx - 1, by, isLeft: true);
+        int topMode = NeighborIntra4x4Mode(mb, leftMb, topMb, bx, by - 1, isLeft: false);
+
+        if (leftMode < 0 || topMode < 0) return 2; // DC fallback
+        return leftMode < topMode ? leftMode : topMode;
+    }
+
+    private static int NeighborIntra4x4Mode(
+        Macroblock cur, Macroblock? leftMb, Macroblock? topMb,
+        int bx, int by, bool isLeft)
+    {
+        // Returns -1 only when the neighbor MB is *unavailable*. When the neighbor MB
+        // is available but not Intra_4x4 (e.g. Intra_16x16), the spec treats its mode
+        // as DC (2) for the purpose of predicting the current block's mode.
+        if (bx >= 0 && by >= 0)
+        {
+            int neighborIdx = MacroblockParser.SpatialToRaster(bx, by);
+            return cur.Intra4x4Mode[neighborIdx];
+        }
+        if (bx < 0)
+        {
+            if (leftMb is null) return -1;
+            if (leftMb.Type.PredMode != MbPartPredMode.Intra4x4) return 2;
+            return leftMb.Intra4x4Mode[MacroblockParser.SpatialToRaster(3, by)];
+        }
+        if (by < 0)
+        {
+            if (topMb is null) return -1;
+            if (topMb.Type.PredMode != MbPartPredMode.Intra4x4) return 2;
+            return topMb.Intra4x4Mode[MacroblockParser.SpatialToRaster(bx, 3)];
+        }
+        _ = isLeft;
+        return -1;
+    }
+
+    /// <summary>
+    /// Whether the top-right 4-sample neighbor of an Intra_4x4 block has already
+    /// been reconstructed. Some in-MB scan positions never have top-right available
+    /// (i ∈ {3, 7, 11, 13, 15}) because the block to the upper-right is decoded later
+    /// in scan order or lives in the not-yet-decoded right-neighbor MB.
+    /// </summary>
+    private static bool ComputeTopRightAvail(
+        int i, int bx, int by, int mbX, int mbY, int pictureWidth,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb)
+    {
+        _ = leftMb;
+        // Out-of-MB cases (when bx == 3) cross the right MB boundary.
+        if (bx == 3)
+        {
+            if (by == 0)
+            {
+                // Top-right is in the top-right neighbor MB; available iff that MB exists.
+                if (topRightMb is null) return false;
+                return mbX * 16 + 16 < pictureWidth;
+            }
+            // Other right-column blocks (by > 0): top-right lies in the right-neighbor
+            // MB which hasn't been decoded yet.
+            return false;
+        }
+
+        // In-MB cases. Per the standard scan-order rule, these are unavailable:
+        //   i == 3 (block (1,1)): TR at (2,0) = i=4, not yet decoded
+        //   i == 11 (block (1,3)): TR at (2,2) = i=12, not yet decoded
+        if (i == 3 || i == 11) return false;
+
+        // Top edge (by == 0) and bx < 3: TR is in the top neighbor MB, available iff topMb exists.
+        if (by == 0)
+        {
+            return topMb != null;
+        }
+
+        // Otherwise the TR block is within the same MB and already decoded.
+        return true;
     }
 
     // ---------------- Chroma ----------------

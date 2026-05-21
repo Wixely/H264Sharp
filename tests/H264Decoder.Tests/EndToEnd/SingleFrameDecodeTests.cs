@@ -85,4 +85,30 @@ public sealed class SingleFrameDecodeTests
         Assert.True(maxU <= 2, $"u max abs error = {maxU}");
         Assert.True(maxV <= 2, $"v max abs error = {maxV}");
     }
+
+    [Fact]
+    public void DecodeTestsrc32x32_HandlesIntra4x4()
+    {
+        // testsrc is detailed enough that x264 picks ~75% Intra_4x4 macroblocks.
+        var sample = FfmpegFixture.Testsrc32x32();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        var pic = new H264FrameDecoder().DecodeFirstIFrame(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+
+        int maxY = 0;
+        for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[i]));
+        int maxU = 0;
+        for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(pic.U[i] - reference[yLen + i]));
+        int maxV = 0;
+        for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(pic.V[i] - reference[yLen + cLen + i]));
+
+        // Allow a couple LSB of slack at the worst sample — same threshold as the
+        // 4-quadrants test, which is effectively bit-exact in practice.
+        Assert.True(maxY <= 2, $"luma max abs error = {maxY}");
+        Assert.True(maxU <= 2, $"u max abs error = {maxU}");
+        Assert.True(maxV <= 2, $"v max abs error = {maxV}");
+    }
 }
