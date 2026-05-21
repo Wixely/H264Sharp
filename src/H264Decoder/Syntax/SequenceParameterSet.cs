@@ -62,9 +62,9 @@ public sealed class SequenceParameterSet
     {
         var r = new BitReader(rbsp);
         byte profileIdc = (byte)r.ReadBits(8);
-        if (profileIdc != 66)
+        if (profileIdc != 66 && profileIdc != 77 && profileIdc != 88 && profileIdc != 100)
         {
-            throw new NotSupportedException($"SPS profile_idc {profileIdc} is not Baseline (66)");
+            throw new NotSupportedException($"SPS profile_idc {profileIdc} not supported (Baseline/Main/Extended/High only)");
         }
 
         bool cs0 = r.ReadBit() == 1;
@@ -78,7 +78,30 @@ public sealed class SequenceParameterSet
         byte levelIdc = (byte)r.ReadBits(8);
         uint spsId = ExpGolomb.ReadUe(ref r);
 
-        // Baseline (profile_idc == 66) skips the chroma_format_idc / bit_depth fields.
+        // High profile (100) carries chroma_format_idc / bit_depth fields here.
+        // Restrict to 4:2:0, 8-bit, no scaling lists, no separate colour plane.
+        if (profileIdc == 100 || profileIdc == 110 || profileIdc == 122 || profileIdc == 244 ||
+            profileIdc == 44 || profileIdc == 83 || profileIdc == 86 || profileIdc == 118 ||
+            profileIdc == 128 || profileIdc == 138 || profileIdc == 139 || profileIdc == 134 || profileIdc == 135)
+        {
+            uint chromaFormatIdc = ExpGolomb.ReadUe(ref r);
+            if (chromaFormatIdc != 1)
+            {
+                throw new NotSupportedException($"SPS chroma_format_idc {chromaFormatIdc} not supported (4:2:0 only)");
+            }
+            uint bitDepthLumaMinus8 = ExpGolomb.ReadUe(ref r);
+            uint bitDepthChromaMinus8 = ExpGolomb.ReadUe(ref r);
+            if (bitDepthLumaMinus8 != 0 || bitDepthChromaMinus8 != 0)
+            {
+                throw new NotSupportedException("SPS bit_depth != 8 not supported");
+            }
+            _ = r.ReadBit(); // qpprime_y_zero_transform_bypass_flag
+            bool seqScalingMatrixPresent = r.ReadBit() == 1;
+            if (seqScalingMatrixPresent)
+            {
+                throw new NotSupportedException("SPS seq_scaling_matrix_present_flag=1 not supported");
+            }
+        }
 
         uint log2MaxFrameNumMinus4 = ExpGolomb.ReadUe(ref r);
         uint picOrderCntType = ExpGolomb.ReadUe(ref r);

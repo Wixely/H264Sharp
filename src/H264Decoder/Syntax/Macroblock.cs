@@ -13,6 +13,9 @@ public sealed class Macroblock
 {
     public int MbAddress { get; init; }
     public IntraMbType Type { get; init; }
+
+    /// <summary>True when this MB is a P_Skip (P-slice only): no syntax was read; MV derived per §8.4.1.1.</summary>
+    public bool IsSkipped { get; init; }
     public IntraChromaPredMode ChromaPredMode { get; set; }
     public int CbpLuma { get; set; }
     public int CbpChroma { get; set; }
@@ -43,6 +46,16 @@ public sealed class Macroblock
 
     /// <summary>Per-block chroma AC non-zero count.</summary>
     public int[,] NonZeroCountChromaAc { get; } = new int[2, 4];
+
+    // ---- CABAC coded_block_flag tracking (per-block, used as neighbor context for §9.3.3.1.1.9) ----
+    /// <summary>coded_block_flag for Intra16x16 luma DC block (single block).</summary>
+    public bool LumaDcCbf { get; set; }
+    /// <summary>coded_block_flag for each of the 16 4x4 luma blocks (raster scan).</summary>
+    public bool[] LumaAcCbf { get; } = new bool[16];
+    /// <summary>coded_block_flag for the 2 chroma DC blocks (one per component).</summary>
+    public bool[] ChromaDcCbf { get; } = new bool[2];
+    /// <summary>coded_block_flag for the 4 chroma AC blocks per component.</summary>
+    public bool[,] ChromaAcCbf { get; } = new bool[2, 4];
 
     // ---- P-slice inter fields (for P_L0_16x16 currently) ----
 

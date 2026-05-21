@@ -108,6 +108,21 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 16x16 red clip encoded with CABAC (Main profile): IDR + P_Skip.
+    /// Exercises the CABAC arithmetic engine, I-slice CABAC mb_type/residual, mb_skip_flag.</summary>
+    public static Sample TwoFramesIdentical16x16Cabac()
+    {
+        const int W = 16, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_red_16x16_cabac.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_red_16x16_cabac.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i color=c=red:s={W}x{H}:d=1:r=2 -frames:v 2 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v main -bf 0 -keyint_min 99 -g 99 -coder 1 -an " +
+            $"-x264-params \"no-deblock=1\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 16x16 red clip: I-frame + identical P-frame (all P_Skip).</summary>
     public static Sample TwoFramesIdentical16x16()
     {

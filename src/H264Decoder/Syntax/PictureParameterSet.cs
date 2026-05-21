@@ -29,10 +29,6 @@ public sealed class PictureParameterSet
         uint ppsId = ExpGolomb.ReadUe(ref r);
         uint spsId = ExpGolomb.ReadUe(ref r);
         bool entropyCoding = r.ReadBit() == 1;
-        if (entropyCoding)
-        {
-            throw new NotSupportedException("PPS entropy_coding_mode_flag=1 (CABAC) not supported");
-        }
         bool bottomFieldPoc = r.ReadBit() == 1;
         uint numSliceGroupsMinus1 = ExpGolomb.ReadUe(ref r);
         if (numSliceGroupsMinus1 > 0)

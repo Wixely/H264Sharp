@@ -23,12 +23,4 @@ public sealed class PpsParserTests
         Assert.InRange(sliceQpBase, 0, 51);
     }
 
-    [Fact]
-    public void ThrowsOnCabacFlag()
-    {
-        // first ue(v)=pps_id=0 ("1"), second ue(v)=sps_id=0 ("1"), then entropy_coding=1
-        // bits: 1 1 1 ... -> first byte 1110_0000 = 0xE0
-        byte[] rbsp = [0xE0];
-        Assert.Throws<NotSupportedException>(() => PictureParameterSet.Parse(rbsp));
-    }
 }

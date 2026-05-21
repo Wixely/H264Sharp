@@ -264,6 +264,39 @@ public sealed class SingleFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeCabacIdrPlusSkip_MatchesFfmpegBitExact()
+    {
+        // 16x16 red, Main profile, CABAC (-coder 1). x264 emits an IDR followed by a
+        // P_Skip frame. Exercises: PPS entropy_coding_mode_flag=1, I-slice CABAC mb_type
+        // (Intra_16x16) + intra_chroma_pred_mode + mb_qp_delta + residual_block_cabac,
+        // and P-slice mb_skip_flag + end_of_slice_flag.
+        var sample = FfmpegFixture.TwoFramesIdentical16x16Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        List<DecodedPicture> frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            DecodedPicture pic = frames[f];
+            int off = f * frameStride;
+            int maxY = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[off + i]));
+            int maxU = 0;
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(pic.U[i] - reference[off + yLen + i]));
+            int maxV = 0;
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(pic.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 1, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 1, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 1, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact]
     public void DecodeTestsrc32x32_HandlesIntra4x4()
     {
         // testsrc is detailed enough that x264 picks ~75% Intra_4x4 macroblocks.

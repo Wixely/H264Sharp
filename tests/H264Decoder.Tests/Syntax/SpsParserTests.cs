@@ -47,10 +47,11 @@ public sealed class SpsParserTests
     }
 
     [Fact]
-    public void ThrowsOnNonBaselineProfile()
+    public void ThrowsOnUnsupportedProfile()
     {
-        // profile_idc=100 (High) -> NotSupportedException
-        byte[] rbsp = [100, 0, 0, 0, 0]; // profile + 8 bits of flags etc; doesn't matter, throws before reading further
+        // profile_idc=50 isn't a real H.264 profile and isn't in our allow-list
+        // (Baseline=66, Main=77, Extended=88, High=100 and friends).
+        byte[] rbsp = [50, 0, 0, 0, 0];
         Assert.Throws<NotSupportedException>(() => SequenceParameterSet.Parse(rbsp));
     }
 }

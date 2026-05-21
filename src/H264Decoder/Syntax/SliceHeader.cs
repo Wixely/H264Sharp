@@ -40,7 +40,37 @@ public sealed class SliceHeader
     public uint NumRefIdxL0ActiveMinus1 { get; init; }
     public bool NumRefIdxActiveOverrideFlag { get; init; }
 
+    // CABAC
+    public uint CabacInitIdc { get; init; }
+
     public int SliceQpY(PictureParameterSet pps) => 26 + pps.PicInitQpMinus26 + SliceQpDelta;
+
+    /// <summary>Parse-and-discard pred_weight_table (§7.3.3.2). We don't apply the weights —
+    /// our MC path is unweighted — but we need to consume the bits so subsequent slice header
+    /// fields align correctly.</summary>
+    internal static void SkipPredWeightTable(ref BitReader r, uint numRefIdxL0ActiveMinus1, bool hasChroma)
+    {
+        _ = ExpGolomb.ReadUe(ref r); // luma_log2_weight_denom
+        if (hasChroma) _ = ExpGolomb.ReadUe(ref r); // chroma_log2_weight_denom
+        for (uint i = 0; i <= numRefIdxL0ActiveMinus1; i++)
+        {
+            bool lumaFlag = r.ReadBit() == 1;
+            if (lumaFlag)
+            {
+                _ = ExpGolomb.ReadSe(ref r); // luma_weight_l0[i]
+                _ = ExpGolomb.ReadSe(ref r); // luma_offset_l0[i]
+            }
+            if (hasChroma)
+            {
+                bool chromaFlag = r.ReadBit() == 1;
+                if (chromaFlag)
+                {
+                    _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r); // weight,offset Cb
+                    _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r); // weight,offset Cr
+                }
+            }
+        }
+    }
 
     public static SliceHeader Parse(
         ReadOnlySpan<byte> rbsp,
@@ -119,7 +149,14 @@ public sealed class SliceHeader
             }
         }
 
-        // No pred_weight_table for our subset (weighted_pred_flag is 0 in baseline x264 default).
+        // pred_weight_table() (§7.3.3.2). x264 emits this when weighted_pred_flag=1 even if
+        // no actual weights are used. We parse-and-discard since weighted prediction isn't
+        // implemented in our reconstructor (the default unweighted MC path produces correct
+        // output when all weights are zero, which is the common case).
+        if (pps.WeightedPredFlag && (sliceType == SliceType.P || sliceType == SliceType.SP))
+        {
+            SkipPredWeightTable(ref r, numRefIdxL0ActiveMinus1, hasChroma: true);
+        }
 
         bool noOutputPriorPics = false;
         bool longTermRef = false;
@@ -135,14 +172,27 @@ public sealed class SliceHeader
                 bool adaptive = r.ReadBit() == 1;
                 if (adaptive)
                 {
-                    // memory_management_control_operation loop — rare for our pipeline; reject.
-                    throw new NotSupportedException(
-                        "adaptive_ref_pic_marking_mode_flag=1 not supported");
+                    // memory_management_control_operation loop (§7.3.3.3). We parse the loop
+                    // structure but reject any actual operations — the common case x264 emits
+                    // is adaptive=1 with an empty loop (immediate op=0 terminator).
+                    while (true)
+                    {
+                        uint mmco = ExpGolomb.ReadUe(ref r);
+                        if (mmco == 0) break;
+                        throw new NotSupportedException(
+                            $"memory_management_control_operation {mmco} not supported");
+                    }
                 }
             }
         }
 
-        // entropy_coding_mode_flag=0, slice_type=I -> no cabac_init_idc
+        uint cabacInitIdc = 0;
+        if (pps.EntropyCodingModeFlag && sliceType != SliceType.I)
+        {
+            cabacInitIdc = ExpGolomb.ReadUe(ref r);
+            if (cabacInitIdc > 2) throw new InvalidDataException($"cabac_init_idc {cabacInitIdc} out of range");
+        }
+
         int sliceQpDelta = ExpGolomb.ReadSe(ref r);
 
         uint disableDeblockingIdc = 0;
@@ -180,6 +230,7 @@ public sealed class SliceHeader
             SliceBetaOffsetDiv2 = betaOffset / 2,
             NumRefIdxL0ActiveMinus1 = numRefIdxL0ActiveMinus1,
             NumRefIdxActiveOverrideFlag = numRefIdxOverride,
+            CabacInitIdc = cabacInitIdc,
         };
     }
 }
