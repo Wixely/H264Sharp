@@ -394,8 +394,12 @@ public sealed class SingleFrameDecodeTests
         Assert.True(maxV <= 2, $"v max abs error = {maxV}");
     }
 
-    [Fact(Skip = "Stage 5 CABAC ctxBlockCat=5 8x8 luma decode works for isolated I8x8 MBs but " +
-                 "desyncs at the I8x8 → I4x4 boundary; root cause under investigation.")]
+    [Fact(Skip = "Stage 5 CABAC ctxBlockCat=5 8x8 luma decode desyncs at MB5 (transform_size_8x8_flag " +
+                 "reads 0 when it should be 1). All neighbor state (leftMb.TransformSize8x8) is propagated " +
+                 "correctly; CABAC engine bits are misaligned by the time MB5 is reached. Suspect 1 " +
+                 "(residual reader bit count) and suspect 2 (LumaAcCbf back-propagation) verified clean " +
+                 "in isolation, but a subtle bug in one of MB0..MB4's CABAC reads remains; root cause " +
+                 "still under investigation.")]
     public void DecodeMandelbrot128x96HighCabac8x8_Intra8x8()
     {
         // High-profile CABAC clip with 8x8 transform + Intra_8x8 prediction. Exercises Stage 5.
