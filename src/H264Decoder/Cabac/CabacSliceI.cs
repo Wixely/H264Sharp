@@ -89,13 +89,28 @@ internal static class CabacSliceI
             int ctxB = (topMb != null && topMb.TransformSize8x8) ? 1 : 0;
             int flag = cabac.DecodeBin(399 + ctxA + ctxB);
             mb.TransformSize8x8 = flag == 1;
-            if (mb.TransformSize8x8)
-            {
-                throw new NotSupportedException("CABAC transform_size_8x8_flag=1 (I_NxN) not yet supported");
-            }
         }
 
-        if (type.PredMode == MbPartPredMode.Intra4x4)
+        if (type.PredMode == MbPartPredMode.Intra4x4 && mb.TransformSize8x8)
+        {
+            // 4 luma 8x8 prediction modes. CABAC ctx is shared with 4x4 path (68/69).
+            for (int i = 0; i < 4; i++)
+            {
+                int prev = cabac.DecodeBin(68);
+                if (prev == 1)
+                {
+                    mb.Intra8x8PredMode[i] = -1;
+                }
+                else
+                {
+                    int r0 = cabac.DecodeBin(69);
+                    int r1 = cabac.DecodeBin(69);
+                    int r2 = cabac.DecodeBin(69);
+                    mb.Intra8x8PredMode[i] = (r2 << 2) | (r1 << 1) | r0;
+                }
+            }
+        }
+        else if (type.PredMode == MbPartPredMode.Intra4x4)
         {
             // 16 luma 4x4 prediction modes (raster scan).
             for (int i = 0; i < 16; i++)
@@ -137,7 +152,14 @@ internal static class CabacSliceI
                 int mbQpDelta = CabacCommon.DecodeMbQpDelta(cabac, ref prevMbQpDeltaState);
                 qpYRunning = CabacCommon.Mod52(qpYRunning + mbQpDelta);
                 mb.QpY = qpYRunning;
-                ReadResidualIntra4x4(cabac, mb, leftMb, topMb);
+                if (mb.TransformSize8x8)
+                {
+                    ReadResidualIntra8x8(cabac, mb, leftMb, topMb);
+                }
+                else
+                {
+                    ReadResidualIntra4x4(cabac, mb, leftMb, topMb);
+                }
             }
             else
             {
@@ -338,6 +360,78 @@ internal static class CabacSliceI
                     {
                         mb.NonZeroCountChromaAc[c, i] = 1;
                         for (int j = 0; j < 16; j++) mb.ChromaAc[c, i, j] = coeffs[j];
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // I_NxN + transform_size_8x8 residual: 4 luma 8x8 blocks (ctxBlockCat=5,
+    // no coded_block_flag — gated by CBP-luma bit), plus chroma DC/AC.
+    // ---------------------------------------------------------------------
+    private static void ReadResidualIntra8x8(
+        CabacDecoder cabac, Macroblock mb, Macroblock? leftMb, Macroblock? topMb)
+    {
+        Span<int> coeffs8 = stackalloc int[64];
+        for (int i8 = 0; i8 < 4; i8++)
+        {
+            bool coded = (mb.CbpLuma & (1 << i8)) != 0;
+            // Propagate the 8x8 CBP bit to the 4 contained 4x4 sub-blocks so neighbor
+            // condTermFlag derivation for the next MB sees the right per-4x4 CBF.
+            int bx0 = (i8 & 1) * 2, by0 = (i8 >> 1) * 2;
+            for (int sy = 0; sy < 2; sy++)
+                for (int sx = 0; sx < 2; sx++)
+                {
+                    int idx = MacroblockParser.SpatialToRaster(bx0 + sx, by0 + sy);
+                    mb.LumaAcCbf[idx] = coded;
+                    if (coded) mb.NonZeroCountLuma[idx] = 1;
+                }
+            if (!coded) continue;
+            CabacResidual.ReadResidualBlock8x8(cabac, coeffs8);
+            int total = 0;
+            for (int j = 0; j < 64; j++)
+            {
+                mb.Luma8x8[i8, j] = coeffs8[j];
+                if (coeffs8[j] != 0) total++;
+            }
+            mb.NonZeroCountLuma8x8[i8] = total;
+        }
+
+        Span<int> chromaCoeffs = stackalloc int[16];
+        if ((mb.CbpChroma & 3) != 0)
+        {
+            Span<int> dcCoeffs = stackalloc int[4];
+            for (int c = 0; c < 2; c++)
+            {
+                int caC = (leftMb == null) ? 1 : (leftMb.ChromaDcCbf[c] ? 1 : 0);
+                int cbC = (topMb == null) ? 1 : (topMb.ChromaDcCbf[c] ? 1 : 0);
+                bool cbf = CabacResidual.ReadResidualBlock(
+                    cabac, dcCoeffs, maxNumCoeff: 4, ctxBlockCat: CabacResidual.CatChromaDc,
+                    condTermFlagA: caC, condTermFlagB: cbC);
+                mb.ChromaDcCbf[c] = cbf;
+                if (cbf)
+                {
+                    for (int j = 0; j < 4; j++) mb.ChromaDc[c, j] = dcCoeffs[j];
+                }
+            }
+        }
+
+        if ((mb.CbpChroma & 2) != 0)
+        {
+            for (int c = 0; c < 2; c++)
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    (int cA, int cB) = ChromaAcNeighborCbf(c, i, mb, leftMb, topMb);
+                    bool acCbf = CabacResidual.ReadResidualBlock(
+                        cabac, chromaCoeffs, maxNumCoeff: 15, ctxBlockCat: CabacResidual.CatChromaAc,
+                        condTermFlagA: cA, condTermFlagB: cB);
+                    mb.ChromaAcCbf[c, i] = acCbf;
+                    if (acCbf)
+                    {
+                        mb.NonZeroCountChromaAc[c, i] = 1;
+                        for (int j = 0; j < 16; j++) mb.ChromaAc[c, i, j] = chromaCoeffs[j];
                     }
                 }
             }

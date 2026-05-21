@@ -145,6 +145,114 @@ internal static class CabacResidual
         return true;
     }
 
+    // Spec Table 9-43, ctxBlockCat=5 frame-coded: position-to-ctxIdxInc maps (63 entries each).
+    private static readonly byte[] SigMap5Frame = new byte[]
+    {
+         0,  1,  2,  3,  4,  5,  5,  4,  4,  3,
+         3,  4,  4,  4,  5,  5,  4,  4,  4,  4,
+         3,  3,  6,  7,  7,  7,  8,  9, 10,  9,
+         8,  7,  7,  6, 11, 12, 13, 11,  6,  7,
+         8,  9, 14, 10,  9,  8,  6, 11, 12, 13,
+        11,  6,  9, 14, 10,  9, 11, 12, 13, 11,
+        14, 10, 12,
+    };
+
+    // Note: per openh264 g_kuiCabacLastSignificantCoeffFlagMap8x8, last cat=5 uses 9 ctxs (0..8).
+    private static readonly byte[] LastMap5Frame = new byte[]
+    {
+        0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
+        2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+        4, 4, 4, 4, 4, 4, 4, 4, 5, 5,
+        5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8,
+    };
+
+    // Spec Table 9-42 ctxIdx bases for ctxBlockCat=5 (Luma8x8, frame-coded).
+    private const int CtxSig5Start = 402;     // significant_coeff_flag base
+    private const int CtxLast5Start = 417;    // last_significant_coeff_flag base
+    private const int CtxAbs5Start = 426;     // coeff_abs_level_minus1 base
+
+    /// <summary>
+    /// Decode one 8x8 luma residual block in CABAC (ctxBlockCat=5). The block has no
+    /// coded_block_flag in the bitstream — the caller's CBP bit signals presence. The
+    /// 63 scan positions use spec Table 9-43 position-dependent ctxIdxInc maps.
+    /// Coefficients are written at scan position (matching the CAVLC convention).
+    /// </summary>
+    public static void ReadResidualBlock8x8(CabacDecoder cabac, scoped Span<int> coeffs)
+    {
+        coeffs.Clear();
+
+        // 1) significant_coeff_flag / last_significant_coeff_flag along 63 scan positions.
+        Span<bool> sigMap = stackalloc bool[64];
+        for (int i = 0; i < 63; i++)
+        {
+            int sig = cabac.DecodeBin(CtxSig5Start + SigMap5Frame[i]);
+            if (sig == 1)
+            {
+                sigMap[i] = true;
+                int last = cabac.DecodeBin(CtxLast5Start + LastMap5Frame[i]);
+                if (last == 1)
+                {
+                    goto DecodeLevels;
+                }
+            }
+        }
+        // Position 63 is implicitly significant if we never saw last==1.
+        sigMap[63] = true;
+
+        DecodeLevels:
+
+        // 2) Reverse-scan absolute level + sign decode (same UEGk(k=0,uCoff=14) flow as cat 0..4).
+        int numDecodAbsLevelEq1 = 0;
+        int numDecodAbsLevelGt1 = 0;
+        for (int i = 63; i >= 0; i--)
+        {
+            if (!sigMap[i]) continue;
+
+            int ctxIdxInc0 = (numDecodAbsLevelGt1 != 0)
+                ? 0
+                : Math.Min(4, 1 + numDecodAbsLevelEq1);
+            int b0 = cabac.DecodeBin(CtxAbs5Start + ctxIdxInc0);
+
+            int absLevelMinus1;
+            if (b0 == 0)
+            {
+                absLevelMinus1 = 0;
+                numDecodAbsLevelEq1++;
+            }
+            else
+            {
+                int ctxIdxIncK = 5 + Math.Min(4, numDecodAbsLevelGt1);
+                int ctxIdxK = CtxAbs5Start + ctxIdxIncK;
+
+                int prefixOnes = 1;
+                while (prefixOnes < 14)
+                {
+                    int bk = cabac.DecodeBin(ctxIdxK);
+                    if (bk == 0) break;
+                    prefixOnes++;
+                }
+
+                if (prefixOnes < 14)
+                {
+                    absLevelMinus1 = prefixOnes;
+                }
+                else
+                {
+                    int egValue = ReadExpGolombBypass(cabac, k: 0);
+                    absLevelMinus1 = 14 + egValue;
+                }
+                numDecodAbsLevelGt1++;
+            }
+
+            int sign = cabac.DecodeBypass();
+            int level = absLevelMinus1 + 1;
+            coeffs[i] = sign == 1 ? -level : level;
+        }
+    }
+
     /// <summary>EGk decoder in bypass mode (spec §9.3.3.2.3). Returns the non-negative value.</summary>
     private static int ReadExpGolombBypass(CabacDecoder cabac, int k)
     {
