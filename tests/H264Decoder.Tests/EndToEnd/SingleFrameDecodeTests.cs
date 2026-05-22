@@ -400,7 +400,15 @@ public sealed class SingleFrameDecodeTests
         }
     }
 
-    [Fact(Skip = "Pending: P-frame frame 1 diverges by ~234 luma. Distinct from the textured P_L0_16x16 desync (now fixed via the CBP-luma P_Skip-neighbor condTermFlag rule). Remaining failure is specific to the P_8x8 sub-MB-partition path (sub_mb_type / per-sub-partition mvd / per-sub-partition ref_idx).")]
+    [Fact(Skip = "Pending: P-frame frame 1 maxY=234. Diag (ffmpeg -debug mb_type ground truth vs LastMacroblocks): " +
+                 "MB6 (P_8x8 / 4x 8x8 sub-MBs) and MB7 (P_16x16) parse cleanly (per-MB pixel error <=20). " +
+                 "First structural divergence is at MB9: ffmpeg marks it P_16x16 but our CABAC parser reads " +
+                 "mb_type bin0=1 and enters the intra branch (Intra4x4). MB8 is the first P_8x8 with mixed " +
+                 "sub_mb_types (q0=PL0_8x8, q1..q3=PL0_4x4) — 13 sub-partitions, 26 mvd pairs — and is " +
+                 "the most likely culprit for the bit-stream desync that leaves MB9 misaligned. " +
+                 "DecodeSubMbTypeP / DecodeMvd / ReadResidualInter for the mixed-sub_mb_type P_8x8 case " +
+                 "are the next places to bisect; bit-position telemetry is now exposed via Macroblock." +
+                 "ParseStartBit/EndBit for both CAVLC and CABAC P-slice MBs.")]
     public void DecodeCabacTwoFramesAllPartitions_AllShapes()
     {
         var sample = FfmpegFixture.TwoFramesAllPartitions128x96Cabac();

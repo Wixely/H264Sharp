@@ -171,7 +171,7 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
-    /// <summary>Two-frame 16x16 red clip encoded with CABAC (Main profile): IDR + P_Skip.
+/// <summary>Two-frame 16x16 red clip encoded with CABAC (Main profile): IDR + P_Skip.
     /// Exercises the CABAC arithmetic engine, I-slice CABAC mb_type/residual, mb_skip_flag.</summary>
     public static Sample TwoFramesIdentical16x16Cabac()
     {

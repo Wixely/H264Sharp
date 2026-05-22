@@ -21,6 +21,7 @@ internal static class CabacSliceP
         ref int prevMbQpDeltaState,
         bool transform8x8ModeFlag = false)
     {
+        int _diagStart = cabac.CurrentBitPos;
         int mbTypeCode = DecodeMbTypeP(cabac, leftMb, topMb);
         if (mbTypeCode >= 5)
         {
@@ -89,6 +90,8 @@ internal static class CabacSliceP
             // No qp_delta read → reset the prev-state.
             prevMbQpDeltaState = 0;
         }
+        mb.ParseStartBit = _diagStart;
+        mb.ParseEndBit = cabac.CurrentBitPos;
         return mb;
     }
 
