@@ -49,7 +49,11 @@ public static class Mp4Reader
     /// sample metadata plus a reference to <paramref name="stream"/> for lazy NAL
     /// resolution. Caller owns the stream lifetime; we do not dispose it.
     /// </summary>
-    public static Mp4SampleStream ExtractH264WithTiming(Stream stream)
+    public static Mp4SampleStream ExtractH264WithTiming(Stream stream) =>
+        ExtractH264WithTiming(stream, stderr: null);
+
+    /// <summary>Streaming entry point with a writer for diagnostic warnings (e.g. unsupported edit lists).</summary>
+    public static Mp4SampleStream ExtractH264WithTiming(Stream stream, TextWriter? stderr)
     {
         ArgumentNullException.ThrowIfNull(stream);
         if (!stream.CanSeek) throw new ArgumentException("MP4: stream must be seekable", nameof(stream));
@@ -108,11 +112,11 @@ public static class Mp4Reader
         }
 
         if (moovBytes is null) throw new InvalidDataException("MP4: no 'moov' box");
-        return ParseMoov(moovBytes, stream, moofRegions);
+        return ParseMoov(moovBytes, stream, moofRegions, stderr);
     }
 
     private static Mp4SampleStream ParseMoov(byte[] moovBytes, Stream source,
-        List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions)
+        List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions, TextWriter? stderr)
     {
         ReadOnlySpan<byte> moov = moovBytes;
 
@@ -133,6 +137,11 @@ public static class Mp4Reader
 
         // Media header — per-track timescale (used for stts/ctts deltas).
         uint mediaTimescale = ReadMdhdTimescale(mdia);
+
+        // Edit list — most commonly a single non-empty edit with media_time>0 that shifts
+        // composition times so the displayed timeline starts at 0 (B-pyramid compensation).
+        // We support that common case; anything more elaborate falls back to no offset.
+        long editMediaTimeOffset = ReadElstMediaTimeOffset(trak, movieTimescale, mediaTimescale, stderr);
 
         if (!TryFindChildBox(mdia, "minf", out int minfS, out int minfL))
             throw new InvalidDataException("MP4: no minf");
@@ -167,8 +176,8 @@ public static class Mp4Reader
         for (int i = 0; i < sampleCount; i++)
         {
             var (offset, size) = sampleOffsets[i];
-            double dtSec = cumulativeDt * tsInv;
-            double ctSec = (cumulativeDt + cttsOffsets[i]) * tsInv;
+            double dtSec = (cumulativeDt - editMediaTimeOffset) * tsInv;
+            double ctSec = (cumulativeDt + cttsOffsets[i] - editMediaTimeOffset) * tsInv;
             samples.Add(new Mp4Sample(offset, size, dtSec, ctSec, isSync[i], lengthSize));
             cumulativeDt += sttsDeltas[i];
         }
@@ -178,7 +187,7 @@ public static class Mp4Reader
         // real fragment data. In both cases the fragmented data is authoritative.
         if (moofRegions.Count > 0)
         {
-            var fragSamples = ParseFragments(source, moofRegions, videoTrackId, trex, lengthSize, tsInv);
+            var fragSamples = ParseFragments(source, moofRegions, videoTrackId, trex, lengthSize, tsInv, editMediaTimeOffset);
             if (fragSamples.Count > 0) samples = fragSamples;
         }
 
@@ -220,6 +229,60 @@ public static class Mp4Reader
             uint dur = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4 + 4, 4));
             return (ts, dur);
         }
+    }
+
+    // ISO/IEC 14496-12 §8.6.6: edts/elst. Returns the media_time offset (in media-timescale units)
+    // to subtract from every sample's decode/composition time so the timeline starts at 0.
+    // Empty edits (media_time == -1) are ignored. We support the common case of a single non-empty
+    // edit with media_rate == 1.0; anything more elaborate emits a warning and returns 0.
+    private static long ReadElstMediaTimeOffset(ReadOnlySpan<byte> trak, uint movieTimescale, uint mediaTimescale, TextWriter? stderr)
+    {
+        if (!TryFindChildBox(trak, "edts", out int edtsS, out int edtsL)) return 0;
+        var edts = trak.Slice(edtsS, edtsL);
+        if (!TryFindChildBox(edts, "elst", out int elstS, out int elstL)) return 0;
+        var b = edts.Slice(elstS, elstL);
+        if (b.Length < 8) return 0;
+        byte version = b[0];
+        int entryCount = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
+        if (entryCount <= 0) return 0;
+        int entrySize = version == 1 ? 20 : 12;
+        if (b.Length < 8 + entryCount * entrySize) return 0;
+
+        // Find the first non-empty entry (media_time != -1).
+        long firstMediaTime = -1;
+        int firstNonEmptyIdx = -1;
+        int nonEmptyCount = 0;
+        for (int i = 0; i < entryCount; i++)
+        {
+            int off = 8 + i * entrySize;
+            long mediaTime;
+            uint mediaRateRaw;
+            if (version == 1)
+            {
+                mediaTime = BinaryPrimitives.ReadInt64BigEndian(b.Slice(off + 8, 8));
+                mediaRateRaw = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(off + 16, 4));
+            }
+            else
+            {
+                mediaTime = BinaryPrimitives.ReadInt32BigEndian(b.Slice(off + 4, 4));
+                mediaRateRaw = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(off + 8, 4));
+            }
+            if (mediaTime < 0) continue; // empty edit — gap, no media presented
+            nonEmptyCount++;
+            // media_rate is 16.16 fixed point; 0x00010000 == 1.0. Anything else: unsupported.
+            if (mediaRateRaw != 0x00010000)
+            {
+                stderr?.WriteLine($"MP4: elst entry {i} has media_rate != 1.0 (0x{mediaRateRaw:X8}); ignoring edit list");
+                return 0;
+            }
+            if (firstNonEmptyIdx < 0) { firstNonEmptyIdx = i; firstMediaTime = mediaTime; }
+        }
+        if (firstNonEmptyIdx < 0) return 0;
+        if (nonEmptyCount > 1)
+        {
+            stderr?.WriteLine($"MP4: elst has {nonEmptyCount} non-empty entries; using first media_time={firstMediaTime} and approximating");
+        }
+        return firstMediaTime;
     }
 
     private static uint ReadMdhdTimescale(ReadOnlySpan<byte> mdia)
@@ -562,7 +625,7 @@ public static class Mp4Reader
     // Iterate every moof region, parse traf/trun for the video track, and accumulate samples.
     private static List<Mp4Sample> ParseFragments(
         Stream source, List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions,
-        uint videoTrackId, TrexDefaults trex, int lengthSize, double tsInv)
+        uint videoTrackId, TrexDefaults trex, int lengthSize, double tsInv, long editMediaTimeOffset)
     {
         var samples = new List<Mp4Sample>();
         // Cumulative decode time across all fragments (in media timescale units). tfdt resets this.
@@ -578,7 +641,7 @@ public static class Mp4Reader
             if (ReadExact(source, moofBuf) != moofBuf.Length)
                 throw new InvalidDataException($"MP4: truncated moof at offset {region.Start}");
 
-            ParseMoof(moofBuf, region.Start, videoTrackId, trex, lengthSize, tsInv, samples, ref cumulativeDt);
+            ParseMoof(moofBuf, region.Start, videoTrackId, trex, lengthSize, tsInv, samples, ref cumulativeDt, editMediaTimeOffset);
         }
         return samples;
     }
@@ -586,7 +649,7 @@ public static class Mp4Reader
     // Parse one moof: iterate traf children, locating one whose tfhd.track_ID matches videoTrackId.
     private static void ParseMoof(byte[] moofBytes, long moofStart, uint videoTrackId,
         TrexDefaults trex, int lengthSize, double tsInv,
-        List<Mp4Sample> samples, ref long cumulativeDt)
+        List<Mp4Sample> samples, ref long cumulativeDt, long editMediaTimeOffset)
     {
         ReadOnlySpan<byte> moof = moofBytes;
         int p = 0;
@@ -598,7 +661,7 @@ public static class Mp4Reader
             if (ty == "traf")
             {
                 ParseTraf(moof.Slice(p + 8, sz - 8), moofStart, videoTrackId, trex, lengthSize, tsInv,
-                    samples, ref cumulativeDt);
+                    samples, ref cumulativeDt, editMediaTimeOffset);
             }
             // mfhd: ignored (sequence_number not needed for decoding correctness).
             p += sz;
@@ -607,7 +670,7 @@ public static class Mp4Reader
 
     private static void ParseTraf(ReadOnlySpan<byte> traf, long moofStart, uint videoTrackId,
         TrexDefaults trex, int lengthSize, double tsInv,
-        List<Mp4Sample> samples, ref long cumulativeDt)
+        List<Mp4Sample> samples, ref long cumulativeDt, long editMediaTimeOffset)
     {
         // tfhd is mandatory and first in well-formed traf.
         if (!TryFindChildBox(traf, "tfhd", out int tfhdS, out int tfhdL)) return;
@@ -663,7 +726,7 @@ public static class Mp4Reader
             if (ty == "trun")
             {
                 ParseTrun(traf.Slice(tp + 8, sz - 8), baseDataOffset, defDur, defSize, defFlags,
-                    lengthSize, tsInv, samples, ref cumulativeDt);
+                    lengthSize, tsInv, samples, ref cumulativeDt, editMediaTimeOffset);
             }
             tp += sz;
         }
@@ -672,7 +735,7 @@ public static class Mp4Reader
     private static void ParseTrun(ReadOnlySpan<byte> trun, long baseDataOffset,
         uint defDur, uint defSize, uint defFlags,
         int lengthSize, double tsInv,
-        List<Mp4Sample> samples, ref long cumulativeDt)
+        List<Mp4Sample> samples, ref long cumulativeDt, long editMediaTimeOffset)
     {
         if (trun.Length < 8) return;
         byte version = trun[0];
@@ -721,8 +784,8 @@ public static class Mp4Reader
             int sampleDependsOn = (int)((sflags >> 24) & 0x3);
             if (sampleDependsOn == 2) isSync = true;
 
-            double dtSec = cumulativeDt * tsInv;
-            double ctSec = (cumulativeDt + ctts) * tsInv;
+            double dtSec = (cumulativeDt - editMediaTimeOffset) * tsInv;
+            double ctSec = (cumulativeDt + ctts - editMediaTimeOffset) * tsInv;
             samples.Add(new Mp4Sample(runOffset, (int)size, dtSec, ctSec, isSync, lengthSize));
             runOffset += size;
             cumulativeDt += dur;

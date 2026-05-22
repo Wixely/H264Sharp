@@ -67,6 +67,9 @@ public sealed class H264FrameDecoder
         // POC type-0 running state (spec §8.2.1.1).
         int prevPicOrderCntMsb = 0;
         int prevPicOrderCntLsb = 0;
+        // Monotonic counter assigned to each decoded picture; used by callers to map
+        // an MP4-sample-table index back into the POC-sorted output list.
+        int decodeOrderCounter = 0;
 
         foreach (var n in nals)
         {
@@ -93,6 +96,7 @@ public sealed class H264FrameDecoder
                     }
                     DecodedPicture pic = DecodeSlice(n, sps, pps, dpb,
                         ref prevPicOrderCntMsb, ref prevPicOrderCntLsb);
+                    pic.DecodeOrderIndex = decodeOrderCounter++;
                     outputs.Add(pic);
                     if (n.NalRefIdc != 0)
                     {

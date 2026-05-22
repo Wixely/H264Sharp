@@ -20,6 +20,11 @@ public sealed class DecodedPicture
     /// <summary>Picture Order Count (spec §8.2.1) — display order key. Lower POC = earlier display.</summary>
     public int PicOrderCnt { get; set; }
 
+    /// <summary>0-based index of this picture in the bitstream's decode order (assigned per
+    /// <see cref="H264Decoder.H264FrameDecoder.DecodeAllFrames(System.Collections.Generic.List{H264Decoder.Bitstream.NalUnit})"/> call).
+    /// Lets callers map an MP4 sample-table index to the right entry of the POC-sorted output list.</summary>
+    public int DecodeOrderIndex { get; set; }
+
     /// <summary>Per-MB decoded syntax/state, indexed by mbAddress. Used by spatial-direct
     /// derivation (spec §8.4.1.2.2) to access the colocated MB in refPicListL1[0].</summary>
     public Syntax.Macroblock[]? Macroblocks { get; set; }

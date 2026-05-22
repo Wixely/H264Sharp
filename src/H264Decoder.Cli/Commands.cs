@@ -134,8 +134,10 @@ public static class Commands
         try { frames = decoder.DecodeAllFrames(nals); }
         catch (Exception ex) { stderr.WriteLine($"decode failed: {ex.Message}"); return 3; }
 
-        int displayIdx = Math.Min(target - idr, frames.Count - 1);
-        var pic = frames[displayIdx];
+        // frames is sorted by POC (display order); the MP4 sample table indexes decode order.
+        // Look up by DecodeOrderIndex so B-pyramid clips don't pick the wrong frame.
+        int targetDecodeIdx = target - idr;
+        var pic = frames.FirstOrDefault(f => f.DecodeOrderIndex == targetDecodeIdx) ?? frames[^1];
         WritePicture(pic, outPath, stderr);
         stderr.WriteLine($"at t={stream.Samples[target].CompositionTimeSeconds:F3}s (sample {target}, sync@{idr})");
         return 0;

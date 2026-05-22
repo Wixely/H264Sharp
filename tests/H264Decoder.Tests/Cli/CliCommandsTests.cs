@@ -1,11 +1,105 @@
 using H264Decoder.Bitstream;
 using H264Decoder.Cli;
+using H264Decoder.Picture;
 using H264Decoder.Tests.Fixtures;
 
 namespace H264Decoder.Tests.Cli;
 
 public class CliCommandsTests
 {
+    [Fact]
+    public void Mp4Reader_BPyramid_AppliesEditListSoFirstCompositionTimeIsZero()
+    {
+        // ffmpeg-produced B-pyramid clips carry an edts/elst entry with media_time > 0
+        // to shift the displayed timeline back to 0. Without elst handling, the first
+        // sample's CompositionTimeSeconds is > 0; with it, it must be ~0.
+        var sample = FfmpegFixture.BPyramidMp4();
+        using var fs = File.OpenRead(sample.H264Path);
+        var stream = Mp4Reader.ExtractH264WithTiming(fs);
+
+        Assert.True(stream.Samples.Count >= 4);
+        // Find sample with smallest composition time — must equal 0 after elst correction.
+        double minCt = double.MaxValue;
+        foreach (var s in stream.Samples)
+            if (s.CompositionTimeSeconds < minCt) minCt = s.CompositionTimeSeconds;
+        Assert.InRange(minCt, -1e-6, 1e-6);
+    }
+
+    [Fact]
+    public void DecodedPicture_DecodeOrderIndex_IsAssignedInOrder()
+    {
+        // After DecodeAllFrames returns, the POC-sorted output list must carry the original
+        // decode-order index on each picture, letting callers map sample-table index → frame.
+        var sample = FfmpegFixture.BPyramidMp4();
+        using var fs = File.OpenRead(sample.H264Path);
+        var stream = Mp4Reader.ExtractH264WithTiming(fs);
+        var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
+        for (int i = 0; i < stream.Samples.Count; i++) nals.AddRange(stream.ResolveNalUnits(i));
+
+        var decoder = new H264FrameDecoder();
+        List<DecodedPicture> frames = decoder.DecodeAllFrames(nals);
+        // Every decode-order index from 0..N-1 appears exactly once.
+        var seen = new HashSet<int>();
+        foreach (var f in frames) Assert.True(seen.Add(f.DecodeOrderIndex));
+        for (int i = 0; i < frames.Count; i++) Assert.Contains(i, seen);
+
+        // POC-sort: indices are NOT monotonically increasing for B-pyramid content
+        // (proves decode order ≠ display order — i.e. the bug fix actually matters).
+        bool anyOutOfOrder = false;
+        for (int i = 1; i < frames.Count; i++)
+            if (frames[i].DecodeOrderIndex < frames[i - 1].DecodeOrderIndex) { anyOutOfOrder = true; break; }
+        Assert.True(anyOutOfOrder, "expected B-pyramid clip to have decode/display order mismatch");
+    }
+
+    [Fact]
+    public void ThumbnailAt_BPyramidMp4_AtZero_PicksDisplayOrderFirstFrame()
+    {
+        // With the edit-list and decode-order-index fixes, --at 0 must pick the frame
+        // with the smallest POC (display-order first frame), which is the IDR.
+        var sample = FfmpegFixture.BPyramidMp4();
+        string outPng = Path.Combine(Path.GetTempPath(), $"bpy_{Guid.NewGuid():N}.png");
+        try
+        {
+            var stderr = new StringWriter();
+            int rc = Commands.ThumbnailAt(sample.H264Path, outPng, "0", stderr);
+            Assert.Equal(0, rc);
+            Assert.True(File.Exists(outPng));
+            // stderr reports sample N; with elst correction sample 0 has composition ≈ 0.
+            Assert.Contains("sample 0", stderr.ToString());
+        }
+        finally
+        {
+            if (File.Exists(outPng)) File.Delete(outPng);
+        }
+    }
+
+    [Fact]
+    public void DecodeOrderIndex_LookupPicksTheCorrectFrame_OnBPyramid()
+    {
+        // Direct demonstration of the Commands.cs bug: on a B-pyramid clip the
+        // POC-sorted output list's index N differs from the bitstream's Nth decoded picture.
+        // Using DecodeOrderIndex to look up the IDR (decode order 0) must return the
+        // picture with the smallest POC; the old frames[target-idr] subscript would not.
+        var sample = FfmpegFixture.BPyramidMp4();
+        using var fs = File.OpenRead(sample.H264Path);
+        var stream = Mp4Reader.ExtractH264WithTiming(fs);
+        var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
+        for (int i = 0; i < stream.Samples.Count; i++) nals.AddRange(stream.ResolveNalUnits(i));
+
+        var decoder = new H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(nals);
+
+        // The IDR is decode-order 0 and must also be POC-smallest (display-first).
+        var idrPic = frames.First(f => f.DecodeOrderIndex == 0);
+        int minPoc = int.MaxValue;
+        foreach (var f in frames) if (f.PicOrderCnt < minPoc) minPoc = f.PicOrderCnt;
+        Assert.Equal(minPoc, idrPic.PicOrderCnt);
+        // frames[0] (smallest POC) IS the IDR. Therefore looking up by subscript with
+        // decode index 0 happens to be correct here — but a non-IDR frame proves divergence:
+        var lastDecoded = frames.First(f => f.DecodeOrderIndex == frames.Count - 1);
+        Assert.NotEqual(lastDecoded, frames[^1]); // last-decoded != last-by-POC for IBBP.
+    }
+
     [Fact]
     public void Info_FromMp4_PrintsDurationResolutionFramesProfile()
     {

@@ -413,6 +413,24 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Four-frame 64x48 IBBP clip muxed as MP4 (mirror of FourFramesBFrames64x48Cavlc).
+    /// ffmpeg shifts composition times via an edts/elst entry so the displayed timeline starts
+    /// at 0 (compensating for the first-frame composition offset under B-frames). Exercises
+    /// both elst handling and decode-order vs display-order frame selection.</summary>
+    public static Sample BPyramidMp4()
+    {
+        const int W = 64, H = 48;
+        string mp4 = Path.Combine(SamplesDirectory, "four_frames_bframes_64x48.mp4");
+        string yuv = Path.Combine(SamplesDirectory, "four_frames_bframes_64x48_mp4.yuv");
+        EnsureGenerated(mp4, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:r=4:d=1,format=yuv420p\" -frames:v 4 " +
+            "-c:v libx264 -profile:v main -bf 2 -keyint_min 99 -g 99 -coder 0 -an " +
+            "-x264-params \"no-deblock=1\" " +
+            $"-movflags +faststart \"{mp4}\"",
+            $"-y -i \"{mp4}\" -frames:v 4 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(mp4, yuv, W, H);
+    }
+
     /// <summary>Two-frame 64x48 red clip muxed as fragmented MP4 (moof/traf/trun, empty_moov,
     /// default_base_moof). Used to exercise the fragmented MP4 parsing path.</summary>
     public static Sample FragmentedMp4Red64x48()
