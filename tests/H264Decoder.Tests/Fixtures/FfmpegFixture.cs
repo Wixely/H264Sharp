@@ -413,6 +413,21 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 64x48 red clip muxed as fragmented MP4 (moof/traf/trun, empty_moov,
+    /// default_base_moof). Used to exercise the fragmented MP4 parsing path.</summary>
+    public static Sample FragmentedMp4Red64x48()
+    {
+        const int W = 64, H = 48;
+        string mp4 = Path.Combine(SamplesDirectory, "frag_red_64x48.mp4");
+        string yuv = Path.Combine(SamplesDirectory, "frag_red_64x48.yuv");
+        EnsureGenerated(mp4, yuv,
+            $"-y -f lavfi -i \"color=c=red:s={W}x{H}:d=1:r=2,format=yuv420p\" " +
+            "-c:v libx264 -profile:v baseline -bf 0 -an " +
+            $"-movflags +frag_keyframe+empty_moov+default_base_moof \"{mp4}\"",
+            $"-y -i \"{mp4}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(mp4, yuv, W, H);
+    }
+
     private static void EnsureGenerated(string h264, string yuv, string h264Args, string yuvArgs)
     {
         lock (_lock)

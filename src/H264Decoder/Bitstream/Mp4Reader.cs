@@ -6,12 +6,14 @@ namespace H264Decoder.Bitstream;
 /// Minimal MP4 (ISOBMFF) reader. Walks the atom tree just enough to extract the
 /// H.264 elementary stream from an MP4 video track:
 ///   - SPS + PPS from the avcC (AVCDecoderConfigurationRecord)
-///   - All video samples from mdat, sliced per the stbl sample table
+///   - All video samples from mdat, sliced per the stbl sample table (non-fragmented)
+///     OR from moof/traf/trun runs (fragmented MP4, fMP4).
 ///
-/// Streams the file: only the moov atom is loaded into memory, so arbitrary-size
-/// inputs are supported as long as moov itself fits in a byte[] (~2 GiB).
-/// Out of scope: fragmented MP4 (moof/traf), edit lists, multiple stsd entries,
-/// audio tracks. We accept 32-bit and 64-bit chunk offsets (stco / co64).
+/// Streams the file: only the moov atom (and each individual moof) is loaded into
+/// memory, so arbitrary-size inputs are supported as long as moov itself fits in
+/// a byte[] (~2 GiB) and each moof fits in ~10 MiB.
+/// Out of scope: edit lists, multiple stsd entries, audio tracks. We accept 32-bit
+/// and 64-bit chunk offsets (stco / co64).
 /// </summary>
 public static class Mp4Reader
 {
@@ -53,17 +55,9 @@ public static class Mp4Reader
         if (!stream.CanSeek) throw new ArgumentException("MP4: stream must be seekable", nameof(stream));
         if (!stream.CanRead) throw new ArgumentException("MP4: stream must be readable", nameof(stream));
 
-        byte[]? moovBytes = ReadMoovAtom(stream);
-        if (moovBytes is null) throw new InvalidDataException("MP4: no 'moov' box");
-        return ParseMoov(moovBytes, stream);
-    }
-
-    /// <summary>
-    /// Scans top-level boxes for 'moov' and returns its payload (post-header).
-    /// mdat and other large boxes are skipped without buffering.
-    /// </summary>
-    private static byte[]? ReadMoovAtom(Stream stream)
-    {
+        // Walk top-level boxes once: pull moov into memory and remember positions of moof atoms.
+        byte[]? moovBytes = null;
+        var moofRegions = new List<(long Start, long PayloadStart, long PayloadEnd)>();
         long fileLength = stream.Length;
         long pos = 0;
         Span<byte> header = stackalloc byte[16];
@@ -79,14 +73,12 @@ public static class Mp4Reader
             long payloadStart;
             if (sz32 == 1)
             {
-                // Extended 64-bit size follows the 8-byte header.
                 if (ReadExact(stream, header[8..16]) < 8) break;
                 boxSize = (long)BinaryPrimitives.ReadUInt64BigEndian(header[8..16]);
                 payloadStart = pos + 16;
             }
             else if (sz32 == 0)
             {
-                // Box extends to end of file.
                 boxSize = fileLength - pos;
                 payloadStart = pos + 8;
             }
@@ -98,23 +90,29 @@ public static class Mp4Reader
 
             if (boxSize < 8 || pos + boxSize > fileLength) break;
 
-            if (ty == "moov")
+            if (ty == "moov" && moovBytes is null)
             {
                 long payloadLen = pos + boxSize - payloadStart;
                 if (payloadLen > int.MaxValue)
                     throw new InvalidDataException("MP4: moov atom too large to load (>2 GiB)");
-                byte[] buf = new byte[(int)payloadLen];
+                moovBytes = new byte[(int)payloadLen];
                 stream.Position = payloadStart;
-                if (ReadExact(stream, buf) != buf.Length)
+                if (ReadExact(stream, moovBytes) != moovBytes.Length)
                     throw new InvalidDataException("MP4: truncated moov atom");
-                return buf;
+            }
+            else if (ty == "moof")
+            {
+                moofRegions.Add((pos, payloadStart, pos + boxSize));
             }
             pos += boxSize;
         }
-        return null;
+
+        if (moovBytes is null) throw new InvalidDataException("MP4: no 'moov' box");
+        return ParseMoov(moovBytes, stream, moofRegions);
     }
 
-    private static Mp4SampleStream ParseMoov(byte[] moovBytes, Stream source)
+    private static Mp4SampleStream ParseMoov(byte[] moovBytes, Stream source,
+        List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions)
     {
         ReadOnlySpan<byte> moov = moovBytes;
 
@@ -124,6 +122,7 @@ public static class Mp4Reader
         if (!TryFindVideoTrak(moov, out int trakStart, out int trakLen))
             throw new InvalidDataException("MP4: no video track");
         var trak = moov.Slice(trakStart, trakLen);
+        uint videoTrackId = ReadTkhdTrackId(trak);
 
         // Track header — width/height (16.16 fixed point) for the video track.
         (int tkhdWidth, int tkhdHeight) = ReadTkhdSize(trak);
@@ -146,20 +145,25 @@ public static class Mp4Reader
         if (sps.Count == 0 || pps.Count == 0)
             throw new InvalidDataException("MP4: avcC missing SPS or PPS");
 
-        var sampleOffsets = BuildSampleOffsetTable(stbl);
-        int sampleCount = sampleOffsets.Count;
-
-        uint[] sttsDeltas = ReadStts(stbl, sampleCount);
-        int[] cttsOffsets = ReadCtts(stbl, sampleCount);
-        bool[] isSync = ReadStss(stbl, sampleCount);
+        // Read trex defaults for the video track (used by fragmented MP4).
+        var trex = ReadTrexForTrack(moov, videoTrackId);
 
         var avcConfig = new List<NalUnit>(sps.Count + pps.Count);
         avcConfig.AddRange(sps);
         avcConfig.AddRange(pps);
 
-        var samples = new List<Mp4Sample>(sampleCount);
-        long cumulativeDt = 0;
         double tsInv = mediaTimescale > 0 ? 1.0 / mediaTimescale : 0.0;
+        List<Mp4Sample> samples;
+
+        // Build samples from stbl as before — may be empty for fragmented (empty_moov) files.
+        var sampleOffsets = BuildSampleOffsetTable(stbl);
+        int sampleCount = sampleOffsets.Count;
+        uint[] sttsDeltas = ReadStts(stbl, sampleCount);
+        int[] cttsOffsets = ReadCtts(stbl, sampleCount);
+        bool[] isSync = ReadStss(stbl, sampleCount);
+
+        samples = new List<Mp4Sample>(sampleCount);
+        long cumulativeDt = 0;
         for (int i = 0; i < sampleCount; i++)
         {
             var (offset, size) = sampleOffsets[i];
@@ -167,6 +171,15 @@ public static class Mp4Reader
             double ctSec = (cumulativeDt + cttsOffsets[i]) * tsInv;
             samples.Add(new Mp4Sample(offset, size, dtSec, ctSec, isSync[i], lengthSize));
             cumulativeDt += sttsDeltas[i];
+        }
+
+        // If fragments exist, prefer them. Some files have a placeholder stbl (sample_count=0)
+        // plus real samples across moof/mdat pairs — others have a small stbl init alongside
+        // real fragment data. In both cases the fragmented data is authoritative.
+        if (moofRegions.Count > 0)
+        {
+            var fragSamples = ParseFragments(source, moofRegions, videoTrackId, trex, lengthSize, tsInv);
+            if (fragSamples.Count > 0) samples = fragSamples;
         }
 
         double durationSec = movieTimescale > 0 ? (double)movieDuration / movieTimescale : 0.0;
@@ -228,6 +241,17 @@ public static class Mp4Reader
         uint w16 = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(offToWH, 4));
         uint h16 = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(offToWH + 4, 4));
         return ((int)(w16 >> 16), (int)(h16 >> 16));
+    }
+
+    // tkhd track_ID lives right after version+flags(4) + creation/modification times.
+    private static uint ReadTkhdTrackId(ReadOnlySpan<byte> trak)
+    {
+        if (!TryFindChildBox(trak, "tkhd", out int s, out int l)) return 0;
+        var b = trak.Slice(s, l);
+        byte version = b[0];
+        int off = version == 1 ? (4 + 8 + 8) : (4 + 4 + 4);
+        if (b.Length < off + 4) return 0;
+        return BinaryPrimitives.ReadUInt32BigEndian(b.Slice(off, 4));
     }
 
     private static uint[] ReadStts(ReadOnlySpan<byte> stbl, int sampleCount)
@@ -489,6 +513,220 @@ public static class Mp4Reader
             total += n;
         }
         return total;
+    }
+
+    // ---------- fragmented MP4 ----------
+
+    // Per-track defaults from mvex/trex. All fields can be overridden by tfhd at fragment scope.
+    private readonly struct TrexDefaults
+    {
+        public readonly uint SampleDescriptionIndex;
+        public readonly uint SampleDuration;
+        public readonly uint SampleSize;
+        public readonly uint SampleFlags;
+        public TrexDefaults(uint sdi, uint dur, uint size, uint flags)
+        { SampleDescriptionIndex = sdi; SampleDuration = dur; SampleSize = size; SampleFlags = flags; }
+    }
+
+    // Scan moov for an mvex/trex matching the given track_ID. Missing trex => all-zero defaults.
+    private static TrexDefaults ReadTrexForTrack(ReadOnlySpan<byte> moov, uint trackId)
+    {
+        if (!TryFindChildBox(moov, "mvex", out int mvexS, out int mvexL)) return default;
+        var mvex = moov.Slice(mvexS, mvexL);
+        int p = 0;
+        while (p + 8 <= mvex.Length)
+        {
+            int sz = BinaryPrimitives.ReadInt32BigEndian(mvex.Slice(p, 4));
+            string ty = AsFourcc(mvex.Slice(p + 4, 4));
+            if (sz < 8 || p + sz > mvex.Length) break;
+            if (ty == "trex" && sz >= 8 + 4 + 4 + 4 + 4 + 4 + 4)
+            {
+                var b = mvex.Slice(p + 8, sz - 8);
+                // version+flags(4), track_ID(4), default_sample_description_index(4),
+                // default_sample_duration(4), default_sample_size(4), default_sample_flags(4).
+                uint tid = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4, 4));
+                if (tid == trackId)
+                {
+                    return new TrexDefaults(
+                        BinaryPrimitives.ReadUInt32BigEndian(b.Slice(8, 4)),
+                        BinaryPrimitives.ReadUInt32BigEndian(b.Slice(12, 4)),
+                        BinaryPrimitives.ReadUInt32BigEndian(b.Slice(16, 4)),
+                        BinaryPrimitives.ReadUInt32BigEndian(b.Slice(20, 4)));
+                }
+            }
+            p += sz;
+        }
+        return default;
+    }
+
+    // Iterate every moof region, parse traf/trun for the video track, and accumulate samples.
+    private static List<Mp4Sample> ParseFragments(
+        Stream source, List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions,
+        uint videoTrackId, TrexDefaults trex, int lengthSize, double tsInv)
+    {
+        var samples = new List<Mp4Sample>();
+        // Cumulative decode time across all fragments (in media timescale units). tfdt resets this.
+        long cumulativeDt = 0;
+        foreach (var region in moofRegions)
+        {
+            long payloadLen = region.PayloadEnd - region.PayloadStart;
+            if (payloadLen <= 0) continue;
+            if (payloadLen > 10L * 1024 * 1024)
+                throw new InvalidDataException($"MP4: moof atom too large ({payloadLen} bytes > 10 MiB) at offset {region.Start}");
+            byte[] moofBuf = new byte[(int)payloadLen];
+            source.Position = region.PayloadStart;
+            if (ReadExact(source, moofBuf) != moofBuf.Length)
+                throw new InvalidDataException($"MP4: truncated moof at offset {region.Start}");
+
+            ParseMoof(moofBuf, region.Start, videoTrackId, trex, lengthSize, tsInv, samples, ref cumulativeDt);
+        }
+        return samples;
+    }
+
+    // Parse one moof: iterate traf children, locating one whose tfhd.track_ID matches videoTrackId.
+    private static void ParseMoof(byte[] moofBytes, long moofStart, uint videoTrackId,
+        TrexDefaults trex, int lengthSize, double tsInv,
+        List<Mp4Sample> samples, ref long cumulativeDt)
+    {
+        ReadOnlySpan<byte> moof = moofBytes;
+        int p = 0;
+        while (p + 8 <= moof.Length)
+        {
+            int sz = BinaryPrimitives.ReadInt32BigEndian(moof.Slice(p, 4));
+            string ty = AsFourcc(moof.Slice(p + 4, 4));
+            if (sz < 8 || p + sz > moof.Length) break;
+            if (ty == "traf")
+            {
+                ParseTraf(moof.Slice(p + 8, sz - 8), moofStart, videoTrackId, trex, lengthSize, tsInv,
+                    samples, ref cumulativeDt);
+            }
+            // mfhd: ignored (sequence_number not needed for decoding correctness).
+            p += sz;
+        }
+    }
+
+    private static void ParseTraf(ReadOnlySpan<byte> traf, long moofStart, uint videoTrackId,
+        TrexDefaults trex, int lengthSize, double tsInv,
+        List<Mp4Sample> samples, ref long cumulativeDt)
+    {
+        // tfhd is mandatory and first in well-formed traf.
+        if (!TryFindChildBox(traf, "tfhd", out int tfhdS, out int tfhdL)) return;
+        var tfhd = traf.Slice(tfhdS, tfhdL);
+        if (tfhd.Length < 8) return;
+        uint tfhdFlags = (uint)((tfhd[1] << 16) | (tfhd[2] << 8) | tfhd[3]);
+        uint tfhdTrackId = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(4, 4));
+        if (tfhdTrackId != videoTrackId) return;
+
+        int o = 8;
+        long baseDataOffset;
+        bool baseIsMoof = (tfhdFlags & 0x020000) != 0;
+        if ((tfhdFlags & 0x000001) != 0)
+        {
+            baseDataOffset = (long)BinaryPrimitives.ReadUInt64BigEndian(tfhd.Slice(o, 8));
+            o += 8;
+        }
+        else if (baseIsMoof)
+        {
+            baseDataOffset = moofStart;
+        }
+        else
+        {
+            // Spec: default base = first byte of moof when no override (close enough for our usage).
+            baseDataOffset = moofStart;
+        }
+        if ((tfhdFlags & 0x000002) != 0) o += 4; // sample_description_index: ignored
+        uint defDur = trex.SampleDuration;
+        uint defSize = trex.SampleSize;
+        uint defFlags = trex.SampleFlags;
+        if ((tfhdFlags & 0x000008) != 0) { defDur = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
+        if ((tfhdFlags & 0x000010) != 0) { defSize = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
+        if ((tfhdFlags & 0x000020) != 0) { defFlags = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
+
+        // tfdt overrides cumulative decode time for this fragment.
+        if (TryFindChildBox(traf, "tfdt", out int tfdtS, out int tfdtL) && tfdtL >= 8)
+        {
+            var b = traf.Slice(tfdtS, tfdtL);
+            byte ver = b[0];
+            if (ver == 1 && b.Length >= 4 + 8)
+                cumulativeDt = (long)BinaryPrimitives.ReadUInt64BigEndian(b.Slice(4, 8));
+            else if (b.Length >= 4 + 4)
+                cumulativeDt = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4, 4));
+        }
+
+        // Iterate all trun atoms (typically one per traf, but the spec allows several).
+        int tp = 0;
+        while (tp + 8 <= traf.Length)
+        {
+            int sz = BinaryPrimitives.ReadInt32BigEndian(traf.Slice(tp, 4));
+            string ty = AsFourcc(traf.Slice(tp + 4, 4));
+            if (sz < 8 || tp + sz > traf.Length) break;
+            if (ty == "trun")
+            {
+                ParseTrun(traf.Slice(tp + 8, sz - 8), baseDataOffset, defDur, defSize, defFlags,
+                    lengthSize, tsInv, samples, ref cumulativeDt);
+            }
+            tp += sz;
+        }
+    }
+
+    private static void ParseTrun(ReadOnlySpan<byte> trun, long baseDataOffset,
+        uint defDur, uint defSize, uint defFlags,
+        int lengthSize, double tsInv,
+        List<Mp4Sample> samples, ref long cumulativeDt)
+    {
+        if (trun.Length < 8) return;
+        byte version = trun[0];
+        uint flags = (uint)((trun[1] << 16) | (trun[2] << 8) | trun[3]);
+        int sampleCount = BinaryPrimitives.ReadInt32BigEndian(trun.Slice(4, 4));
+        int o = 8;
+
+        int dataOffset = 0;
+        if ((flags & 0x000001) != 0)
+        {
+            dataOffset = BinaryPrimitives.ReadInt32BigEndian(trun.Slice(o, 4));
+            o += 4;
+        }
+        uint firstSampleFlags = defFlags;
+        bool hasFirstSampleFlags = (flags & 0x000004) != 0;
+        if (hasFirstSampleFlags)
+        {
+            firstSampleFlags = BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4));
+            o += 4;
+        }
+        bool hasDur = (flags & 0x000100) != 0;
+        bool hasSize = (flags & 0x000200) != 0;
+        bool hasFlags = (flags & 0x000400) != 0;
+        bool hasCtts = (flags & 0x000800) != 0;
+
+        long runOffset = baseDataOffset + dataOffset;
+        for (int i = 0; i < sampleCount; i++)
+        {
+            uint dur = hasDur ? BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4)) : defDur; if (hasDur) o += 4;
+            uint size = hasSize ? BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4)) : defSize; if (hasSize) o += 4;
+            uint sflags = hasFlags ? BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4))
+                : (i == 0 ? firstSampleFlags : defFlags);
+            if (hasFlags) o += 4;
+            int ctts = 0;
+            if (hasCtts)
+            {
+                // Version 1 -> signed; version 0 -> unsigned (cast to int, may saturate but rare in practice).
+                if (version == 1) ctts = BinaryPrimitives.ReadInt32BigEndian(trun.Slice(o, 4));
+                else ctts = (int)BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4));
+                o += 4;
+            }
+
+            // sample_is_non_sync_sample lives in bit 16 of the lower half (= 0x00010000).
+            // Equivalently sample_depends_on==2 ("does not depend") marks a sync sample.
+            bool isSync = (sflags & 0x00010000) == 0;
+            int sampleDependsOn = (int)((sflags >> 24) & 0x3);
+            if (sampleDependsOn == 2) isSync = true;
+
+            double dtSec = cumulativeDt * tsInv;
+            double ctSec = (cumulativeDt + ctts) * tsInv;
+            samples.Add(new Mp4Sample(runOffset, (int)size, dtSec, ctSec, isSync, lengthSize));
+            runOffset += size;
+            cumulativeDt += dur;
+        }
     }
 }
 
