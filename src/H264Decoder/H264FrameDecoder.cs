@@ -356,6 +356,9 @@ public sealed class H264FrameDecoder
 
             if (mbSkipFlag == 1)
             {
+                // Skipped MBs carry no mb_qp_delta — per FFmpeg h264_cabac.c:1952, the
+                // "previous mb_qp_delta non-zero" CABAC state must be reset to 0.
+                prevMbQpDeltaState = 0;
                 if (isBSlice)
                 {
                     Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
