@@ -90,14 +90,12 @@ public sealed class BFrameDecodeTests
             worstMaxY = Math.Max(worstMaxY, maxY);
         }
 
-        // I (frame 0) and P (frame 3) must be byte-exact. After stage 4 (implicit weighted
-        // bipred + per-4x4 colocated-MV override) the FIRST B-frame is also byte-exact.
-        // The second B-frame still drifts on a non-direct B_L0_L1_16x8 MB (mb_type 8):
-        // a pre-existing MV-prediction issue tracked separately.
+        // All four frames byte-exact after fixing the inter-CBP golomb table (spec Table 9-4(b)
+        // entries 36..47 were transposed in the prior port; corrected to match FFmpeg/OpenH264).
         Assert.True(perFrame[0] <= 2, $"I-frame luma diff = {perFrame[0]}");
         Assert.True(perFrame[3] <= 2, $"P-frame luma diff = {perFrame[3]}");
-        Assert.True(perFrame[1] <= 2, $"B1-frame luma diff = {perFrame[1]} (should be byte-exact after stage 4)");
-        Assert.True(perFrame[2] <= 50, $"B2-frame luma diff = {perFrame[2]} (regression detection only)");
+        Assert.True(perFrame[1] <= 2, $"B1-frame luma diff = {perFrame[1]}");
+        Assert.True(perFrame[2] <= 2, $"B2-frame luma diff = {perFrame[2]}");
     }
 
     [Fact]
