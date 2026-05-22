@@ -193,6 +193,46 @@ public sealed class BFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeBPyramidCabacMotion_PFrameByteExact()
+    {
+        // Regression: CABAC + bf=2 + motion content. PPS carries weighted_pred_flag=1
+        // and pic_order_cnt_type=0; the P-slice (decode-order #1) contains an Intra_4x4
+        // MB whose top neighbor is a P_Skip MB. The prior CABAC intra CBP-luma context
+        // derivation (DecodeCbpLumaIntra) returned condTermFlag=0 for a P_Skip neighbor
+        // instead of 1 (FFmpeg h264_cabac.c decode_cabac_mb_cbp_luma + h264_mvpred.h sets
+        // cbp_table[skip]=0 and tests !(cbp_a & bit) so cbp_bit==0 → condTermFlag=1).
+        // The off-by-one CBP-luma bin desynced CABAC for the remainder of the slice.
+        var sample = FfmpegFixture.BPyramidCabacMotionMp4();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+
+        var decoder = new H264Decoder.H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameBytes = yLen + 2 * cLen;
+
+        Assert.Equal(4, frames.Count);
+
+        // Frame 0 (I) and frame 3 (P, highest POC) must be byte-exact. The two B-frames
+        // (frame 1, frame 2) are out of scope here (covered by other tests / pre-existing
+        // direct-mode limitations); they would have been corrupted by the CABAC P-frame
+        // desync prior to this fix, so we sanity-check them at a permissive tolerance.
+        int maxYAt(int f)
+        {
+            var pic = frames[f];
+            int offset = f * frameBytes;
+            int m = 0;
+            for (int i = 0; i < yLen; i++) m = Math.Max(m, Math.Abs(pic.Y[i] - reference[offset + i]));
+            return m;
+        }
+
+        Assert.True(maxYAt(0) <= 2, $"I-frame luma diff = {maxYAt(0)}");
+        Assert.True(maxYAt(3) <= 2, $"P-frame luma diff = {maxYAt(3)}");
+    }
+
+    [Fact]
     public void DecodeThreeFramesBFrames32x16CabacDeblock_ByteExact()
     {
         // Same as the CABAC B-frame test but with the deblocking filter ENABLED.

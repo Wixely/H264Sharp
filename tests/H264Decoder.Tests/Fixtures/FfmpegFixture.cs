@@ -436,8 +436,9 @@ public static class FfmpegFixture
     /// derivation path (spec §8.4.1.2.3).</summary>
     public static Sample BPyramidTemporalDirectMp4()
     {
-        // Use CAVLC (coder=0) to sidestep a pre-existing CABAC+IBBP+motion P-frame
-        // decode bug that's unrelated to temporal direct mode itself.
+        // CAVLC (coder=0) chosen to keep the test focused on temporal-direct derivation
+        // rather than entropy coding (the prior CABAC+IBBP P-frame intra-CBP bug has
+        // since been fixed; see BPyramidCabacMotionMp4 regression).
         const int W = 64, H = 48;
         string mp4 = Path.Combine(SamplesDirectory, "temporal_direct_64x48.mp4");
         string yuv = Path.Combine(SamplesDirectory, "temporal_direct_64x48.yuv");
@@ -446,6 +447,24 @@ public static class FfmpegFixture
             "-c:v libx264 -profile:v main -bf 2 -coder 0 " +
             "-keyint_min 99 -g 99 -an -qp 18 " +
             $"-x264-params \"no-deblock=1:direct=temporal\" -f mp4 \"{mp4}\"",
+            $"-y -i \"{mp4}\" -frames:v 4 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(mp4, yuv, W, H);
+    }
+
+    /// <summary>4-frame 64x48 IBBP CABAC clip with motion (testsrc). Exercises the
+    /// CABAC P-slice intra-MB CBP-luma neighbor context derivation when the P-slice
+    /// follows a B-frame-configured PPS (weighted_pred_flag=1 + pic_order_cnt_type=0)
+    /// and contains Intra_4x4 MBs whose left/top neighbor is a P_Skip MB.</summary>
+    public static Sample BPyramidCabacMotionMp4()
+    {
+        const int W = 64, H = 48;
+        string mp4 = Path.Combine(SamplesDirectory, "bpyramid_cabac_motion_64x48.mp4");
+        string yuv = Path.Combine(SamplesDirectory, "bpyramid_cabac_motion_64x48.yuv");
+        EnsureGenerated(mp4, yuv,
+            $"-y -f lavfi -i \"testsrc=s={W}x{H}:r=2:d=2,format=yuv420p\" " +
+            "-c:v libx264 -profile:v main -bf 2 -b_strategy 0 -refs 1 -coder 1 " +
+            "-keyint_min 99 -g 99 -an -qp 18 " +
+            $"-x264-params \"no-deblock=1:direct=spatial\" -f mp4 \"{mp4}\"",
             $"-y -i \"{mp4}\" -frames:v 4 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
         return new Sample(mp4, yuv, W, H);
     }

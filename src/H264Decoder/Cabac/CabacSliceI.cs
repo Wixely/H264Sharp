@@ -269,15 +269,18 @@ internal static class CabacSliceI
         {
             int cx = i & 1, cy = i >> 1;
 
+            // External neighbor CBP: P_Skip has cbp=0 (so its bits == 0 → condTermFlag=1).
+            // Unavailable neighbor: condTermFlag=0 for the chosen sub-block bit (matches
+            // FFmpeg's top_cbp=0x00F seeding which sets the tested luma bits).
             int condA;
             if (cx > 0) { int nb = cy * 2 + (cx - 1); condA = ((cbp >> nb) & 1) == 0 ? 1 : 0; }
-            else if (leftMb == null || leftMb.IsSkipped) condA = 0;
-            else { int extBit = (leftMb.CbpLuma >> (cy * 2 + 1)) & 1; condA = extBit == 0 ? 1 : 0; }
+            else if (leftMb == null) condA = 0;
+            else { int extCbp = leftMb.IsSkipped ? 0 : leftMb.CbpLuma; int extBit = (extCbp >> (cy * 2 + 1)) & 1; condA = extBit == 0 ? 1 : 0; }
 
             int condB;
             if (cy > 0) { int nb = (cy - 1) * 2 + cx; condB = ((cbp >> nb) & 1) == 0 ? 1 : 0; }
-            else if (topMb == null || topMb.IsSkipped) condB = 0;
-            else { int extBit = (topMb.CbpLuma >> (2 + cx)) & 1; condB = extBit == 0 ? 1 : 0; }
+            else if (topMb == null) condB = 0;
+            else { int extCbp = topMb.IsSkipped ? 0 : topMb.CbpLuma; int extBit = (extCbp >> (2 + cx)) & 1; condB = extBit == 0 ? 1 : 0; }
 
             int bit = cabac.DecodeBin(73 + condA + 2 * condB);
             cbp |= bit << i;
