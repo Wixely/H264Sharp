@@ -8,6 +8,8 @@ namespace H264Decoder.Bitstream;
 ///   - SPS + PPS from the avcC (AVCDecoderConfigurationRecord)
 ///   - All video samples from mdat, sliced per the stbl sample table
 ///
+/// Streams the file: only the moov atom is loaded into memory, so arbitrary-size
+/// inputs are supported as long as moov itself fits in a byte[] (~2 GiB).
 /// Out of scope: fragmented MP4 (moof/traf), edit lists, multiple stsd entries,
 /// audio tracks. We accept 32-bit and 64-bit chunk offsets (stco / co64).
 /// </summary>
@@ -19,22 +21,102 @@ public static class Mp4Reader
     /// </summary>
     public static List<NalUnit> ExtractH264NalUnits(ReadOnlySpan<byte> mp4)
     {
-        var stream = ExtractH264WithTiming(mp4);
+        // The span overload owns its own MemoryStream; sample resolution needs it alive.
+        var ms = new MemoryStream(mp4.ToArray(), writable: false);
+        var stream = ExtractH264WithTiming(ms);
         var results = new List<NalUnit>();
         results.AddRange(stream.AvcCConfigNalUnits);
-        foreach (var s in stream.Samples) results.AddRange(s.NalUnits);
+        for (int i = 0; i < stream.Samples.Count; i++)
+            results.AddRange(stream.ResolveNalUnits(i));
         return results;
     }
 
     /// <summary>
-    /// Parse an MP4 fully — avcC configuration NALs, per-sample NAL units, and the
-    /// timing tables (stts / ctts / stss / mvhd / tkhd) needed to seek to a timestamp.
+    /// Span-based wrapper kept for backwards compatibility. Internally wraps the span
+    /// in a MemoryStream and dispatches to the streaming entry point.
     /// </summary>
     public static Mp4SampleStream ExtractH264WithTiming(ReadOnlySpan<byte> mp4)
     {
-        if (!TryFindTopBox(mp4, "moov", out int moovStart, out int moovLen))
-            throw new InvalidDataException("MP4: no 'moov' box");
-        var moov = mp4.Slice(moovStart, moovLen);
+        var ms = new MemoryStream(mp4.ToArray(), writable: false);
+        return ExtractH264WithTiming(ms);
+    }
+
+    /// <summary>
+    /// Streaming entry point. Walks top-level boxes via Seek/Read, loads only the
+    /// moov atom into memory, and returns a <see cref="Mp4SampleStream"/> carrying
+    /// sample metadata plus a reference to <paramref name="stream"/> for lazy NAL
+    /// resolution. Caller owns the stream lifetime; we do not dispose it.
+    /// </summary>
+    public static Mp4SampleStream ExtractH264WithTiming(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanSeek) throw new ArgumentException("MP4: stream must be seekable", nameof(stream));
+        if (!stream.CanRead) throw new ArgumentException("MP4: stream must be readable", nameof(stream));
+
+        byte[]? moovBytes = ReadMoovAtom(stream);
+        if (moovBytes is null) throw new InvalidDataException("MP4: no 'moov' box");
+        return ParseMoov(moovBytes, stream);
+    }
+
+    /// <summary>
+    /// Scans top-level boxes for 'moov' and returns its payload (post-header).
+    /// mdat and other large boxes are skipped without buffering.
+    /// </summary>
+    private static byte[]? ReadMoovAtom(Stream stream)
+    {
+        long fileLength = stream.Length;
+        long pos = 0;
+        Span<byte> header = stackalloc byte[16];
+        while (pos + 8 <= fileLength)
+        {
+            stream.Position = pos;
+            int read = ReadExact(stream, header[..8]);
+            if (read < 8) break;
+            uint sz32 = BinaryPrimitives.ReadUInt32BigEndian(header[..4]);
+            string ty = AsFourcc(header[4..8]);
+
+            long boxSize;
+            long payloadStart;
+            if (sz32 == 1)
+            {
+                // Extended 64-bit size follows the 8-byte header.
+                if (ReadExact(stream, header[8..16]) < 8) break;
+                boxSize = (long)BinaryPrimitives.ReadUInt64BigEndian(header[8..16]);
+                payloadStart = pos + 16;
+            }
+            else if (sz32 == 0)
+            {
+                // Box extends to end of file.
+                boxSize = fileLength - pos;
+                payloadStart = pos + 8;
+            }
+            else
+            {
+                boxSize = sz32;
+                payloadStart = pos + 8;
+            }
+
+            if (boxSize < 8 || pos + boxSize > fileLength) break;
+
+            if (ty == "moov")
+            {
+                long payloadLen = pos + boxSize - payloadStart;
+                if (payloadLen > int.MaxValue)
+                    throw new InvalidDataException("MP4: moov atom too large to load (>2 GiB)");
+                byte[] buf = new byte[(int)payloadLen];
+                stream.Position = payloadStart;
+                if (ReadExact(stream, buf) != buf.Length)
+                    throw new InvalidDataException("MP4: truncated moov atom");
+                return buf;
+            }
+            pos += boxSize;
+        }
+        return null;
+    }
+
+    private static Mp4SampleStream ParseMoov(byte[] moovBytes, Stream source)
+    {
+        ReadOnlySpan<byte> moov = moovBytes;
 
         // Movie header — global timescale + duration on the master timeline.
         (uint movieTimescale, ulong movieDuration) = ReadMvhd(moov);
@@ -67,11 +149,8 @@ public static class Mp4Reader
         var sampleOffsets = BuildSampleOffsetTable(stbl);
         int sampleCount = sampleOffsets.Count;
 
-        // Per-sample decode-time deltas (stts) — sum across runs to get cumulative time.
         uint[] sttsDeltas = ReadStts(stbl, sampleCount);
-        // Per-sample composition offsets (ctts), or zero if absent.
         int[] cttsOffsets = ReadCtts(stbl, sampleCount);
-        // 1-based indices of sync samples (stss); if absent all samples are sync.
         bool[] isSync = ReadStss(stbl, sampleCount);
 
         var avcConfig = new List<NalUnit>(sps.Count + pps.Count);
@@ -84,23 +163,9 @@ public static class Mp4Reader
         for (int i = 0; i < sampleCount; i++)
         {
             var (offset, size) = sampleOffsets[i];
-            if (offset < 0 || (long)offset + size > mp4.Length)
-                throw new InvalidDataException($"MP4: sample at {offset}+{size} exceeds file size {mp4.Length}");
-            var sample = mp4.Slice(offset, size);
-            var nals = new List<NalUnit>();
-            int pos = 0;
-            while (pos + lengthSize <= sample.Length)
-            {
-                int nalLen = ReadBE(sample, pos, lengthSize);
-                pos += lengthSize;
-                if (nalLen < 1 || pos + nalLen > sample.Length)
-                    throw new InvalidDataException($"MP4: NAL length {nalLen} overflows sample at offset {offset}");
-                nals.Add(BuildNalUnit(sample.Slice(pos, nalLen)));
-                pos += nalLen;
-            }
             double dtSec = cumulativeDt * tsInv;
             double ctSec = (cumulativeDt + cttsOffsets[i]) * tsInv;
-            samples.Add(new Mp4Sample(nals, dtSec, ctSec, isSync[i]));
+            samples.Add(new Mp4Sample(offset, size, dtSec, ctSec, isSync[i], lengthSize));
             cumulativeDt += sttsDeltas[i];
         }
 
@@ -119,7 +184,8 @@ public static class Mp4Reader
             catch { /* fall back to tkhd dims */ }
         }
 
-        return new Mp4SampleStream(avcConfig, samples, mediaTimescale, durationSec, width, height);
+        return new Mp4SampleStream(avcConfig, samples, mediaTimescale, durationSec, width, height,
+            (byte)(lengthSize - 1), source);
     }
 
     // ---------- timing atoms ----------
@@ -131,14 +197,12 @@ public static class Mp4Reader
         byte version = b[0];
         if (version == 1)
         {
-            // v1: 8B ctime, 8B mtime, 4B timescale, 8B duration
             uint ts = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 8 + 8, 4));
             ulong dur = BinaryPrimitives.ReadUInt64BigEndian(b.Slice(4 + 8 + 8 + 4, 8));
             return (ts, dur);
         }
         else
         {
-            // v0: 4B ctime, 4B mtime, 4B timescale, 4B duration
             uint ts = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4, 4));
             uint dur = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4 + 4, 4));
             return (ts, dur);
@@ -159,10 +223,6 @@ public static class Mp4Reader
         if (!TryFindChildBox(trak, "tkhd", out int s, out int l)) return (0, 0);
         var b = trak.Slice(s, l);
         byte version = b[0];
-        // version 0: 4B v/f + 4B ctime + 4B mtime + 4B track_id + 4B reserved + 4B duration
-        //          + 8B reserved + 2B layer + 2B alt + 2B vol + 2B reserved
-        //          + 36B matrix + 4B width (16.16) + 4B height (16.16)
-        // version 1: same with 8B ctime/mtime + 8B duration.
         int offToWH = version == 1 ? (4 + 8 + 8 + 4 + 4 + 8 + 8 + 2 + 2 + 2 + 2 + 36) : (4 + 4 + 4 + 4 + 4 + 4 + 8 + 2 + 2 + 2 + 2 + 36);
         if (b.Length < offToWH + 8) return (0, 0);
         uint w16 = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(offToWH, 4));
@@ -191,7 +251,6 @@ public static class Mp4Reader
         var offsets = new int[sampleCount];
         if (!TryFindChildBox(stbl, "ctts", out int s, out int l)) return offsets;
         var b = stbl.Slice(s, l);
-        // ctts v1 carries signed offsets; v0 unsigned. We coerce to int either way.
         int entries = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         int idx = 0;
         for (int e = 0; e < entries && idx < sampleCount; e++)
@@ -208,7 +267,6 @@ public static class Mp4Reader
         var flags = new bool[sampleCount];
         if (!TryFindChildBox(stbl, "stss", out int s, out int l))
         {
-            // No stss -> every sample is a sync sample (per ISOBMFF).
             for (int i = 0; i < sampleCount; i++) flags[i] = true;
             return flags;
         }
@@ -225,46 +283,18 @@ public static class Mp4Reader
 
     // ---------- atom walking ----------
 
-    private static bool TryFindTopBox(ReadOnlySpan<byte> file, string fourcc, out int dataStart, out int dataLen)
-    {
-        int p = 0;
-        while (p + 8 <= file.Length)
-        {
-            int sz = BinaryPrimitives.ReadInt32BigEndian(file.Slice(p, 4));
-            string ty = Fourcc(file, p + 4);
-            if (sz < 8 || p + sz > file.Length) break;
-            if (ty == fourcc) { dataStart = p + 8; dataLen = sz - 8; return true; }
-            p += sz;
-        }
-        dataStart = 0; dataLen = 0; return false;
-    }
-
     private static bool TryFindChildBox(ReadOnlySpan<byte> parent, string fourcc, out int dataStart, out int dataLen)
     {
         int p = 0;
         while (p + 8 <= parent.Length)
         {
             int sz = BinaryPrimitives.ReadInt32BigEndian(parent.Slice(p, 4));
-            string ty = Fourcc(parent, p + 4);
+            string ty = AsFourcc(parent.Slice(p + 4, 4));
             if (sz < 8 || p + sz > parent.Length) break;
             if (ty == fourcc) { dataStart = p + 8; dataLen = sz - 8; return true; }
             p += sz;
         }
         dataStart = 0; dataLen = 0; return false;
-    }
-
-    private static bool TryFindNestedBox(ReadOnlySpan<byte> root, string a, string b, string c, out int dataStart, out int dataLen)
-    {
-        dataStart = 0; dataLen = 0;
-        if (!TryFindChildBox(root, a, out int aS, out int aL)) return false;
-        var aSpan = root.Slice(aS, aL);
-        if (!TryFindChildBox(aSpan, b, out int bS, out int bL)) return false;
-        var bSpan = aSpan.Slice(bS, bL);
-        if (!TryFindChildBox(bSpan, c, out int cS, out int cL)) return false;
-        // Translate cS, cL back to root coordinates.
-        dataStart = aS + bS + cS;
-        dataLen = cL;
-        return true;
     }
 
     private static bool TryFindVideoTrak(ReadOnlySpan<byte> moov, out int trakStart, out int trakLen)
@@ -273,7 +303,7 @@ public static class Mp4Reader
         while (p + 8 <= moov.Length)
         {
             int sz = BinaryPrimitives.ReadInt32BigEndian(moov.Slice(p, 4));
-            string ty = Fourcc(moov, p + 4);
+            string ty = AsFourcc(moov.Slice(p + 4, 4));
             if (sz < 8 || p + sz > moov.Length) break;
             if (ty == "trak")
             {
@@ -294,8 +324,7 @@ public static class Mp4Reader
         var mdia = trak.Slice(mdiaS, mdiaL);
         if (!TryFindChildBox(mdia, "hdlr", out int hdlrS, out int hdlrL)) return false;
         var hdlr = mdia.Slice(hdlrS, hdlrL);
-        // hdlr payload: 4B v/f + 4B pre_defined + 4B handler_type + ...
-        return hdlr.Length >= 12 && Fourcc(hdlr, 8) == "vide";
+        return hdlr.Length >= 12 && AsFourcc(hdlr.Slice(8, 4)) == "vide";
     }
 
     // ---------- avcC ----------
@@ -306,17 +335,15 @@ public static class Mp4Reader
             return (new(), new(), 4);
         var stsd = stbl.Slice(stsdS, stsdL);
 
-        // stsd: 4B version/flags + 4B entry_count + N sample entries (themselves boxes).
         int entries = BinaryPrimitives.ReadInt32BigEndian(stsd.Slice(4, 4));
         int p = 8;
         for (int e = 0; e < entries && p + 8 <= stsd.Length; e++)
         {
             int entrySize = BinaryPrimitives.ReadInt32BigEndian(stsd.Slice(p, 4));
             if (entrySize < 8 || p + entrySize > stsd.Length) break;
-            string entryType = Fourcc(stsd, p + 4);
+            string entryType = AsFourcc(stsd.Slice(p + 4, 4));
             if (entryType is "avc1" or "avc3")
             {
-                // VisualSampleEntry: 78 bytes of fixed header after the box header, then child boxes.
                 int childStart = p + 8 + 78;
                 int childEnd = p + entrySize;
                 if (childStart > childEnd) break;
@@ -359,7 +386,7 @@ public static class Mp4Reader
 
     // ---------- sample table ----------
 
-    private static List<(int Offset, int Size)> BuildSampleOffsetTable(ReadOnlySpan<byte> stbl)
+    private static List<(long Offset, int Size)> BuildSampleOffsetTable(ReadOnlySpan<byte> stbl)
     {
         if (!TryFindChildBox(stbl, "stsz", out int stszS, out int stszL)) throw new InvalidDataException("MP4: no stsz");
         if (!TryFindChildBox(stbl, "stsc", out int stscS, out int stscL)) throw new InvalidDataException("MP4: no stsc");
@@ -393,8 +420,9 @@ public static class Mp4Reader
         }
         else
         {
+            // stco entries are unsigned 32-bit; widen via uint before storing.
             for (int i = 0; i < chunkCount; i++)
-                chunkOffsets[i] = BinaryPrimitives.ReadInt32BigEndian(stco.Slice(8 + i * 4, 4));
+                chunkOffsets[i] = BinaryPrimitives.ReadUInt32BigEndian(stco.Slice(8 + i * 4, 4));
         }
 
         int stscCount = BinaryPrimitives.ReadInt32BigEndian(stsc.Slice(4, 4));
@@ -406,7 +434,7 @@ public static class Mp4Reader
                 BinaryPrimitives.ReadInt32BigEndian(stsc.Slice(8 + i * 12 + 4, 4)));
         }
 
-        var result = new List<(int, int)>(sampleCount);
+        var result = new List<(long, int)>(sampleCount);
         int sampleIdx = 0;
         for (int e = 0; e < stscCount && sampleIdx < sampleCount; e++)
         {
@@ -419,7 +447,7 @@ public static class Mp4Reader
                 for (int s = 0; s < samplesPerChunk && sampleIdx < sampleCount; s++)
                 {
                     int sz = sampleSizes[sampleIdx];
-                    result.Add(((int)pos, sz));
+                    result.Add((pos, sz));
                     pos += sz;
                     sampleIdx++;
                 }
@@ -430,7 +458,7 @@ public static class Mp4Reader
 
     // ---------- helpers ----------
 
-    private static NalUnit BuildNalUnit(ReadOnlySpan<byte> headerPlusEbsp)
+    internal static NalUnit BuildNalUnit(ReadOnlySpan<byte> headerPlusEbsp)
     {
         byte header = headerPlusEbsp[0];
         if ((header & 0x80) != 0)
@@ -441,33 +469,52 @@ public static class Mp4Reader
         return new NalUnit(nalRefIdc, nalUnitType, rbsp);
     }
 
-    private static int ReadBE(ReadOnlySpan<byte> s, int pos, int n)
+    internal static int ReadBE(ReadOnlySpan<byte> s, int pos, int n)
     {
         int v = 0;
         for (int i = 0; i < n; i++) v = (v << 8) | s[pos + i];
         return v;
     }
 
-    private static string Fourcc(ReadOnlySpan<byte> s, int pos) =>
-        new string(new[] { (char)s[pos], (char)s[pos + 1], (char)s[pos + 2], (char)s[pos + 3] });
+    private static string AsFourcc(ReadOnlySpan<byte> s) =>
+        new string(new[] { (char)s[0], (char)s[1], (char)s[2], (char)s[3] });
+
+    private static int ReadExact(Stream stream, Span<byte> buffer)
+    {
+        int total = 0;
+        while (total < buffer.Length)
+        {
+            int n = stream.Read(buffer[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
 }
 
 /// <summary>
 /// MP4 video track parsed into NAL units plus timing metadata: per-sample decode time,
 /// composition time, sync-sample flag, plus container-level duration and dimensions.
+/// Samples carry only metadata (file offset + size); call <see cref="ResolveNalUnits(int)"/>
+/// to lazily read and parse a sample's NAL units from the source stream.
 /// </summary>
 public sealed class Mp4SampleStream
 {
+    private readonly Stream _source;
+
     public IReadOnlyList<NalUnit> AvcCConfigNalUnits { get; }
     public IReadOnlyList<Mp4Sample> Samples { get; }
     public uint Timescale { get; }
     public double DurationSeconds { get; }
     public int Width { get; }
     public int Height { get; }
+    /// <summary>NAL-length prefix size minus 1 (from avcC); resolved length is this+1 bytes.</summary>
+    public byte LengthSizeMinusOne { get; }
 
     public Mp4SampleStream(
         IReadOnlyList<NalUnit> avcConfig, IReadOnlyList<Mp4Sample> samples,
-        uint timescale, double durationSeconds, int width, int height)
+        uint timescale, double durationSeconds, int width, int height,
+        byte lengthSizeMinusOne, Stream source)
     {
         AvcCConfigNalUnits = avcConfig;
         Samples = samples;
@@ -475,22 +522,72 @@ public sealed class Mp4SampleStream
         DurationSeconds = durationSeconds;
         Width = width;
         Height = height;
+        LengthSizeMinusOne = lengthSizeMinusOne;
+        _source = source;
     }
+
+    /// <summary>Resolve a sample's NAL units by reading the bytes from the source stream.</summary>
+    public IReadOnlyList<NalUnit> ResolveNalUnits(int sampleIndex) =>
+        Samples[sampleIndex].ResolveNalUnits(_source);
 }
 
-/// <summary>One MP4 video sample (typically an access unit / coded picture).</summary>
+/// <summary>
+/// One MP4 video sample (typically an access unit / coded picture). Holds only the
+/// file offset, size, and timing — NAL units are parsed on demand by
+/// <see cref="ResolveNalUnits(Stream)"/> to avoid loading the entire mdat into memory.
+/// </summary>
 public sealed class Mp4Sample
 {
-    public IReadOnlyList<NalUnit> NalUnits { get; }
+    /// <summary>Absolute byte offset of this sample's data within the source file.</summary>
+    public long FileOffset { get; }
+    /// <summary>Sample size in bytes.</summary>
+    public int Size { get; }
     public double DecodeTimeSeconds { get; }
     public double CompositionTimeSeconds { get; }
     public bool IsSyncSample { get; }
 
-    public Mp4Sample(IReadOnlyList<NalUnit> nalUnits, double decodeTime, double compositionTime, bool isSync)
+    private readonly int _lengthSize;
+
+    public Mp4Sample(long fileOffset, int size, double decodeTime, double compositionTime, bool isSync, int lengthSize)
     {
-        NalUnits = nalUnits;
+        FileOffset = fileOffset;
+        Size = size;
         DecodeTimeSeconds = decodeTime;
         CompositionTimeSeconds = compositionTime;
         IsSyncSample = isSync;
+        _lengthSize = lengthSize;
+    }
+
+    /// <summary>Read this sample's bytes from <paramref name="source"/> and parse AVCC length-prefixed NAL units.</summary>
+    public IReadOnlyList<NalUnit> ResolveNalUnits(Stream source)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        if (!source.CanSeek) throw new ArgumentException("source stream must be seekable", nameof(source));
+        if (Size <= 0) return Array.Empty<NalUnit>();
+
+        byte[] buffer = new byte[Size];
+        source.Position = FileOffset;
+        int total = 0;
+        while (total < buffer.Length)
+        {
+            int n = source.Read(buffer, total, buffer.Length - total);
+            if (n == 0) throw new InvalidDataException(
+                $"MP4: truncated sample at offset {FileOffset} (expected {Size} bytes, got {total})");
+            total += n;
+        }
+
+        var nals = new List<NalUnit>();
+        ReadOnlySpan<byte> sample = buffer;
+        int pos = 0;
+        while (pos + _lengthSize <= sample.Length)
+        {
+            int nalLen = Mp4Reader.ReadBE(sample, pos, _lengthSize);
+            pos += _lengthSize;
+            if (nalLen < 1 || pos + nalLen > sample.Length)
+                throw new InvalidDataException($"MP4: NAL length {nalLen} overflows sample at offset {FileOffset}");
+            nals.Add(Mp4Reader.BuildNalUnit(sample.Slice(pos, nalLen)));
+            pos += nalLen;
+        }
+        return nals;
     }
 }

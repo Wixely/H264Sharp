@@ -196,4 +196,241 @@ public class CliCommandsTests
             if (File.Exists(outYuv)) File.Delete(outYuv);
         }
     }
+
+    [Fact]
+    public void Mp4Reader_Stream_MatchesSpanOverload_OnSmallFile()
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        byte[] bytes = File.ReadAllBytes(sample.H264Path);
+
+        var spanStream = Mp4Reader.ExtractH264WithTiming(bytes);
+        using var fs = File.OpenRead(sample.H264Path);
+        var fsStream = Mp4Reader.ExtractH264WithTiming(fs);
+
+        Assert.Equal(spanStream.Samples.Count, fsStream.Samples.Count);
+        Assert.Equal(spanStream.Width, fsStream.Width);
+        Assert.Equal(spanStream.Height, fsStream.Height);
+        Assert.Equal(spanStream.Timescale, fsStream.Timescale);
+        Assert.Equal(spanStream.DurationSeconds, fsStream.DurationSeconds);
+        for (int i = 0; i < spanStream.Samples.Count; i++)
+        {
+            Assert.Equal(spanStream.Samples[i].FileOffset, fsStream.Samples[i].FileOffset);
+            Assert.Equal(spanStream.Samples[i].Size, fsStream.Samples[i].Size);
+            Assert.Equal(spanStream.Samples[i].IsSyncSample, fsStream.Samples[i].IsSyncSample);
+            // NAL resolution through both paths produces equivalent NAL types + payloads.
+            var spanNals = spanStream.ResolveNalUnits(i);
+            var fsNals = fsStream.ResolveNalUnits(i);
+            Assert.Equal(spanNals.Count, fsNals.Count);
+            for (int j = 0; j < spanNals.Count; j++)
+            {
+                Assert.Equal(spanNals[j].NalUnitType, fsNals[j].NalUnitType);
+                Assert.True(spanNals[j].Rbsp.Span.SequenceEqual(fsNals[j].Rbsp.Span));
+            }
+        }
+    }
+
+    [Fact]
+    public void Commands_ThumbnailAt_WorksThroughStream()
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        string outPng = Path.Combine(Path.GetTempPath(), $"thumb_{Guid.NewGuid():N}.png");
+        try
+        {
+            var stderr = new StringWriter();
+            int rc = Commands.ThumbnailAt(sample.H264Path, outPng, "0", stderr);
+            Assert.Equal(0, rc);
+            Assert.True(File.Exists(outPng));
+            Assert.True(new FileInfo(outPng).Length > 0);
+        }
+        finally
+        {
+            if (File.Exists(outPng)) File.Delete(outPng);
+        }
+    }
+
+    [Fact]
+    public void Mp4Reader_Stream_HandlesLargeOffsets_Co64()
+    {
+        // Build a synthetic MP4 with a single video sample whose chunk offset is > 2^31.
+        // We use a sparse stream wrapper so we never actually allocate 4 GiB of data.
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        byte[] real = File.ReadAllBytes(sample.H264Path);
+
+        // Parse the real file via the span path to recover the existing samples.
+        var refStream = Mp4Reader.ExtractH264WithTiming(real);
+        Assert.True(refStream.Samples.Count >= 1);
+
+        // Rebuild moov with stco replaced by co64 holding sample 0's chunk offset shifted
+        // by +4 GiB. The sparse stream maps reads at the shifted offset back to the real bytes.
+        long shift = 1L << 33;
+        byte[] mutated = RewriteStcoToCo64WithShift(real, shift, out long origChunkOffset, out int rewriteDelta, out int rewritePos);
+        // If moov rewrite happened before the chunk data, the data shifted by rewriteDelta in the mutated buffer.
+        long dataPosInMutated = rewritePos < origChunkOffset ? origChunkOffset + rewriteDelta : origChunkOffset;
+
+        using var sparse = new SparseShiftedStream(mutated, dataPosInMutated, origChunkOffset + shift, refStream.Samples[0].Size);
+        var streamed = Mp4Reader.ExtractH264WithTiming(sparse);
+
+        Assert.True(streamed.Samples[0].FileOffset >= shift, $"expected offset > 2^31, got {streamed.Samples[0].FileOffset}");
+        var nals = streamed.ResolveNalUnits(0);
+        Assert.NotEmpty(nals);
+        // Compare to span-based reference: same NAL types in same order.
+        var refNals = refStream.ResolveNalUnits(0);
+        Assert.Equal(refNals.Count, nals.Count);
+        for (int i = 0; i < refNals.Count; i++)
+            Assert.Equal(refNals[i].NalUnitType, nals[i].NalUnitType);
+    }
+
+    // Rebuilds an MP4 byte array, replacing the stco box in the first video trak with a co64
+    // whose only entry equals (firstChunkOffset + shift). All other bytes are preserved.
+    // The returned array still references the original mdat region; reads at the shifted
+    // offset will be served by the sparse stream wrapper.
+    private static byte[] RewriteStcoToCo64WithShift(byte[] mp4, long shift, out long origChunkOffset, out int delta, out int rewritePos)
+    {
+        // Locate stco within the file (linear scan is fine for the small fixture).
+        // We rewrite in-place: stco header is "size(4) 'stco' version_flags(4) count(4) entries..."
+        // co64 entries are 8 bytes each vs stco's 4 — we must produce a new buffer if sizes differ.
+        int stcoStart = FindBoxStart(mp4, "stco");
+        if (stcoStart < 0) throw new InvalidOperationException("test fixture has no stco");
+        int stcoSize = (int)((uint)mp4[stcoStart] << 24 | (uint)mp4[stcoStart + 1] << 16 | (uint)mp4[stcoStart + 2] << 8 | mp4[stcoStart + 3]);
+        int count = (int)((uint)mp4[stcoStart + 12] << 24 | (uint)mp4[stcoStart + 13] << 16 | (uint)mp4[stcoStart + 14] << 8 | mp4[stcoStart + 15]);
+
+        // Read first chunk offset (we shift all of them).
+        origChunkOffset = (uint)mp4[stcoStart + 16] << 24 | (uint)mp4[stcoStart + 17] << 16 | (uint)mp4[stcoStart + 18] << 8 | mp4[stcoStart + 19];
+
+        int newStcoSize = 16 + count * 8;
+        delta = newStcoSize - stcoSize;
+        rewritePos = stcoStart;
+        byte[] outBuf = new byte[mp4.Length + delta];
+        Buffer.BlockCopy(mp4, 0, outBuf, 0, stcoStart);
+
+        // Write new co64 box.
+        WriteU32BE(outBuf, stcoStart, (uint)newStcoSize);
+        outBuf[stcoStart + 4] = (byte)'c'; outBuf[stcoStart + 5] = (byte)'o';
+        outBuf[stcoStart + 6] = (byte)'6'; outBuf[stcoStart + 7] = (byte)'4';
+        // version + flags (zero), copied from stco.
+        Buffer.BlockCopy(mp4, stcoStart + 8, outBuf, stcoStart + 8, 4);
+        WriteU32BE(outBuf, stcoStart + 12, (uint)count);
+        for (int i = 0; i < count; i++)
+        {
+            long off = (uint)mp4[stcoStart + 16 + i * 4] << 24 | (uint)mp4[stcoStart + 17 + i * 4] << 16
+                | (uint)mp4[stcoStart + 18 + i * 4] << 8 | mp4[stcoStart + 19 + i * 4];
+            WriteU64BE(outBuf, stcoStart + 16 + i * 8, (ulong)(off + shift));
+        }
+
+        // Tail.
+        Buffer.BlockCopy(mp4, stcoStart + stcoSize, outBuf, stcoStart + newStcoSize, mp4.Length - stcoStart - stcoSize);
+
+        // Patch ancestor box sizes (stbl, minf, mdia, trak, moov) — find each enclosing box and add delta.
+        PatchAncestorSizes(outBuf, stcoStart, delta);
+
+        return outBuf;
+    }
+
+    private static void PatchAncestorSizes(byte[] buf, int childPos, int delta)
+    {
+        // Walk the file top-down to find boxes that contain childPos; grow their sizes.
+        // Boxes containing childPos: moov > trak > mdia > minf > stbl.
+        PatchContainingBoxes(buf, 0, buf.Length, childPos, delta);
+    }
+
+    private static void PatchContainingBoxes(byte[] buf, int start, int end, int childPos, int delta)
+    {
+        int p = start;
+        while (p + 8 <= end)
+        {
+            int sz = (int)((uint)buf[p] << 24 | (uint)buf[p + 1] << 16 | (uint)buf[p + 2] << 8 | buf[p + 3]);
+            if (sz < 8 || p + sz > end + delta) break;
+            int boxEndOrig = p + sz; // pre-patch end in this region
+            if (p < childPos && childPos < boxEndOrig)
+            {
+                // This box contains the child; grow it and recurse into payload.
+                WriteU32BE(buf, p, (uint)(sz + delta));
+                PatchContainingBoxes(buf, p + 8, boxEndOrig, childPos, delta);
+                return;
+            }
+            p += sz;
+        }
+    }
+
+    private static int FindBoxStart(byte[] buf, string fourcc)
+    {
+        for (int i = 0; i + 8 <= buf.Length; i++)
+        {
+            if (buf[i + 4] == fourcc[0] && buf[i + 5] == fourcc[1] && buf[i + 6] == fourcc[2] && buf[i + 7] == fourcc[3])
+                return i;
+        }
+        return -1;
+    }
+
+    private static void WriteU32BE(byte[] buf, int pos, uint v)
+    {
+        buf[pos] = (byte)(v >> 24); buf[pos + 1] = (byte)(v >> 16);
+        buf[pos + 2] = (byte)(v >> 8); buf[pos + 3] = (byte)v;
+    }
+
+    private static void WriteU64BE(byte[] buf, int pos, ulong v)
+    {
+        for (int i = 0; i < 8; i++) buf[pos + i] = (byte)(v >> (56 - i * 8));
+    }
+
+    // A seekable stream that exposes a "virtual" length larger than 2 GiB by mapping reads
+    // at [origOffset+shift .. +size) back to [origOffset .. +size) in the underlying buffer.
+    // Reads in [0, mutated.Length) come from the mutated buffer directly.
+    private sealed class SparseShiftedStream : Stream
+    {
+        private readonly byte[] _data;
+        private readonly long _dataPosInMutated;
+        private readonly long _shiftedStart;
+        private readonly int _sampleSize;
+        private long _position;
+
+        public SparseShiftedStream(byte[] data, long dataPosInMutated, long shiftedStart, int sampleSize)
+        {
+            _data = data;
+            _dataPosInMutated = dataPosInMutated;
+            _shiftedStart = shiftedStart;
+            _sampleSize = sampleSize;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => _shiftedStart + _sampleSize;
+        public override long Position { get => _position; set => _position = value; }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            _position = origin switch
+            {
+                SeekOrigin.Begin => offset,
+                SeekOrigin.Current => _position + offset,
+                _ => Length + offset,
+            };
+            return _position;
+        }
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            // Region A: low addresses — straight from mutated buffer (ftyp/moov/etc., possibly mdat too).
+            if (_position < _data.Length)
+            {
+                int avail = (int)Math.Min(count, _data.Length - _position);
+                Buffer.BlockCopy(_data, (int)_position, buffer, offset, avail);
+                _position += avail;
+                return avail;
+            }
+            // Region B: shifted sample window — map reads back to the data buffer.
+            if (_position >= _shiftedStart && _position < _shiftedStart + _sampleSize)
+            {
+                int avail = (int)Math.Min(count, _shiftedStart + _sampleSize - _position);
+                long srcPos = _dataPosInMutated + (_position - _shiftedStart);
+                Buffer.BlockCopy(_data, (int)srcPos, buffer, offset, avail);
+                _position += avail;
+                return avail;
+            }
+            return 0;
+        }
+    }
 }

@@ -77,14 +77,14 @@ public static class Commands
             return 4;
         }
         if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
-        byte[] bytes = File.ReadAllBytes(inPath);
-        if (!LooksLikeMp4(bytes))
+        if (!FileLooksLikeMp4(inPath))
         {
             stderr.WriteLine("--at-pct requires an MP4 container (Annex-B has no timestamps)");
             return 5;
         }
+        using var fs = File.OpenRead(inPath);
         Mp4SampleStream stream;
-        try { stream = Mp4Reader.ExtractH264WithTiming(bytes); }
+        try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
         catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
 
@@ -99,14 +99,14 @@ public static class Commands
     private static int ThumbnailAtSeconds(string inPath, string outPath, double t, TextWriter stderr)
     {
         if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
-        byte[] bytes = File.ReadAllBytes(inPath);
-        if (!LooksLikeMp4(bytes))
+        if (!FileLooksLikeMp4(inPath))
         {
             stderr.WriteLine("--at requires an MP4 container (Annex-B has no timestamps)");
             return 5;
         }
+        using var fs = File.OpenRead(inPath);
         Mp4SampleStream stream;
-        try { stream = Mp4Reader.ExtractH264WithTiming(bytes); }
+        try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
         catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
         return ThumbnailAtTimeForStream(stream, outPath, t, stderr);
@@ -127,7 +127,7 @@ public static class Commands
         while (idr > 0 && !stream.Samples[idr].IsSyncSample) idr--;
 
         var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
-        for (int i = idr; i <= target; i++) nals.AddRange(stream.Samples[i].NalUnits);
+        for (int i = idr; i <= target; i++) nals.AddRange(stream.ResolveNalUnits(i));
 
         var decoder = new H264FrameDecoder();
         List<DecodedPicture> frames;
@@ -145,14 +145,15 @@ public static class Commands
     public static int Info(string inPath, TextWriter stdout, TextWriter stderr)
     {
         if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
-        byte[] bytes = File.ReadAllBytes(inPath);
-        if (!LooksLikeMp4(bytes))
+        if (!FileLooksLikeMp4(inPath))
         {
             // Annex-B / AVCC raw: parse SPS for resolution + profile, count slices for frames.
+            byte[] bytes = File.ReadAllBytes(inPath);
             return InfoAnnexB(bytes, stdout, stderr);
         }
+        using var fs = File.OpenRead(inPath);
         Mp4SampleStream stream;
-        try { stream = Mp4Reader.ExtractH264WithTiming(bytes); }
+        try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
         catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
 
         int frames = stream.Samples.Count;
@@ -264,6 +265,20 @@ public static class Commands
     }
 
     // ----- Local container sniffing copies (H264FrameDecoder's versions are private) -----
+
+    private static bool FileLooksLikeMp4(string path)
+    {
+        Span<byte> head = stackalloc byte[8];
+        using var fs = File.OpenRead(path);
+        int read = 0;
+        while (read < head.Length)
+        {
+            int n = fs.Read(head[read..]);
+            if (n == 0) break;
+            read += n;
+        }
+        return read >= 8 && LooksLikeMp4(head);
+    }
 
     private static bool LooksLikeMp4(ReadOnlySpan<byte> bytes)
     {
