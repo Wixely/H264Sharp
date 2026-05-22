@@ -35,11 +35,20 @@ internal static class MacroblockReconstructor
         Macroblock? leftMb,
         Macroblock? topMb,
         Macroblock? topRightMb,
-        IReadOnlyList<DecodedPicture>? refPicListL0 = null)
+        IReadOnlyList<DecodedPicture>? refPicListL0 = null,
+        IReadOnlyList<DecodedPicture>? refPicListL1 = null)
     {
         if (mb.IsPcm)
         {
             ReconstructPcm(mb, picture, mbX, mbY);
+            return;
+        }
+        if (mb.IsBInter || mb.IsBSkip)
+        {
+            if (refPicListL0 is null) throw new InvalidOperationException("B-inter reconstruction requires L0 ref list");
+            ReconstructLumaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY);
+            int qPcB = ChromaQp(mb.QpY, chromaQpIndexOffset);
+            ReconstructChromaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, qPcB);
             return;
         }
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
@@ -771,4 +780,182 @@ internal static class MacroblockReconstructor
     }
 
     private static byte ClipByte(int v) => (byte)(v < 0 ? 0 : v > 255 ? 255 : v);
+
+    // ---------------- Luma (B-slice inter) ----------------
+    private static void ReconstructLumaInterB(
+        Macroblock mb, DecodedPicture picture,
+        IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1, int mbX, int mbY)
+    {
+        Span<byte> predBlock = stackalloc byte[256];
+        Span<byte> p0 = stackalloc byte[256];
+        Span<byte> p1 = stackalloc byte[256];
+        Span<byte> outBuf256 = stackalloc byte[256];
+        foreach (var part in mb.BInterPartitions)
+        {
+            int n = part.Width * part.Height;
+            Span<byte> outBuf = outBuf256[..n];
+
+            bool useL0 = part.Dir == BPredDir.L0 || part.Dir == BPredDir.Bi;
+            bool useL1 = part.Dir == BPredDir.L1 || part.Dir == BPredDir.Bi;
+            if (useL0)
+            {
+                int ri = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
+                var rp = refL0[ri];
+                MotionCompensation.LumaPredict(rp.Y, rp.Width, rp.Height,
+                    mbX * 16 + part.X, mbY * 16 + part.Y,
+                    part.MvL0X, part.MvL0Y, part.Width, part.Height, p0[..n]);
+            }
+            if (useL1)
+            {
+                if (refL1 is null || refL1.Count == 0)
+                    throw new InvalidOperationException("B-inter L1 reconstruction needs non-empty L1 list");
+                int ri = part.RefIdxL1 < 0 ? 0 : (part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
+                var rp = refL1[ri];
+                MotionCompensation.LumaPredict(rp.Y, rp.Width, rp.Height,
+                    mbX * 16 + part.X, mbY * 16 + part.Y,
+                    part.MvL1X, part.MvL1Y, part.Width, part.Height, p1[..n]);
+            }
+
+            if (useL0 && useL1)
+            {
+                for (int i = 0; i < n; i++) outBuf[i] = (byte)((p0[i] + p1[i] + 1) >> 1);
+            }
+            else if (useL0)
+            {
+                p0[..n].CopyTo(outBuf);
+            }
+            else
+            {
+                p1[..n].CopyTo(outBuf);
+            }
+
+            for (int yy = 0; yy < part.Height; yy++)
+                for (int xx = 0; xx < part.Width; xx++)
+                    predBlock[(part.Y + yy) * 16 + (part.X + xx)] = outBuf[yy * part.Width + xx];
+        }
+
+        // Add residual per 4x4 block (CBP-gated).
+        Span<int> coeffsScan = stackalloc int[16];
+        Span<int> coeffsRaster = stackalloc int[16];
+        for (int i = 0; i < 16; i++)
+        {
+            (int bx, int by) = MacroblockParser.LumaBlockPos[i];
+            int px0 = mbX * 16 + bx * 4;
+            int py0 = mbY * 16 + by * 4;
+
+            bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+            if (coded)
+            {
+                for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
+                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
+                InverseTransform.Inverse4x4(coeffsRaster);
+            }
+            else
+            {
+                coeffsRaster.Clear();
+            }
+            for (int yy = 0; yy < 4; yy++)
+                for (int xx = 0; xx < 4; xx++)
+                {
+                    int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
+                    int v = pred + coeffsRaster[yy * 4 + xx];
+                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                }
+        }
+    }
+
+    private static void ReconstructChromaInterB(
+        Macroblock mb, DecodedPicture picture,
+        IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1,
+        int mbX, int mbY, int qPc)
+    {
+        Span<byte> predBlock = stackalloc byte[64];
+        Span<byte> p0 = stackalloc byte[64];
+        Span<byte> p1 = stackalloc byte[64];
+        Span<byte> outBuf64 = stackalloc byte[64];
+        Span<int> dc = stackalloc int[4];
+        Span<int> coeffsScan = stackalloc int[16];
+        Span<int> coeffsRaster = stackalloc int[16];
+
+        for (int comp = 0; comp < 2; comp++)
+        {
+            byte[] plane = comp == 0 ? picture.U : picture.V;
+            int stride = picture.ChromaWidth;
+            foreach (var part in mb.BInterPartitions)
+            {
+                int cx = part.X / 2, cy = part.Y / 2, cw = part.Width / 2, ch = part.Height / 2;
+                int n = cw * ch;
+                Span<byte> outBuf = outBuf64[..n];
+                bool useL0 = part.Dir == BPredDir.L0 || part.Dir == BPredDir.Bi;
+                bool useL1 = part.Dir == BPredDir.L1 || part.Dir == BPredDir.Bi;
+                if (useL0)
+                {
+                    int ri = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
+                    var rp = refL0[ri];
+                    byte[] refPlane = comp == 0 ? rp.U : rp.V;
+                    MotionCompensation.ChromaPredict(refPlane, rp.ChromaWidth, rp.ChromaHeight,
+                        mbX * 8 + cx, mbY * 8 + cy, part.MvL0X, part.MvL0Y, cw, ch, p0[..n]);
+                }
+                if (useL1)
+                {
+                    if (refL1 is null) throw new InvalidOperationException("B chroma L1 needs ref list");
+                    int ri = part.RefIdxL1 < 0 ? 0 : (part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
+                    var rp = refL1[ri];
+                    byte[] refPlane = comp == 0 ? rp.U : rp.V;
+                    MotionCompensation.ChromaPredict(refPlane, rp.ChromaWidth, rp.ChromaHeight,
+                        mbX * 8 + cx, mbY * 8 + cy, part.MvL1X, part.MvL1Y, cw, ch, p1[..n]);
+                }
+                if (useL0 && useL1)
+                {
+                    for (int i = 0; i < n; i++) outBuf[i] = (byte)((p0[i] + p1[i] + 1) >> 1);
+                }
+                else if (useL0)
+                {
+                    p0[..n].CopyTo(outBuf);
+                }
+                else
+                {
+                    p1[..n].CopyTo(outBuf);
+                }
+                for (int yy = 0; yy < ch; yy++)
+                    for (int xx = 0; xx < cw; xx++)
+                        predBlock[(cy + yy) * 8 + (cx + xx)] = outBuf[yy * cw + xx];
+            }
+
+            dc.Clear();
+            if ((mb.CbpChroma & 3) != 0)
+            {
+                for (int k = 0; k < 4; k++) dc[k] = mb.ChromaDc[comp, k];
+            }
+            InverseTransform.InverseHadamard2x2(dc);
+            Quantization.DequantChromaDc(dc, qPc);
+
+            for (int b = 0; b < 4; b++)
+            {
+                int subX = b & 1, subY = (b >> 1) & 1;
+                int dcValue = dc[subY * 2 + subX];
+                bool acCoded = (mb.CbpChroma & 2) != 0;
+                coeffsScan[0] = dcValue;
+                if (acCoded) { for (int k = 0; k < 15; k++) coeffsScan[k + 1] = mb.ChromaAc[comp, b, k]; }
+                else         { for (int k = 1; k < 16; k++) coeffsScan[k] = 0; }
+                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                int dcSaved = coeffsRaster[0];
+                coeffsRaster[0] = 0;
+                Quantization.Dequant4x4Ac(coeffsRaster, qPc);
+                coeffsRaster[0] = dcSaved;
+                InverseTransform.Inverse4x4(coeffsRaster);
+
+                int px0 = mbX * 8 + subX * 4;
+                int py0 = mbY * 8 + subY * 4;
+                for (int yy = 0; yy < 4; yy++)
+                    for (int xx = 0; xx < 4; xx++)
+                    {
+                        int pred = predBlock[(subY * 4 + yy) * 8 + (subX * 4 + xx)];
+                        int v = pred + coeffsRaster[yy * 4 + xx];
+                        plane[(py0 + yy) * stride + (px0 + xx)] = ClipByte(v);
+                    }
+            }
+        }
+    }
 }

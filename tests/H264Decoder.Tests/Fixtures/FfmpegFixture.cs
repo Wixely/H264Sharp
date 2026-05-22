@@ -258,6 +258,38 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Three-frame 64x48 clip with B-frames enabled (-bf 1), CAVLC. Display order I + B + P.
+    /// Encoded with high QP so most B-MBs are B_Skip or B_Direct (small or zero residual).</summary>
+    public static Sample ThreeFramesBFrames64x48Cavlc()
+    {
+        const int W = 64, H = 48;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_bframes_64x48_cavlc.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_bframes_64x48_cavlc.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:r=2:d=1.5,format=yuv420p\" -frames:v 3 " +
+            "-c:v libx264 -profile:v main -bf 1 -keyint_min 99 -g 99 -coder 0 -an " +
+            "-x264-params \"no-deblock=1\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 3 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
+    /// <summary>4-frame 64x48 CAVLC B-frame clip with -bf 2 (IBBP pattern). Exercises B-frames
+    /// with multiple references including the future P-frame.</summary>
+    public static Sample FourFramesBFrames64x48Cavlc()
+    {
+        const int W = 64, H = 48;
+        string h264 = Path.Combine(SamplesDirectory, "four_frames_bframes_64x48_cavlc.h264");
+        string yuv = Path.Combine(SamplesDirectory, "four_frames_bframes_64x48_cavlc.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:r=4:d=1,format=yuv420p\" -frames:v 4 " +
+            "-c:v libx264 -profile:v main -bf 2 -keyint_min 99 -g 99 -coder 0 -an " +
+            "-x264-params \"no-deblock=1\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 4 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Three-frame 16x16 red clip with B-frames enabled (-bf 2): IDR + P + B reorder.
     /// Used to exercise the B-slice header parser, POC computation, and L0/L1 list construction.</summary>
     public static Sample ThreeFramesBFrames16x16()

@@ -48,9 +48,24 @@ public static class MacroblockParser
         int startBit = reader.BitPosition;
         uint mbTypeCode = ExpGolomb.ReadUe(ref reader);
         bool isPSlice = sliceHeader.SliceType == SliceType.P;
-        var type = isPSlice
-            ? IntraMbType.FromPSliceCodeword(mbTypeCode)
-            : IntraMbType.FromISliceCodeword(mbTypeCode);
+        bool isBSlice = sliceHeader.SliceType == SliceType.B;
+        IntraMbType type;
+        if (isBSlice)
+        {
+            if (BMbType.IsInter(mbTypeCode))
+            {
+                return ParseBInterMb(ref reader, mb_initType: (int)mbTypeCode,
+                    sliceHeader, leftMb, topMb, topRightMb, topLeftMb, mbAddress, ref qpYRunning, startBit);
+            }
+            // Intra branch: mb_type - 23 is the I-slice code.
+            type = IntraMbType.FromISliceCodeword(mbTypeCode - 23);
+        }
+        else
+        {
+            type = isPSlice
+                ? IntraMbType.FromPSliceCodeword(mbTypeCode)
+                : IntraMbType.FromISliceCodeword(mbTypeCode);
+        }
         if (type.PredMode == MbPartPredMode.IPcm)
         {
             var pcmMb = new Macroblock
@@ -724,8 +739,19 @@ public static class MacroblockParser
     private static MvNeighbor GetMvNeighbor(
         int bx, int by, Macroblock cur,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        => GetMvNeighborList(bx, by, cur, leftMb, topMb, topRightMb, topLeftMb, listX: 0);
+
+    internal static MvNeighbor GetMvNeighborListPublic(
+        int bx, int by, Macroblock cur,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        int listX)
+        => GetMvNeighborList(bx, by, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
+
+    private static MvNeighbor GetMvNeighborList(
+        int bx, int by, Macroblock cur,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        int listX)
     {
-        // Resolve the MB containing the 4x4 block at (bx, by) (relative to current MB).
         Macroblock? mb;
         int nbBx, nbBy;
         if (bx >= 0 && by >= 0 && bx <= 3 && by <= 3) { mb = cur; nbBx = bx; nbBy = by; }
@@ -736,14 +762,458 @@ public static class MacroblockParser
         else { mb = null; nbBx = 0; nbBy = 0; }
 
         if (mb is null) return new MvNeighbor(false, 0, 0, -1);
+        int idx = _spatialToRaster[nbBy * 4 + nbBx];
+
+        if (mb.IsBInter || mb.IsBSkip)
+        {
+            byte pf = listX == 0 ? mb.PredFlagL0Block[idx] : mb.PredFlagL1Block[idx];
+            if (pf == 0) return new MvNeighbor(true, 0, 0, -1);
+            int q = QuadrantOf(nbBx, nbBy);
+            int refIdx = listX == 0 ? mb.RefIdxL08x8[q] : mb.RefIdxL18x8[q];
+            int mvX = listX == 0 ? mb.MvL0XBlock[idx] : mb.MvL1XBlock[idx];
+            int mvY = listX == 0 ? mb.MvL0YBlock[idx] : mb.MvL1YBlock[idx];
+            return new MvNeighbor(true, mvX, mvY, refIdx);
+        }
         if (mb.Type.PredMode != MbPartPredMode.PredL0)
         {
-            // Intra neighbor: MV unavailable for prediction purposes (refIdx=-1).
+            return new MvNeighbor(true, 0, 0, -1);
+        }
+        if (listX != 0)
+        {
             return new MvNeighbor(true, 0, 0, -1);
         }
 
-        int idx = _spatialToRaster[nbBy * 4 + nbBx];
-        int refIdx = mb.RefIdxL08x8[QuadrantOf(nbBx, nbBy)];
-        return new MvNeighbor(true, mb.MvL0XBlock[idx], mb.MvL0YBlock[idx], refIdx);
+        int qp = QuadrantOf(nbBx, nbBy);
+        int refIdxP = mb.RefIdxL08x8[qp];
+        return new MvNeighbor(true, mb.MvL0XBlock[idx], mb.MvL0YBlock[idx], refIdxP);
+    }
+
+    // ============================================================
+    //  B-slice macroblock parsing (CAVLC).
+    // ============================================================
+
+    internal static Macroblock ParseBInterMb(
+        ref BitReader reader, int mb_initType, SliceHeader sliceHeader,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        int mbAddress, ref int qpYRunning, int startBit)
+    {
+        var info = BMbType.Info(mb_initType);
+        var mb = new Macroblock
+        {
+            MbAddress = mbAddress,
+            Type = new IntraMbType(mb_initType, MbPartPredMode.PredL0, default, 0, 0),
+            IsBInter = true,
+            ParseStartBit = startBit,
+        };
+
+        BParseMbPredAndMvs(ref reader, mb, info, sliceHeader,
+            leftMb, topMb, topRightMb, topLeftMb);
+
+        // CBP for B-inter MBs.
+        uint cbpCode = ExpGolomb.ReadUe(ref reader);
+        int cbp = CodedBlockPattern.FromCodeNum(cbpCode, intra: false);
+        mb.CbpLuma = CodedBlockPattern.LumaPart(cbp);
+        mb.CbpChroma = CodedBlockPattern.ChromaPart(cbp);
+
+        // mb_qp_delta + residual (only if any CBP bit set).
+        if (mb.CbpLuma != 0 || mb.CbpChroma != 0)
+        {
+            int mbQpDelta = ExpGolomb.ReadSe(ref reader);
+            qpYRunning = Mod52(qpYRunning + mbQpDelta);
+            mb.QpY = qpYRunning;
+            ParseResidual(ref reader, mb, leftMb, topMb);
+        }
+        else
+        {
+            mb.QpY = qpYRunning;
+        }
+
+        mb.ParseEndBit = reader.BitPosition;
+        return mb;
+    }
+
+    private static void BParseMbPredAndMvs(
+        ref BitReader reader, Macroblock mb, BMbTypeInfo info, SliceHeader sliceHeader,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        int rawMb = info.RawMbType;
+        if (rawMb == 0)
+        {
+            // B_Direct_16x16: no per-partition syntax. Derive MVs via direct mode.
+            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
+            return;
+        }
+        if (rawMb == 22)
+        {
+            // B_8x8: 4 sub_mb_types.
+            var subTypes = new BSubMbType[4];
+            for (int i = 0; i < 4; i++)
+            {
+                uint code = ExpGolomb.ReadUe(ref reader);
+                if (code > 12) throw new InvalidDataException($"B sub_mb_type {code} out of range");
+                subTypes[i] = (BSubMbType)code;
+            }
+            BParseB8x8RefAndMv(ref reader, mb, subTypes, sliceHeader,
+                leftMb, topMb, topRightMb, topLeftMb);
+            return;
+        }
+        // mb_type 1..21: 1 or 2 partitions, each with a fixed direction.
+        BParse16Partitions(ref reader, mb, info, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
+    }
+
+    /// <summary>Read ref_idx + mvds for B mb_types 1..21 (one or two 16x16/16x8/8x16 partitions
+    /// with directions specified by the mb_type).</summary>
+    private static void BParse16Partitions(
+        ref BitReader reader, Macroblock mb, BMbTypeInfo info, SliceHeader sliceHeader,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        int numPart = info.NumMbPart;
+        uint maxRefL0 = sliceHeader.NumRefIdxL0ActiveMinus1;
+        uint maxRefL1 = sliceHeader.NumRefIdxL1ActiveMinus1;
+
+        // Partition rectangles.
+        var partRects = new (int X, int Y, int W, int H)[numPart];
+        if (numPart == 1)
+        {
+            partRects[0] = (0, 0, 16, 16);
+        }
+        else if (info.PartWidth == 16) // 16x8
+        {
+            partRects[0] = (0, 0, 16, 8);
+            partRects[1] = (0, 8, 16, 8);
+        }
+        else // 8x16
+        {
+            partRects[0] = (0, 0, 8, 16);
+            partRects[1] = (8, 0, 8, 16);
+        }
+
+        // Read ref_idx_l0 then ref_idx_l1 per partition (only if direction uses that list).
+        int[] refL0 = new int[numPart];
+        int[] refL1 = new int[numPart];
+        for (int p = 0; p < numPart; p++)
+        {
+            var dir = info.DirForPart(p);
+            bool useL0 = dir == BPredDir.L0 || dir == BPredDir.Bi;
+            refL0[p] = useL0 ? (maxRefL0 > 0 ? (int)ExpGolomb.ReadTe(ref reader, maxRefL0) : 0) : -1;
+        }
+        for (int p = 0; p < numPart; p++)
+        {
+            var dir = info.DirForPart(p);
+            bool useL1 = dir == BPredDir.L1 || dir == BPredDir.Bi;
+            refL1[p] = useL1 ? (maxRefL1 > 0 ? (int)ExpGolomb.ReadTe(ref reader, maxRefL1) : 0) : -1;
+        }
+
+        // Fill RefIdxL08x8 and RefIdxL18x8 per partition.
+        ReplicateBRefAcross16(info, partRects, refL0, mb.RefIdxL08x8);
+        ReplicateBRefAcross16(info, partRects, refL1, mb.RefIdxL18x8);
+
+        // mvds — L0 first then L1.
+        var mvdL0 = new (int X, int Y)[numPart];
+        var mvdL1 = new (int X, int Y)[numPart];
+        for (int p = 0; p < numPart; p++)
+        {
+            var dir = info.DirForPart(p);
+            bool useL0 = dir == BPredDir.L0 || dir == BPredDir.Bi;
+            if (useL0)
+            {
+                mvdL0[p].X = ExpGolomb.ReadSe(ref reader);
+                mvdL0[p].Y = ExpGolomb.ReadSe(ref reader);
+            }
+        }
+        for (int p = 0; p < numPart; p++)
+        {
+            var dir = info.DirForPart(p);
+            bool useL1 = dir == BPredDir.L1 || dir == BPredDir.Bi;
+            if (useL1)
+            {
+                mvdL1[p].X = ExpGolomb.ReadSe(ref reader);
+                mvdL1[p].Y = ExpGolomb.ReadSe(ref reader);
+            }
+        }
+
+        // Now per partition: predict, add mvd, write per-block MVs, build BInterPartitions.
+        for (int p = 0; p < numPart; p++)
+        {
+            var rect = partRects[p];
+            var dir = info.DirForPart(p);
+            int bx = rect.X / 4, by = rect.Y / 4, bw = rect.W / 4, bh = rect.H / 4;
+
+            int mvL0X = 0, mvL0Y = 0, mvL1X = 0, mvL1Y = 0;
+
+            if (dir == BPredDir.L0 || dir == BPredDir.Bi)
+            {
+                (int predX, int predY) = PredictMvForPartitionListB(mb, info.RawMbType, p,
+                    bx, by, bw, bh, refL0[p], listX: 0,
+                    leftMb, topMb, topRightMb, topLeftMb);
+                mvL0X = predX + mvdL0[p].X;
+                mvL0Y = predY + mvdL0[p].Y;
+                FillBlockMvsL0(mb, bx, by, bw, bh, mvL0X, mvL0Y);
+                FillBlockMvdsL0(mb, bx, by, bw, bh, mvdL0[p].X, mvdL0[p].Y);
+                SetPredFlag(mb.PredFlagL0Block, bx, by, bw, bh, 1);
+            }
+            if (dir == BPredDir.L1 || dir == BPredDir.Bi)
+            {
+                (int predX, int predY) = PredictMvForPartitionListB(mb, info.RawMbType, p,
+                    bx, by, bw, bh, refL1[p], listX: 1,
+                    leftMb, topMb, topRightMb, topLeftMb);
+                mvL1X = predX + mvdL1[p].X;
+                mvL1Y = predY + mvdL1[p].Y;
+                FillBlockMvsL1(mb, bx, by, bw, bh, mvL1X, mvL1Y);
+                FillBlockMvdsL1(mb, bx, by, bw, bh, mvdL1[p].X, mvdL1[p].Y);
+                SetPredFlag(mb.PredFlagL1Block, bx, by, bw, bh, 1);
+            }
+
+            mb.BInterPartitions.Add(new BMvPartition(
+                rect.X, rect.Y, rect.W, rect.H, dir,
+                refL0[p], mvL0X, mvL0Y,
+                refL1[p], mvL1X, mvL1Y));
+        }
+    }
+
+    private static void BParseB8x8RefAndMv(
+        ref BitReader reader, Macroblock mb, BSubMbType[] subTypes, SliceHeader sliceHeader,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        uint maxRefL0 = sliceHeader.NumRefIdxL0ActiveMinus1;
+        uint maxRefL1 = sliceHeader.NumRefIdxL1ActiveMinus1;
+
+        // ref_idx_l0 per 8x8 quadrant where direction uses L0 (Direct skipped — ref derived later).
+        int[] refL0 = new int[4];
+        int[] refL1 = new int[4];
+        for (int q = 0; q < 4; q++)
+        {
+            var dir = BSubMbTypeOps.Dir(subTypes[q]);
+            bool useL0 = dir == BPredDir.L0 || dir == BPredDir.Bi;
+            refL0[q] = useL0 ? (maxRefL0 > 0 ? (int)ExpGolomb.ReadTe(ref reader, maxRefL0) : 0) : -1;
+        }
+        for (int q = 0; q < 4; q++)
+        {
+            var dir = BSubMbTypeOps.Dir(subTypes[q]);
+            bool useL1 = dir == BPredDir.L1 || dir == BPredDir.Bi;
+            refL1[q] = useL1 ? (maxRefL1 > 0 ? (int)ExpGolomb.ReadTe(ref reader, maxRefL1) : 0) : -1;
+        }
+        for (int q = 0; q < 4; q++)
+        {
+            mb.RefIdxL08x8[q] = refL0[q] < 0 ? 0 : refL0[q];
+            mb.RefIdxL18x8[q] = refL1[q] < 0 ? 0 : refL1[q];
+        }
+
+        // mvd_l0 then mvd_l1 per sub-partition.
+        for (int q = 0; q < 4; q++)
+        {
+            var sub = subTypes[q];
+            var dir = BSubMbTypeOps.Dir(sub);
+            if (dir != BPredDir.L0 && dir != BPredDir.Bi) continue;
+            int n = BSubMbTypeOps.NumSubMbPart(sub);
+            var (sw, sh) = BSubMbTypeOps.SubMbPartSize(sub);
+            int qx = (q & 1) * 8, qy = (q >> 1) * 8;
+            for (int sp = 0; sp < n; sp++)
+            {
+                int spx, spy;
+                if (sw == 8 && sh == 8) { spx = 0; spy = 0; }
+                else if (sw == 8 && sh == 4) { spx = 0; spy = sp * 4; }
+                else if (sw == 4 && sh == 8) { spx = sp * 4; spy = 0; }
+                else { spx = (sp & 1) * 4; spy = (sp >> 1) * 4; }
+                int partX = qx + spx, partY = qy + spy;
+                int bx = partX / 4, by = partY / 4, bw = sw / 4, bh = sh / 4;
+                int mvdX = ExpGolomb.ReadSe(ref reader);
+                int mvdY = ExpGolomb.ReadSe(ref reader);
+                (int predX, int predY) = PredictMvForPartitionListB(mb, 0, 0,
+                    bx, by, bw, bh, refL0[q], listX: 0,
+                    leftMb, topMb, topRightMb, topLeftMb);
+                int mvX = predX + mvdX, mvY = predY + mvdY;
+                FillBlockMvsL0(mb, bx, by, bw, bh, mvX, mvY);
+                FillBlockMvdsL0(mb, bx, by, bw, bh, mvdX, mvdY);
+                SetPredFlag(mb.PredFlagL0Block, bx, by, bw, bh, 1);
+            }
+        }
+        for (int q = 0; q < 4; q++)
+        {
+            var sub = subTypes[q];
+            var dir = BSubMbTypeOps.Dir(sub);
+            if (dir != BPredDir.L1 && dir != BPredDir.Bi) continue;
+            int n = BSubMbTypeOps.NumSubMbPart(sub);
+            var (sw, sh) = BSubMbTypeOps.SubMbPartSize(sub);
+            int qx = (q & 1) * 8, qy = (q >> 1) * 8;
+            for (int sp = 0; sp < n; sp++)
+            {
+                int spx, spy;
+                if (sw == 8 && sh == 8) { spx = 0; spy = 0; }
+                else if (sw == 8 && sh == 4) { spx = 0; spy = sp * 4; }
+                else if (sw == 4 && sh == 8) { spx = sp * 4; spy = 0; }
+                else { spx = (sp & 1) * 4; spy = (sp >> 1) * 4; }
+                int partX = qx + spx, partY = qy + spy;
+                int bx = partX / 4, by = partY / 4, bw = sw / 4, bh = sh / 4;
+                int mvdX = ExpGolomb.ReadSe(ref reader);
+                int mvdY = ExpGolomb.ReadSe(ref reader);
+                (int predX, int predY) = PredictMvForPartitionListB(mb, 0, 0,
+                    bx, by, bw, bh, refL1[q], listX: 1,
+                    leftMb, topMb, topRightMb, topLeftMb);
+                int mvX = predX + mvdX, mvY = predY + mvdY;
+                FillBlockMvsL1(mb, bx, by, bw, bh, mvX, mvY);
+                FillBlockMvdsL1(mb, bx, by, bw, bh, mvdX, mvdY);
+                SetPredFlag(mb.PredFlagL1Block, bx, by, bw, bh, 1);
+            }
+        }
+        // For Direct sub-blocks: derive MVs via direct mode per 8x8 quadrant.
+        for (int q = 0; q < 4; q++)
+        {
+            if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
+            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
+        }
+
+        // Build BInterPartitions list reflecting sub-partition shapes (each carries direction).
+        for (int q = 0; q < 4; q++)
+        {
+            int qx = (q & 1) * 8, qy = (q >> 1) * 8;
+            var sub = subTypes[q];
+            var dir = BSubMbTypeOps.Dir(sub);
+            int n = BSubMbTypeOps.NumSubMbPart(sub);
+            var (sw, sh) = BSubMbTypeOps.SubMbPartSize(sub);
+            for (int sp = 0; sp < n; sp++)
+            {
+                int spx, spy;
+                if (sw == 8 && sh == 8) { spx = 0; spy = 0; }
+                else if (sw == 8 && sh == 4) { spx = 0; spy = sp * 4; }
+                else if (sw == 4 && sh == 8) { spx = sp * 4; spy = 0; }
+                else { spx = (sp & 1) * 4; spy = (sp >> 1) * 4; }
+                int bx = (qx + spx) / 4, by = (qy + spy) / 4;
+                int idx = _spatialToRaster[by * 4 + bx];
+                int mvL0X = mb.MvL0XBlock[idx], mvL0Y = mb.MvL0YBlock[idx];
+                int mvL1X = mb.MvL1XBlock[idx], mvL1Y = mb.MvL1YBlock[idx];
+                int rL0 = mb.PredFlagL0Block[idx] != 0 ? mb.RefIdxL08x8[q] : -1;
+                int rL1 = mb.PredFlagL1Block[idx] != 0 ? mb.RefIdxL18x8[q] : -1;
+                BPredDir effDir = dir;
+                if (dir == BPredDir.Direct)
+                {
+                    if (mb.PredFlagL0Block[idx] != 0 && mb.PredFlagL1Block[idx] != 0) effDir = BPredDir.Bi;
+                    else if (mb.PredFlagL0Block[idx] != 0) effDir = BPredDir.L0;
+                    else if (mb.PredFlagL1Block[idx] != 0) effDir = BPredDir.L1;
+                }
+                mb.BInterPartitions.Add(new BMvPartition(qx + spx, qy + spy, sw, sh, effDir,
+                    rL0, mvL0X, mvL0Y, rL1, mvL1X, mvL1Y));
+            }
+        }
+    }
+
+    private static void ReplicateBRefAcross16(BMbTypeInfo info,
+        (int X, int Y, int W, int H)[] partRects, int[] partRef, int[] perQuadrant)
+    {
+        if (info.NumMbPart == 1)
+        {
+            for (int q = 0; q < 4; q++) perQuadrant[q] = partRef[0] < 0 ? 0 : partRef[0];
+        }
+        else if (info.PartWidth == 16) // 16x8
+        {
+            perQuadrant[0] = perQuadrant[1] = partRef[0] < 0 ? 0 : partRef[0];
+            perQuadrant[2] = perQuadrant[3] = partRef[1] < 0 ? 0 : partRef[1];
+        }
+        else // 8x16
+        {
+            perQuadrant[0] = perQuadrant[2] = partRef[0] < 0 ? 0 : partRef[0];
+            perQuadrant[1] = perQuadrant[3] = partRef[1] < 0 ? 0 : partRef[1];
+        }
+    }
+
+    /// <summary>MV prediction for one direction of a B-slice partition. Mirrors
+    /// PredictMvForPartition but consults listX neighbor MVs.</summary>
+    internal static (int X, int Y) PredictMvForPartitionListB(
+        Macroblock cur, int rawMbType, int partIdx,
+        int bx, int by, int bwBlocks, int bhBlocks, int curRefIdx, int listX,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        var A = GetMvNeighborList(bx - 1, by, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
+        var B = GetMvNeighborList(bx, by - 1, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
+        int cBx = bx + bwBlocks, cBy = by - 1;
+        var C = GetMvNeighborList(cBx, cBy, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
+        if (!C.Avail)
+            C = GetMvNeighborList(bx - 1, by - 1, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
+
+        // Partition-specific overrides for 16x8 and 8x16 (spec §8.4.1.3.1).
+        // For B-slice mb_type 4..21, info.PartWidth==16 → 16x8 and PartWidth==8 → 8x16.
+        // Determine shape from rawMbType.
+        bool shape16x8 = false, shape8x16 = false;
+        if (rawMbType >= 1 && rawMbType <= 21)
+        {
+            var info = BMbType.Info(rawMbType);
+            if (info.NumMbPart == 2)
+            {
+                shape16x8 = info.PartWidth == 16;
+                shape8x16 = info.PartWidth == 8;
+            }
+        }
+        if (shape16x8)
+        {
+            if (partIdx == 0 && B.Avail && B.RefIdx == curRefIdx) return (B.MvX, B.MvY);
+            if (partIdx == 1 && A.Avail && A.RefIdx == curRefIdx) return (A.MvX, A.MvY);
+        }
+        else if (shape8x16)
+        {
+            if (partIdx == 0 && A.Avail && A.RefIdx == curRefIdx) return (A.MvX, A.MvY);
+            if (partIdx == 1 && C.Avail && C.RefIdx == curRefIdx) return (C.MvX, C.MvY);
+        }
+        if (!B.Avail && !C.Avail && A.Avail)
+            return (A.MvX, A.MvY);
+
+        int aX = A.Avail ? A.MvX : 0, aY = A.Avail ? A.MvY : 0, aR = A.Avail ? A.RefIdx : -1;
+        int bX = B.Avail ? B.MvX : 0, bY = B.Avail ? B.MvY : 0, bR = B.Avail ? B.RefIdx : -1;
+        int cX = C.Avail ? C.MvX : 0, cY = C.Avail ? C.MvY : 0, cR = C.Avail ? C.RefIdx : -1;
+
+        int matchCount = (aR == curRefIdx ? 1 : 0) + (bR == curRefIdx ? 1 : 0) + (cR == curRefIdx ? 1 : 0);
+        if (matchCount == 1)
+        {
+            if (aR == curRefIdx) return (aX, aY);
+            if (bR == curRefIdx) return (bX, bY);
+            return (cX, cY);
+        }
+        return (Median3(aX, bX, cX), Median3(aY, bY, cY));
+    }
+
+    internal static void FillBlockMvsL0(Macroblock mb, int bx0, int by0, int bw, int bh, int mvX, int mvY)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+            {
+                int idx = _spatialToRaster[by * 4 + bx];
+                mb.MvL0XBlock[idx] = mvX;
+                mb.MvL0YBlock[idx] = mvY;
+            }
+    }
+    internal static void FillBlockMvsL1(Macroblock mb, int bx0, int by0, int bw, int bh, int mvX, int mvY)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+            {
+                int idx = _spatialToRaster[by * 4 + bx];
+                mb.MvL1XBlock[idx] = mvX;
+                mb.MvL1YBlock[idx] = mvY;
+            }
+    }
+    internal static void FillBlockMvdsL0(Macroblock mb, int bx0, int by0, int bw, int bh, int mvdX, int mvdY)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+            {
+                int idx = _spatialToRaster[by * 4 + bx];
+                mb.MvdL0XBlock[idx] = mvdX;
+                mb.MvdL0YBlock[idx] = mvdY;
+            }
+    }
+    internal static void FillBlockMvdsL1(Macroblock mb, int bx0, int by0, int bw, int bh, int mvdX, int mvdY)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+            {
+                int idx = _spatialToRaster[by * 4 + bx];
+                mb.MvdL1XBlock[idx] = mvdX;
+                mb.MvdL1YBlock[idx] = mvdY;
+            }
+    }
+    internal static void SetPredFlag(byte[] arr, int bx0, int by0, int bw, int bh, byte v)
+    {
+        for (int by = by0; by < by0 + bh; by++)
+            for (int bx = bx0; bx < bx0 + bw; bx++)
+                arr[_spatialToRaster[by * 4 + bx]] = v;
     }
 }

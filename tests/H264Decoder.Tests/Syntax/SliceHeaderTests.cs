@@ -51,13 +51,16 @@ public sealed class SliceHeaderTests
     }
 
     [Fact]
-    public void BFrameStreamReachesNotSupportedOnBMbDecode()
+    public void BFrameStreamDecodesAllSkipBSlice()
     {
+        // Red-only B-frame fixture: every B-MB is B_Skip (matching reference).
+        // Stage 2: B_Skip + B_Direct spatial via direct mode now supported (CABAC mb_skip_flag
+        // handles routing; non-skip B-MBs would still throw via CabacSliceB stub).
         var sample = FfmpegFixture.ThreeFramesBFrames16x16();
         byte[] stream = File.ReadAllBytes(sample.H264Path);
 
         var decoder = new H264Decoder.H264FrameDecoder();
-        var ex = Assert.Throws<NotSupportedException>(() => decoder.DecodeAllFrames(stream));
-        Assert.Contains("B-slice", ex.Message);
+        var frames = decoder.DecodeAllFrames(stream);
+        Assert.Equal(3, frames.Count);
     }
 }

@@ -4,6 +4,13 @@ namespace H264Decoder.Syntax;
 /// (X, Y in 0..15 and width/height in 4..16). MV is in quarter-pixel units.</summary>
 public readonly record struct MvPartition(int X, int Y, int Width, int Height, int RefIdxL0, int MvL0X, int MvL0Y);
 
+/// <summary>One motion partition within a B-slice MB. PredDir indicates which lists are active.</summary>
+public readonly record struct BMvPartition(
+    int X, int Y, int Width, int Height,
+    BPredDir Dir,
+    int RefIdxL0, int MvL0X, int MvL0Y,
+    int RefIdxL1, int MvL1X, int MvL1Y);
+
 
 /// <summary>
 /// One parsed macroblock — fully decoded syntax + residual coefficients, but
@@ -112,6 +119,29 @@ public sealed class Macroblock
     /// <summary>Motion partitions for this MB (list of (x, y, w, h, refIdx, mvX, mvY)).
     /// One entry for P_L0_16x16, two for 16x8 / 8x16, up to sixteen for P_8x8 with 4x4 sub-blocks.</summary>
     public List<MvPartition> InterPartitions { get; set; } = new();
+
+    // ---- B-slice inter fields ----
+
+    /// <summary>True iff this MB is a B-slice inter MB (uses BInterPartitions instead of InterPartitions).</summary>
+    public bool IsBInter { get; set; }
+
+    /// <summary>True when this MB is a B_Skip (no syntax; MV derived via direct mode).</summary>
+    public bool IsBSkip { get; set; }
+
+    /// <summary>B-slice motion partitions with both L0 and L1 fields.</summary>
+    public List<BMvPartition> BInterPartitions { get; set; } = new();
+
+    /// <summary>Per-4x4 L1 MV X (quarter-pel) and refIdx-per-quadrant (parallel to L0 arrays).</summary>
+    public int[] MvL1XBlock { get; } = new int[16];
+    public int[] MvL1YBlock { get; } = new int[16];
+    public int[] MvdL1XBlock { get; } = new int[16];
+    public int[] MvdL1YBlock { get; } = new int[16];
+    public int[] RefIdxL18x8 { get; } = new int[4];
+
+    /// <summary>Per-4x4 predFlagL0/L1 (1 if direction active, else 0). For neighbor MV-prediction
+    /// context selection. For P-slice MBs predFlagL0Block[i] = 1 and predFlagL1Block[i] = 0.</summary>
+    public byte[] PredFlagL0Block { get; } = new byte[16];
+    public byte[] PredFlagL1Block { get; } = new byte[16];
 
     /// <summary>Diagnostic: bit position in the slice RBSP where this MB's parsing started/ended.</summary>
     public int ParseStartBit { get; set; }

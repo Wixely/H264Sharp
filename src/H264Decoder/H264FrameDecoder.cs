@@ -153,8 +153,6 @@ public sealed class H264FrameDecoder
         {
             refPicListL0 = new List<DecodedPicture>();
         }
-        _ = refPicListL1; // stage 1: parsed but not yet consumed by MB decoder.
-
         int width = (int)sps.CroppedWidth;
         int height = (int)sps.CroppedHeight;
         var picture = new DecodedPicture(width, height)
@@ -162,14 +160,6 @@ public sealed class H264FrameDecoder
             FrameNum = (int)header.FrameNum,
             PicOrderCnt = picOrderCnt,
         };
-
-        // Stage 1: B-slice header parsing + POC + L0/L1 lists are wired through but
-        // per-MB B decoding (mb_type, bipred MC, B_Direct, B_Skip) is not implemented.
-        if (isBSlice)
-        {
-            throw new NotSupportedException(
-                "B-slice macroblock decoding not yet implemented (header + POC + ref lists parsed)");
-        }
 
         var reader = new BitReader(nal.Rbsp.Span);
         SkipSliceHeader(ref reader, nal, sps, pps);
@@ -184,9 +174,9 @@ public sealed class H264FrameDecoder
         // ---- Branch on entropy coding mode ----
         if (pps.EntropyCodingModeFlag)
         {
-            DecodeSliceCabac(nal, sps, pps, header, ref reader, mbs, picture, refPicListL0,
+            DecodeSliceCabac(nal, sps, pps, header, ref reader, mbs, picture, refPicListL0, refPicListL1,
                 mbsPerRow, totalMbs, ref qpY, addr);
-            if (header.DisableDeblockingFilterIdc != 1 && !isPSlice)
+            if (header.DisableDeblockingFilterIdc != 1 && !isPSlice && !isBSlice)
             {
                 bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
                 DeblockingFilter.Apply(picture, mbs, mbsPerRow,
@@ -200,7 +190,7 @@ public sealed class H264FrameDecoder
         }
 
         int mbSkipRun = 0;
-        if (isPSlice)
+        if (isPSlice || isBSlice)
         {
             mbSkipRun = (int)ExpGolomb.ReadUe(ref reader);
         }
@@ -233,24 +223,35 @@ public sealed class H264FrameDecoder
                 continue;
             }
 
+            if (isBSlice && mbSkipRun > 0)
+            {
+                Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
+                mbs[addr] = skipMb;
+                MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
+                mbSkipRun--;
+                addr++;
+                continue;
+            }
+
             Macroblock mb = MacroblockParser.Parse(
                 ref reader, sps, pps, header,
                 leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY);
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
 
             addr++;
 
             // In CAVLC P-slices, after each non-skipped MB we read another mb_skip_run.
-            if (isPSlice && addr < totalMbs)
+            if ((isPSlice || isBSlice) && addr < totalMbs)
             {
                 mbSkipRun = (int)ExpGolomb.ReadUe(ref reader);
             }
         }
 
-        if (header.DisableDeblockingFilterIdc != 1 && !isPSlice)
+        if (header.DisableDeblockingFilterIdc != 1 && !isPSlice && !isBSlice)
         {
             // For pure-skip P-slices the reference is already deblocked; the spec
             // would still apply deblocking, but the per-MB filter strengths are
@@ -286,13 +287,32 @@ public sealed class H264FrameDecoder
         return mb;
     }
 
+    /// <summary>Placeholder Macroblock for a B_Skip — uses B_Direct_16x16 spatial direct derivation
+    /// to fill MVs; no residual.</summary>
+    private static Macroblock BSkipPlaceholder(int addr, SliceHeader header,
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+    {
+        var mb = new Macroblock
+        {
+            MbAddress = addr,
+            Type = new IntraMbType(0, MbPartPredMode.PredL0, default, 0, 0),
+            IsSkipped = true,
+            IsBSkip = true,
+            IsBInter = true,
+        };
+        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb);
+        return mb;
+    }
+
     /// <summary>CABAC slice_data() loop (spec §7.3.4). Currently handles all-P_Skip P-slices.</summary>
     private static void DecodeSliceCabac(
         NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps, SliceHeader header,
         ref BitReader reader, Macroblock[] mbs, DecodedPicture picture,
-        List<DecodedPicture> refPicListL0, int mbsPerRow, int totalMbs, ref int qpY, int addr)
+        List<DecodedPicture> refPicListL0, List<DecodedPicture> refPicListL1,
+        int mbsPerRow, int totalMbs, ref int qpY, int addr)
     {
         bool isPSlice = header.SliceType == SliceType.P;
+        bool isBSlice = header.SliceType == SliceType.B;
 
         // CABAC alignment: consume one-bits up to byte boundary (spec §7.3.4 — cabac_alignment_one_bit).
         while ((reader.BitPosition & 7) != 0) reader.ReadBit();
@@ -325,24 +345,34 @@ public sealed class H264FrameDecoder
             Macroblock? topLeftMb = (mbY > 0 && mbX > 0) ? mbs[addr - mbsPerRow - 1] : null;
 
             int mbSkipFlag = 0;
-            if (isPSlice)
+            if (isPSlice || isBSlice)
             {
-                // ctxIdxInc for mb_skip_flag (spec table 9-39): condTermFlagX = 0 if neighbor
-                // is unavailable OR has mb_skip_flag == 1; otherwise 1.
+                // ctxIdxInc for mb_skip_flag (spec table 9-39).
                 int condA = (leftMb != null && !leftMb.IsSkipped) ? 1 : 0;
                 int condB = (topMb != null && !topMb.IsSkipped) ? 1 : 0;
-                mbSkipFlag = cabac.DecodeBin(11 + condA + condB);
+                int ctxBase = isBSlice ? 24 : 11;
+                mbSkipFlag = cabac.DecodeBin(ctxBase + condA + condB);
             }
 
             if (mbSkipFlag == 1)
             {
-                (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
-                Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
-                mbs[addr] = skipMb;
-                MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+                if (isBSlice)
+                {
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
+                    mbs[addr] = skipMb;
+                    MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
+                }
+                else
+                {
+                    (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
+                    Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
+                    mbs[addr] = skipMb;
+                    MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+                }
             }
-            else if (!isPSlice)
+            else if (!isPSlice && !isBSlice)
             {
                 // I-slice macroblock (no mb_skip_flag exists for I-slices).
                 Macroblock mb = CabacSliceI.ParseMb(cabac, leftMb, topMb, addr,
@@ -350,6 +380,16 @@ public sealed class H264FrameDecoder
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                     pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+            }
+            else if (isBSlice)
+            {
+                // B-slice non-skip MB.
+                Macroblock mb = CabacSliceB.ParseMb(cabac, header,
+                    leftMb, topMb, topRightMb, topLeftMb, addr,
+                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag);
+                mbs[addr] = mb;
+                MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
             }
             else
             {
