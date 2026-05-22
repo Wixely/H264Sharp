@@ -555,34 +555,74 @@ internal static class MacroblockReconstructor
                     predBlock[(part.Y + yy) * 16 + (part.X + xx)] = partOut[yy * part.Width + xx];
         }
 
-        // Now add residual per 4x4 block (CBP-gated, full 16-coeff blocks).
-        Span<int> coeffsScan = stackalloc int[16];
-        Span<int> coeffsRaster = stackalloc int[16];
-
-        for (int i = 0; i < 16; i++)
+        // Residual: 8x8 transform path when transform_size_8x8_flag is set, else 16 4x4 blocks.
+        if (mb.TransformSize8x8)
         {
-            (int bx, int by) = MacroblockParser.LumaBlockPos[i];
-            int px0 = mbX * 16 + bx * 4;
-            int py0 = mbY * 16 + by * 4;
+            ApplyLumaInter8x8Residual(mb, picture, mbX, mbY, predBlock);
+        }
+        else
+        {
+            Span<int> coeffsScan = stackalloc int[16];
+            Span<int> coeffsRaster = stackalloc int[16];
 
-            bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+            for (int i = 0; i < 16; i++)
+            {
+                (int bx, int by) = MacroblockParser.LumaBlockPos[i];
+                int px0 = mbX * 16 + bx * 4;
+                int py0 = mbY * 16 + by * 4;
+
+                bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+                if (coded)
+                {
+                    for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
+                    ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                    Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
+                    InverseTransform.Inverse4x4(coeffsRaster);
+                }
+                else
+                {
+                    coeffsRaster.Clear();
+                }
+
+                for (int yy = 0; yy < 4; yy++)
+                    for (int xx = 0; xx < 4; xx++)
+                    {
+                        int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
+                        int v = pred + coeffsRaster[yy * 4 + xx];
+                        picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    }
+            }
+        }
+    }
+
+    /// <summary>Add inter 8x8 residual onto a 16x16 MC prediction buffer and write to the picture.</summary>
+    private static void ApplyLumaInter8x8Residual(
+        Macroblock mb, DecodedPicture picture, int mbX, int mbY, Span<byte> predBlock)
+    {
+        Span<int> coeffsScan = stackalloc int[64];
+        Span<int> coeffsRaster = stackalloc int[64];
+        for (int i8 = 0; i8 < 4; i8++)
+        {
+            int bx = i8 & 1, by = (i8 >> 1) & 1;
+            int px0 = mbX * 16 + bx * 8;
+            int py0 = mbY * 16 + by * 8;
+            bool coded = (mb.CbpLuma & (1 << i8)) != 0;
             if (coded)
             {
-                for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
-                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
-                Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
-                InverseTransform.Inverse4x4(coeffsRaster);
+                for (int k = 0; k < 64; k++) coeffsScan[k] = mb.Luma8x8[i8, k];
+                ScanOrder.Unzigzag8x8(coeffsScan, coeffsRaster);
+                Quantization.Dequant8x8(coeffsRaster, mb.QpY);
+                InverseTransform.Inverse8x8(coeffsRaster);
             }
             else
             {
                 coeffsRaster.Clear();
             }
-
-            for (int yy = 0; yy < 4; yy++)
-                for (int xx = 0; xx < 4; xx++)
+            for (int yy = 0; yy < 8; yy++)
+                for (int xx = 0; xx < 8; xx++)
                 {
-                    int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
-                    int v = pred + coeffsRaster[yy * 4 + xx];
+                    int pred = predBlock[(by * 8 + yy) * 16 + (bx * 8 + xx)];
+                    int v = pred + coeffsRaster[yy * 8 + xx];
                     picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
                 }
         }
@@ -910,34 +950,41 @@ internal static class MacroblockReconstructor
                     predBlock[(part.Y + yy) * 16 + (part.X + xx)] = outBuf[yy * part.Width + xx];
         }
 
-        // Add residual per 4x4 block (CBP-gated).
-        Span<int> coeffsScan = stackalloc int[16];
-        Span<int> coeffsRaster = stackalloc int[16];
-        for (int i = 0; i < 16; i++)
+        if (mb.TransformSize8x8)
         {
-            (int bx, int by) = MacroblockParser.LumaBlockPos[i];
-            int px0 = mbX * 16 + bx * 4;
-            int py0 = mbY * 16 + by * 4;
+            ApplyLumaInter8x8Residual(mb, picture, mbX, mbY, predBlock);
+        }
+        else
+        {
+            // Add residual per 4x4 block (CBP-gated).
+            Span<int> coeffsScan = stackalloc int[16];
+            Span<int> coeffsRaster = stackalloc int[16];
+            for (int i = 0; i < 16; i++)
+            {
+                (int bx, int by) = MacroblockParser.LumaBlockPos[i];
+                int px0 = mbX * 16 + bx * 4;
+                int py0 = mbY * 16 + by * 4;
 
-            bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
-            if (coded)
-            {
-                for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
-                ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
-                Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
-                InverseTransform.Inverse4x4(coeffsRaster);
-            }
-            else
-            {
-                coeffsRaster.Clear();
-            }
-            for (int yy = 0; yy < 4; yy++)
-                for (int xx = 0; xx < 4; xx++)
+                bool coded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+                if (coded)
                 {
-                    int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
-                    int v = pred + coeffsRaster[yy * 4 + xx];
-                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    for (int k = 0; k < 16; k++) coeffsScan[k] = mb.Luma[i, k];
+                    ScanOrder.Unzigzag4x4(coeffsScan, coeffsRaster);
+                    Quantization.Dequant4x4Ac(coeffsRaster, mb.QpY);
+                    InverseTransform.Inverse4x4(coeffsRaster);
                 }
+                else
+                {
+                    coeffsRaster.Clear();
+                }
+                for (int yy = 0; yy < 4; yy++)
+                    for (int xx = 0; xx < 4; xx++)
+                    {
+                        int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
+                        int v = pred + coeffsRaster[yy * 4 + xx];
+                        picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    }
+            }
         }
     }
 

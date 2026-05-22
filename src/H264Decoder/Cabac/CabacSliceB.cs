@@ -55,20 +55,18 @@ internal static class CabacSliceB
         mb.CbpLuma = cbpLuma;
         mb.CbpChroma = cbpChroma;
 
-        // transform_size_8x8_flag: not yet supported here (matches P-slice limitation).
+        // transform_size_8x8_flag for B-inter (spec §7.3.5.1).
+        // Eligible when not B_Direct_16x16 (mbTypeCode 0) and (not B_8x8 OR all sub-mbs are 8x8).
         if (transform8x8ModeFlag && cbpLuma > 0)
         {
-            bool eligible = mbTypeCode == 0 || (mbTypeCode == 22 && AllSubMbsAre8x8(mb));
+            bool eligible = (mbTypeCode >= 1 && mbTypeCode <= 21)
+                            || (mbTypeCode == 22 && AllSubMbsAre8x8(mb));
             if (eligible)
             {
                 int ctxA = (leftMb != null && leftMb.TransformSize8x8) ? 1 : 0;
                 int ctxB = (topMb != null && topMb.TransformSize8x8) ? 1 : 0;
                 int flag = cabac.DecodeBin(399 + ctxA + ctxB);
                 mb.TransformSize8x8 = flag == 1;
-                if (mb.TransformSize8x8)
-                {
-                    throw new NotSupportedException("CABAC transform_size_8x8_flag=1 (B-inter) not yet supported");
-                }
             }
         }
 

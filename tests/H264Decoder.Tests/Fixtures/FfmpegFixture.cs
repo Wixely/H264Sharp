@@ -385,6 +385,34 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 128x96 testsrc shifted, High profile, CAVLC, 8x8dct=1.
+    /// Forces x264 to emit P-inter MBs with transform_size_8x8_flag=1 alongside
+    /// 4x4 transform inter MBs. Exercises CAVLC inter 8x8 residual decode + reconstruction.</summary>
+    public static Sample TwoFramesShifted128x96HighCavlc8x8Inter()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_shifted_128x96_high_cavlc_8x8inter.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_shifted_128x96_high_cavlc_8x8inter.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:d=0.5:r=2[a];testsrc=size={W}x{H}:d=0.5:r=2,crop=120:96:8:0,pad={W}:{H}:0:0[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            $"-pix_fmt yuv420p -c:v libx264 -profile:v high -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 0 -an -qp 18 -x264-params \"no-deblock=1:8x8dct=1:partitions=p8x8\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
+    /// <summary>Mirror of TwoFramesShifted128x96HighCavlc8x8Inter with CABAC (-coder 1).</summary>
+    public static Sample TwoFramesShifted128x96HighCabac8x8Inter()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_shifted_128x96_high_cabac_8x8inter.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_shifted_128x96_high_cabac_8x8inter.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:d=0.5:r=2[a];testsrc=size={W}x{H}:d=0.5:r=2,crop=120:96:8:0,pad={W}:{H}:0:0[b];[a][b]concat=n=2:v=1:a=0,format=yuv420p\" " +
+            $"-pix_fmt yuv420p -c:v libx264 -profile:v high -bf 0 -keyint_min 100 -g 100 -sc_threshold 0 -coder 1 -an -qp 18 -x264-params \"no-deblock=1:8x8dct=1:partitions=p8x8\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     private static void EnsureGenerated(string h264, string yuv, string h264Args, string yuvArgs)
     {
         lock (_lock)

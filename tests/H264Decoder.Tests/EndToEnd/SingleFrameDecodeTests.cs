@@ -527,4 +527,62 @@ public sealed class SingleFrameDecodeTests
         Assert.True(maxU <= 2, $"u max abs error = {maxU}");
         Assert.True(maxV <= 2, $"v max abs error = {maxV}");
     }
+
+    [Fact]
+    public void DecodeCavlcTwoFramesShiftedHigh8x8Inter_PInterTransform8x8()
+    {
+        // High profile + 8x8dct=1 + partitions=p8x8 + CAVLC: P-inter MBs may carry
+        // transform_size_8x8_flag=1 and emit 4x 8x8 luma residual blocks (ctxBlockCat=5
+        // in CABAC, 4 interleaved CAVLC 4x4 sub-blocks here).
+        var sample = FfmpegFixture.TwoFramesShifted128x96HighCavlc8x8Inter();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 2, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 2, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 2, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact]
+    public void DecodeCabacTwoFramesShiftedHigh8x8Inter_PInterTransform8x8()
+    {
+        // Mirror of CAVLC variant with CABAC; uses CabacResidual.ReadResidualBlock8x8.
+        var sample = FfmpegFixture.TwoFramesShifted128x96HighCabac8x8Inter();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 2, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 2, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 2, $"frame {f} V max err = {maxV}");
+        }
+    }
 }

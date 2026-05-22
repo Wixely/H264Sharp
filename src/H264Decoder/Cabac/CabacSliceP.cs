@@ -69,10 +69,6 @@ internal static class CabacSliceP
                 int ctxB = (topMb != null && topMb.TransformSize8x8) ? 1 : 0;
                 int flag = cabac.DecodeBin(399 + ctxA + ctxB);
                 mb.TransformSize8x8 = flag == 1;
-                if (mb.TransformSize8x8)
-                {
-                    throw new NotSupportedException("CABAC transform_size_8x8_flag=1 (inter) not yet supported");
-                }
             }
         }
 
@@ -580,24 +576,55 @@ internal static class CabacSliceP
     {
         Span<int> coeffs = stackalloc int[16];
 
-        // ---- Luma 4x4 blocks (CbpLuma bit per 8x8 sub-block) ----
-        for (int i = 0; i < 16; i++)
+        if (mb.TransformSize8x8)
         {
-            bool blockCoded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
-            if (!blockCoded)
+            // 4 luma 8x8 blocks. CBP-luma bit i8 gates 8x8 block i8 directly (no CBF read).
+            // Per spec: the 8x8 block's CBP bit propagates to the contained 4 4x4 blocks'
+            // LumaAcCbf (for downstream deblocking/neighbor derivation).
+            Span<int> coeffs8 = stackalloc int[64];
+            for (int i8 = 0; i8 < 4; i8++)
             {
-                mb.LumaAcCbf[i] = false;
-                continue;
+                bool coded = (mb.CbpLuma & (1 << i8)) != 0;
+                int bx0 = (i8 & 1) * 2, by0 = (i8 >> 1) * 2;
+                for (int sy = 0; sy < 2; sy++)
+                    for (int sx = 0; sx < 2; sx++)
+                    {
+                        int idx = MacroblockParser.SpatialToRaster(bx0 + sx, by0 + sy);
+                        mb.LumaAcCbf[idx] = coded;
+                        if (coded) mb.NonZeroCountLuma[idx] = 1;
+                    }
+                if (!coded) continue;
+                CabacResidual.ReadResidualBlock8x8(cabac, coeffs8);
+                int total = 0;
+                for (int j = 0; j < 64; j++)
+                {
+                    mb.Luma8x8[i8, j] = coeffs8[j];
+                    if (coeffs8[j] != 0) total++;
+                }
+                mb.NonZeroCountLuma8x8[i8] = total;
             }
-            (int cA, int cB) = LumaAcNeighborCbfInter(i, mb, leftMb, topMb);
-            bool acCbf = CabacResidual.ReadResidualBlock(
-                cabac, coeffs, maxNumCoeff: 16, ctxBlockCat: CabacResidual.CatLuma4x4,
-                condTermFlagA: cA, condTermFlagB: cB);
-            mb.LumaAcCbf[i] = acCbf;
-            if (acCbf)
+        }
+        else
+        {
+            // ---- Luma 4x4 blocks (CbpLuma bit per 8x8 sub-block) ----
+            for (int i = 0; i < 16; i++)
             {
-                mb.NonZeroCountLuma[i] = 1;
-                for (int j = 0; j < 16; j++) mb.Luma[i, j] = coeffs[j];
+                bool blockCoded = (mb.CbpLuma & (1 << (i >> 2))) != 0;
+                if (!blockCoded)
+                {
+                    mb.LumaAcCbf[i] = false;
+                    continue;
+                }
+                (int cA, int cB) = LumaAcNeighborCbfInter(i, mb, leftMb, topMb);
+                bool acCbf = CabacResidual.ReadResidualBlock(
+                    cabac, coeffs, maxNumCoeff: 16, ctxBlockCat: CabacResidual.CatLuma4x4,
+                    condTermFlagA: cA, condTermFlagB: cB);
+                mb.LumaAcCbf[i] = acCbf;
+                if (acCbf)
+                {
+                    mb.NonZeroCountLuma[i] = 1;
+                    for (int j = 0; j < 16; j++) mb.Luma[i, j] = coeffs[j];
+                }
             }
         }
 

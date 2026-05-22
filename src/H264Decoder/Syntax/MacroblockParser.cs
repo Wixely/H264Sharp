@@ -56,7 +56,7 @@ public static class MacroblockParser
             if (BMbType.IsInter(mbTypeCode))
             {
                 return ParseBInterMb(ref reader, mb_initType: (int)mbTypeCode,
-                    sliceHeader, leftMb, topMb, topRightMb, topLeftMb, mbAddress, ref qpYRunning, startBit,
+                    pps, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, mbAddress, ref qpYRunning, startBit,
                     colocatedMb);
             }
             // Intra branch: mb_type - 23 is the I-slice code.
@@ -184,10 +184,6 @@ public static class MacroblockParser
             {
                 bool flag = reader.ReadBit() == 1;
                 mb.TransformSize8x8 = flag;
-                if (flag)
-                {
-                    throw new NotSupportedException("transform_size_8x8_flag=1 (inter) not yet supported");
-                }
             }
         }
 
@@ -218,6 +214,22 @@ public static class MacroblockParser
             if (p.Width != 8 || p.Height != 8) return false;
         }
         return true;
+    }
+
+    private static bool BInterEligibleFor8x8Transform(int mb_initType, Macroblock mb)
+    {
+        // B_Direct_16x16 (mb_initType==0): not eligible (no partitions / sub-mb syntax).
+        if (mb_initType == 0) return false;
+        // B_8x8 (mb_initType==22): eligible only if all sub-mb sizes are 8x8.
+        if (mb_initType == 22)
+        {
+            if (mb.BInterPartitions.Count != 4) return false;
+            foreach (var p in mb.BInterPartitions)
+                if (p.Width != 8 || p.Height != 8) return false;
+            return true;
+        }
+        // mb_type 1..21: 16x16 / 16x8 / 8x16 — eligible (noSubMbPartSizeLessThan8x8 trivially true).
+        return mb_initType >= 1 && mb_initType <= 21;
     }
 
     private static int Mod52(int v)
@@ -795,7 +807,7 @@ public static class MacroblockParser
     // ============================================================
 
     internal static Macroblock ParseBInterMb(
-        ref BitReader reader, int mb_initType, SliceHeader sliceHeader,
+        ref BitReader reader, int mb_initType, PictureParameterSet pps, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         int mbAddress, ref int qpYRunning, int startBit,
         Macroblock? colocatedMb = null)
@@ -817,6 +829,19 @@ public static class MacroblockParser
         int cbp = CodedBlockPattern.FromCodeNum(cbpCode, intra: false);
         mb.CbpLuma = CodedBlockPattern.LumaPart(cbp);
         mb.CbpChroma = CodedBlockPattern.ChromaPart(cbp);
+
+        // transform_size_8x8_flag for B-inter (spec §7.3.5.1) — same rules as P-inter.
+        // Eligible when not B_Direct_16x16 (rawMb==0), not B_8x8 with sub-8x8 partitions,
+        // and CbpLuma>0. For simplicity we check info eligibility via mb_initType / partitions.
+        if (pps.Transform8x8ModeFlag && mb.CbpLuma > 0)
+        {
+            bool eligible = BInterEligibleFor8x8Transform(mb_initType, mb);
+            if (eligible)
+            {
+                bool flag = reader.ReadBit() == 1;
+                mb.TransformSize8x8 = flag;
+            }
+        }
 
         // mb_qp_delta + residual (only if any CBP bit set).
         if (mb.CbpLuma != 0 || mb.CbpChroma != 0)
