@@ -354,6 +354,37 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Same as ThreeFramesBFrames64x48Cavlc but with deblocking ENABLED — exercises
+    /// the deblocking filter for P and B slices end-to-end (luma byte-exact check).</summary>
+    public static Sample ThreeFramesBFrames64x48CavlcDeblock()
+    {
+        const int W = 64, H = 48;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_bframes_64x48_cavlc_deblock.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_bframes_64x48_cavlc_deblock.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:r=2:d=1.5,format=yuv420p\" -frames:v 3 " +
+            "-c:v libx264 -profile:v main -bf 1 -keyint_min 99 -g 99 -coder 0 -an " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 3 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
+    /// <summary>Same as ThreeFramesBFrames32x16Cabac but with deblocking ENABLED — exercises
+    /// the deblocking filter for CABAC P + B slices.</summary>
+    public static Sample ThreeFramesBFrames32x16CabacDeblock()
+    {
+        const int W = 32, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_bframes_32x16_cabac_deblock.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_bframes_32x16_cabac_deblock.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i color=c=red:s={W}x{H}:d=1.5:r=2,format=yuv420p -frames:v 3 " +
+            "-c:v libx264 -profile:v main -bf 1 -keyint_min 99 -g 99 -coder 1 -an " +
+            "-x264-params \"8x8dct=0\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 3 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     private static void EnsureGenerated(string h264, string yuv, string h264Args, string yuvArgs)
     {
         lock (_lock)

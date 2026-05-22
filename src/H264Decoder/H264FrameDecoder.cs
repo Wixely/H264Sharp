@@ -178,7 +178,7 @@ public sealed class H264FrameDecoder
         {
             DecodeSliceCabac(nal, sps, pps, header, ref reader, mbs, picture, refPicListL0, refPicListL1,
                 mbsPerRow, totalMbs, ref qpY, addr, implicitBipred);
-            if (header.DisableDeblockingFilterIdc != 1 && !isPSlice && !isBSlice)
+            if (header.DisableDeblockingFilterIdc != 1)
             {
                 bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
                 DeblockingFilter.Apply(picture, mbs, mbsPerRow,
@@ -258,12 +258,8 @@ public sealed class H264FrameDecoder
             }
         }
 
-        if (header.DisableDeblockingFilterIdc != 1 && !isPSlice && !isBSlice)
+        if (header.DisableDeblockingFilterIdc != 1)
         {
-            // For pure-skip P-slices the reference is already deblocked; the spec
-            // would still apply deblocking, but the per-MB filter strengths are
-            // all zero (no coded coefs, MVs match, refs match), so it's a no-op
-            // for our minimal case.
             bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
             DeblockingFilter.Apply(picture, mbs, mbsPerRow,
                 pps.ChromaQpIndexOffset,

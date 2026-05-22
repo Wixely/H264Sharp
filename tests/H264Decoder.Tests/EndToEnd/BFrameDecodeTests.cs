@@ -132,4 +132,65 @@ public sealed class BFrameDecodeTests
 
         Assert.True(worstMaxY <= 2, $"luma max abs error across CABAC B-frames = {worstMaxY}");
     }
+
+    [Fact]
+    public void DecodeThreeFramesBFrames64x48CavlcDeblock_ByteExact()
+    {
+        // Same as the CAVLC B-frame test but with the deblocking filter ENABLED in the
+        // bitstream — exercises bS derivation for inter MBs (P and B).
+        var sample = FfmpegFixture.ThreeFramesBFrames64x48CavlcDeblock();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+
+        var decoder = new H264Decoder.H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameBytes = yLen + 2 * cLen;
+
+        Assert.Equal(3, frames.Count);
+
+        int worstMaxY = 0;
+        for (int f = 0; f < 3; f++)
+        {
+            var pic = frames[f];
+            int offset = f * frameBytes;
+            int maxY = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[offset + i]));
+            worstMaxY = Math.Max(worstMaxY, maxY);
+        }
+
+        Assert.True(worstMaxY <= 2, $"luma max abs error across deblock-on B-frames = {worstMaxY}");
+    }
+
+    [Fact]
+    public void DecodeThreeFramesBFrames32x16CabacDeblock_ByteExact()
+    {
+        // Same as the CABAC B-frame test but with the deblocking filter ENABLED.
+        var sample = FfmpegFixture.ThreeFramesBFrames32x16CabacDeblock();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+
+        var decoder = new H264Decoder.H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameBytes = yLen + 2 * cLen;
+
+        Assert.Equal(3, frames.Count);
+
+        int worstMaxY = 0;
+        for (int f = 0; f < 3; f++)
+        {
+            var pic = frames[f];
+            int offset = f * frameBytes;
+            int maxY = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[offset + i]));
+            worstMaxY = Math.Max(worstMaxY, maxY);
+        }
+
+        Assert.True(worstMaxY <= 2, $"luma max abs error across CABAC deblock-on B-frames = {worstMaxY}");
+    }
 }
