@@ -143,6 +143,12 @@ public sealed class Macroblock
     public byte[] PredFlagL0Block { get; } = new byte[16];
     public byte[] PredFlagL1Block { get; } = new byte[16];
 
+    /// <summary>Per-4x4 direct-flag: 1 if this 4x4 block belongs to a B_Skip MB, a
+    /// B_Direct_16x16 MB, or a B_Direct_8x8 sub-MB; 0 otherwise. Used by §9.3.3.1.1.6
+    /// ref_idx_lX neighbor context derivation (refIdxZeroFlagN gate) — direct/skip
+    /// neighbors must contribute condTermFlag=0 regardless of derived refIdx.</summary>
+    public byte[] IsDirectBlock { get; } = new byte[16];
+
     /// <summary>Diagnostic: bit position in the slice RBSP where this MB's parsing started/ended.</summary>
     public int ParseStartBit { get; set; }
     public int ParseEndBit { get; set; }

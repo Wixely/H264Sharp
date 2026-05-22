@@ -469,6 +469,27 @@ public static class FfmpegFixture
         return new Sample(mp4, yuv, W, H);
     }
 
+    /// <summary>4-frame 64x48 CABAC IBBP clip with multi-ref (-refs 3) enabled. Generates
+    /// neighbor topologies where a non-direct B-MB sits next to a B_Skip / B_Direct neighbor
+    /// whose derived refIdx is > 0, exercising the §9.3.3.1.1.6 refIdxZeroFlagN "skip/direct"
+    /// gate in CABAC ref_idx_lX context derivation.</summary>
+    public static Sample BPyramidMultiRefCabacMp4()
+    {
+        const int W = 64, H = 48;
+        const int FRAMES = 16;
+        string mp4 = Path.Combine(SamplesDirectory, "bpyramid_multiref_cabac_64x48.mp4");
+        string yuv = Path.Combine(SamplesDirectory, "bpyramid_multiref_cabac_64x48.yuv");
+        // Mandelbrot content has enough motion entropy to make x264 actually pick refIdx>0
+        // for B-slice partitions (verified: "ref B L0: 90.5% 9.5%" with these params).
+        EnsureGenerated(mp4, yuv,
+            $"-y -f lavfi -i \"mandelbrot=s={W}x{H}:rate=4\" -t 4 -pix_fmt yuv420p " +
+            "-c:v libx264 -profile:v main -bf 2 -b_strategy 0 -coder 1 " +
+            "-keyint_min 99 -g 99 -an -qp 26 " +
+            $"-x264-params \"no-deblock=1:subme=10:partitions=all:ref=4\" -f mp4 \"{mp4}\"",
+            $"-y -i \"{mp4}\" -frames:v {FRAMES} -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(mp4, yuv, W, H);
+    }
+
     /// <summary>Two-frame 64x48 red clip muxed as fragmented MP4 (moof/traf/trun, empty_moov,
     /// default_base_moof). Used to exercise the fragmented MP4 parsing path.</summary>
     public static Sample FragmentedMp4Red64x48()

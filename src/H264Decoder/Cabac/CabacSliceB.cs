@@ -635,8 +635,12 @@ internal static class CabacSliceB
         int bx = rect.X / 4, by = rect.Y / 4;
         var A = MacroblockParser.GetMvNeighborListPublic(bx - 1, by, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
         var B = MacroblockParser.GetMvNeighborListPublic(bx, by - 1, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
-        int condA = (A.Avail && A.RefIdx > 0) ? 1 : 0;
-        int condB = (B.Avail && B.RefIdx > 0) ? 1 : 0;
+        // §9.3.3.1.1.6: refIdxZeroFlagN=1 if mbN is B_Skip or has direct prediction mode
+        // (B_Direct_16x16, B_Direct_8x8) — those have no signaled refIdx, so condTerm=0.
+        // §9.3.3.1.1.6: refIdxZeroFlagN=1 if mbN is B_Skip or has direct prediction mode
+        // (B_Direct_16x16, B_Direct_8x8) — those have no signaled refIdx, so condTerm=0.
+        int condA = (A.Avail && !A.IsDirect && A.RefIdx > 0) ? 1 : 0;
+        int condB = (B.Avail && !B.IsDirect && B.RefIdx > 0) ? 1 : 0;
         return DecodeRefIdx(cabac, condA, condB);
     }
 
@@ -649,8 +653,12 @@ internal static class CabacSliceB
         int bx = (q & 1) * 2, by = (q >> 1) * 2;
         var A = MacroblockParser.GetMvNeighborListPublic(bx - 1, by, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
         var B = MacroblockParser.GetMvNeighborListPublic(bx, by - 1, cur, leftMb, topMb, topRightMb, topLeftMb, listX);
-        int condA = (A.Avail && A.RefIdx > 0) ? 1 : 0;
-        int condB = (B.Avail && B.RefIdx > 0) ? 1 : 0;
+        // §9.3.3.1.1.6: refIdxZeroFlagN=1 if mbN is B_Skip or has direct prediction mode
+        // (B_Direct_16x16, B_Direct_8x8) — those have no signaled refIdx, so condTerm=0.
+        // §9.3.3.1.1.6: refIdxZeroFlagN=1 if mbN is B_Skip or has direct prediction mode
+        // (B_Direct_16x16, B_Direct_8x8) — those have no signaled refIdx, so condTerm=0.
+        int condA = (A.Avail && !A.IsDirect && A.RefIdx > 0) ? 1 : 0;
+        int condB = (B.Avail && !B.IsDirect && B.RefIdx > 0) ? 1 : 0;
         return DecodeRefIdx(cabac, condA, condB);
     }
 

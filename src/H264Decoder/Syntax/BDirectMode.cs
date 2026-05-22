@@ -29,6 +29,8 @@ internal static class BDirectMode
         Macroblock? colocatedMb = null,
         TemporalDirectContext? tdCtx = null)
     {
+        // Mark every 4x4 block as direct (B_Skip / B_Direct_16x16) for neighbor context use.
+        for (int i = 0; i < 16; i++) mb.IsDirectBlock[i] = 1;
         if (sliceHeader.DirectSpatialMvPredFlag)
         {
             DeriveSpatialDirect(mb, 0, 0, 4, 4, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
@@ -47,6 +49,10 @@ internal static class BDirectMode
         TemporalDirectContext? tdCtx = null)
     {
         int qx = (quadrant & 1) * 2, qy = (quadrant >> 1) * 2;
+        // Mark the four 4x4 blocks in this quadrant as direct (B_Direct_8x8 sub-MB).
+        for (int yy = qy; yy < qy + 2; yy++)
+            for (int xx = qx; xx < qx + 2; xx++)
+                mb.IsDirectBlock[MacroblockParser.SpatialToRaster(xx, yy)] = 1;
         if (sliceHeader.DirectSpatialMvPredFlag)
         {
             DeriveSpatialDirect(mb, qx, qy, 2, 2, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);

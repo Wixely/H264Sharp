@@ -743,7 +743,10 @@ public static class MacroblockParser
     {
         public readonly bool Avail;
         public readonly int MvX, MvY, RefIdx;
-        public MvNeighbor(bool a, int x, int y, int r) { Avail = a; MvX = x; MvY = y; RefIdx = r; }
+        // True if the neighbor 4x4 block belongs to a B_Skip / B_Direct_16x16 / B_Direct_8x8.
+        public readonly bool IsDirect;
+        public MvNeighbor(bool a, int x, int y, int r) { Avail = a; MvX = x; MvY = y; RefIdx = r; IsDirect = false; }
+        public MvNeighbor(bool a, int x, int y, int r, bool d) { Avail = a; MvX = x; MvY = y; RefIdx = r; IsDirect = d; }
     }
 
     internal static MvNeighbor GetMvNeighborPublic(
@@ -781,13 +784,14 @@ public static class MacroblockParser
 
         if (mb.IsBInter || mb.IsBSkip)
         {
+            bool isDirect = mb.IsDirectBlock[idx] != 0;
             byte pf = listX == 0 ? mb.PredFlagL0Block[idx] : mb.PredFlagL1Block[idx];
-            if (pf == 0) return new MvNeighbor(true, 0, 0, -1);
+            if (pf == 0) return new MvNeighbor(true, 0, 0, -1, isDirect);
             int q = QuadrantOf(nbBx, nbBy);
             int refIdx = listX == 0 ? mb.RefIdxL08x8[q] : mb.RefIdxL18x8[q];
             int mvX = listX == 0 ? mb.MvL0XBlock[idx] : mb.MvL1XBlock[idx];
             int mvY = listX == 0 ? mb.MvL0YBlock[idx] : mb.MvL1YBlock[idx];
-            return new MvNeighbor(true, mvX, mvY, refIdx);
+            return new MvNeighbor(true, mvX, mvY, refIdx, isDirect);
         }
         if (mb.Type.PredMode != MbPartPredMode.PredL0)
         {
