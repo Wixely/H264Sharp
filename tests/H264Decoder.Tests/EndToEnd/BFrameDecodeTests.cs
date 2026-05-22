@@ -98,4 +98,37 @@ public sealed class BFrameDecodeTests
         Assert.True(perFrame[1] <= 50 && perFrame[2] <= 50,
             $"B-frame luma error too large: B1={perFrame[1]} B2={perFrame[2]}");
     }
+
+    [Fact]
+    public void DecodeThreeFramesBFrames32x16Cabac_ByteExactWithinTolerance()
+    {
+        // Stage 3: CABAC B-slice non-skip MB parsing. Small constant-content fixture
+        // exercises the CABAC mb_skip_flag B path and (for non-uniform MBs) the
+        // CabacSliceB.ParseMb path. Content is constant-red so most B-MBs are B_Skip,
+        // but the IDR + P + B header / CBP / qp_delta paths are all exercised via CABAC.
+        var sample = FfmpegFixture.ThreeFramesBFrames32x16Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+
+        var decoder = new H264Decoder.H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameBytes = yLen + 2 * cLen;
+
+        Assert.Equal(3, frames.Count);
+
+        int worstMaxY = 0;
+        for (int f = 0; f < 3; f++)
+        {
+            var pic = frames[f];
+            int offset = f * frameBytes;
+            int maxY = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[offset + i]));
+            worstMaxY = Math.Max(worstMaxY, maxY);
+        }
+
+        Assert.True(worstMaxY <= 2, $"luma max abs error across CABAC B-frames = {worstMaxY}");
+    }
 }

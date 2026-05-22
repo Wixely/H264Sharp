@@ -305,6 +305,23 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Three-frame 32x16 CABAC B-frame clip (-bf 1). Single B between I and P.
+    /// Small synthetic content keeps it within the CABAC P-parser's currently supported scope
+    /// while still exercising the CABAC B mb_type / mvd / residual parsing paths.</summary>
+    public static Sample ThreeFramesBFrames32x16Cabac()
+    {
+        const int W = 32, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_bframes_32x16_cabac.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_bframes_32x16_cabac.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i color=c=red:s={W}x{H}:d=1.5:r=2,format=yuv420p -frames:v 3 " +
+            "-c:v libx264 -profile:v main -bf 1 -keyint_min 99 -g 99 -coder 1 -an " +
+            "-x264-params \"no-deblock=1:8x8dct=0\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 3 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     private static void EnsureGenerated(string h264, string yuv, string h264Args, string yuvArgs)
     {
         lock (_lock)

@@ -1210,7 +1210,7 @@ public static class MacroblockParser
                 mb.MvdL1YBlock[idx] = mvdY;
             }
     }
-    internal static void SetPredFlag(byte[] arr, int bx0, int by0, int bw, int bh, byte v)
+    public static void SetPredFlag(byte[] arr, int bx0, int by0, int bw, int bh, byte v)
     {
         for (int by = by0; by < by0 + bh; by++)
             for (int bx = bx0; bx < bx0 + bw; bx++)

@@ -489,7 +489,7 @@ internal static class CabacSliceP
     // coded_block_pattern (separate luma/chroma binarizations).
     // Luma: 4 bins, one per 8x8 luma sub-block (ctx 73..76).
     // ---------------------------------------------------------------------
-    private static int DecodeCbpLuma(CabacDecoder cabac, Macroblock cur,
+    internal static int DecodeCbpLuma(CabacDecoder cabac, Macroblock cur,
         Macroblock? leftMb, Macroblock? topMb)
     {
         // luma 8x8 sub-block layout:
@@ -550,7 +550,7 @@ internal static class CabacSliceP
     /// <summary>
     /// CBP chroma binarization (TU, cMax=2). bin0 ctx 77+inc, bin1 ctx 81+inc.
     /// </summary>
-    private static int DecodeCbpChroma(CabacDecoder cabac, Macroblock? leftMb, Macroblock? topMb)
+    internal static int DecodeCbpChroma(CabacDecoder cabac, Macroblock? leftMb, Macroblock? topMb)
     {
         // bin0: condTermFlag = (mbN avail && !skip && cbpChroma(N) != 0) ? 1 : 0
         int condA0 = (leftMb != null && !leftMb.IsSkipped && leftMb.CbpChroma != 0) ? 1 : 0;
@@ -570,7 +570,7 @@ internal static class CabacSliceP
     //                 + chroma DC (Cat=3) + chroma AC (Cat=4).
     // For inter MBs with unavailable neighbors, condTermFlag defaults to 0.
     // ---------------------------------------------------------------------
-    private static void ReadResidualInter(
+    internal static void ReadResidualInter(
         CabacDecoder cabac, Macroblock mb, Macroblock? leftMb, Macroblock? topMb)
     {
         Span<int> coeffs = stackalloc int[16];
