@@ -174,6 +174,20 @@ public sealed class H264FrameDecoder
         int qpY = header.SliceQpY(pps);
         Macroblock[] mbs = new Macroblock[totalMbs];
         bool implicitBipred = isBSlice && pps.WeightedBipredIdc == 2;
+        bool explicitBipred = isBSlice && pps.WeightedBipredIdc == 1;
+        // Temporal direct mode context — built once per B-slice. Only valid for direct_spatial=0.
+        TemporalDirectContext? tdCtx = null;
+        if (isBSlice && !header.DirectSpatialMvPredFlag && refPicListL1.Count > 0)
+        {
+            int[] l0Pocs = new int[refPicListL0.Count];
+            for (int i = 0; i < refPicListL0.Count; i++) l0Pocs[i] = refPicListL0[i].PicOrderCnt;
+            tdCtx = new TemporalDirectContext
+            {
+                CurrentPoc = picOrderCnt,
+                Pic1Poc = refPicListL1[0].PicOrderCnt,
+                L0Pocs = l0Pocs,
+            };
+        }
 
         int addr = (int)header.FirstMbInSlice;
 
@@ -181,7 +195,7 @@ public sealed class H264FrameDecoder
         if (pps.EntropyCodingModeFlag)
         {
             DecodeSliceCabac(nal, sps, pps, header, ref reader, mbs, picture, refPicListL0, refPicListL1,
-                mbsPerRow, totalMbs, ref qpY, addr, implicitBipred);
+                mbsPerRow, totalMbs, ref qpY, addr, implicitBipred, explicitBipred, tdCtx);
             if (header.DisableDeblockingFilterIdc != 1)
             {
                 bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
@@ -233,11 +247,11 @@ public sealed class H264FrameDecoder
             if (isBSlice && mbSkipRun > 0)
             {
                 Macroblock? colMb = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
-                Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb);
+                Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx);
                 mbs[addr] = skipMb;
                 MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                     pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
-                    implicitBipred);
+                    implicitBipred, explicitBipred);
                 mbSkipRun--;
                 addr++;
                 continue;
@@ -246,12 +260,12 @@ public sealed class H264FrameDecoder
             Macroblock? colMbInter = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
             Macroblock mb = MacroblockParser.Parse(
                 ref reader, sps, pps, header,
-                leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY, colMbInter);
+                leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY, colMbInter, tdCtx);
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                 pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
-                implicitBipred);
+                implicitBipred, explicitBipred);
 
             addr++;
 
@@ -299,7 +313,7 @@ public sealed class H264FrameDecoder
     /// to fill MVs; no residual.</summary>
     private static Macroblock BSkipPlaceholder(int addr, SliceHeader header,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
-        Macroblock? colocatedMb)
+        Macroblock? colocatedMb, TemporalDirectContext? tdCtx)
     {
         var mb = new Macroblock
         {
@@ -309,7 +323,7 @@ public sealed class H264FrameDecoder
             IsBSkip = true,
             IsBInter = true,
         };
-        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
         return mb;
     }
 
@@ -318,7 +332,8 @@ public sealed class H264FrameDecoder
         NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps, SliceHeader header,
         ref BitReader reader, Macroblock[] mbs, DecodedPicture picture,
         List<DecodedPicture> refPicListL0, List<DecodedPicture> refPicListL1,
-        int mbsPerRow, int totalMbs, ref int qpY, int addr, bool implicitBipred)
+        int mbsPerRow, int totalMbs, ref int qpY, int addr, bool implicitBipred,
+        bool explicitBipred, TemporalDirectContext? tdCtx)
     {
         bool isPSlice = header.SliceType == SliceType.P;
         bool isBSlice = header.SliceType == SliceType.B;
@@ -371,11 +386,11 @@ public sealed class H264FrameDecoder
                 if (isBSlice)
                 {
                     Macroblock? colMbSkip = GetColocatedMb(refPicListL1, addr);
-                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip, tdCtx);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
-                        implicitBipred);
+                        implicitBipred, explicitBipred);
                 }
                 else
                 {
@@ -401,11 +416,11 @@ public sealed class H264FrameDecoder
                 Macroblock? colMbB = GetColocatedMb(refPicListL1, addr);
                 Macroblock mb = CabacSliceB.ParseMb(cabac, header,
                     leftMb, topMb, topRightMb, topLeftMb, addr,
-                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag, colMbB);
+                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag, colMbB, tdCtx);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                     pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
-                    implicitBipred);
+                    implicitBipred, explicitBipred);
             }
             else
             {

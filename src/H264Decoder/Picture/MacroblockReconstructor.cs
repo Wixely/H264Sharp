@@ -38,7 +38,8 @@ internal static class MacroblockReconstructor
         IReadOnlyList<DecodedPicture>? refPicListL0 = null,
         IReadOnlyList<DecodedPicture>? refPicListL1 = null,
         PredWeightTable? predWeights = null,
-        bool implicitBipred = false)
+        bool implicitBipred = false,
+        bool explicitBipred = false)
     {
         if (mb.IsPcm)
         {
@@ -48,9 +49,11 @@ internal static class MacroblockReconstructor
         if (mb.IsBInter || mb.IsBSkip)
         {
             if (refPicListL0 is null) throw new InvalidOperationException("B-inter reconstruction requires L0 ref list");
-            ReconstructLumaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, implicitBipred);
+            ReconstructLumaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, implicitBipred,
+                explicitBipred ? predWeights : null);
             int qPcB = ChromaQp(mb.QpY, chromaQpIndexOffset);
-            ReconstructChromaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, qPcB, implicitBipred);
+            ReconstructChromaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, qPcB, implicitBipred,
+                explicitBipred ? predWeights : null);
             return;
         }
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
@@ -628,6 +631,33 @@ internal static class MacroblockReconstructor
         }
     }
 
+    /// <summary>Apply explicit weighted bipred sample combination (spec §8.4.2.3.2):
+    /// pred = Clip1( ((p0*w0 + p1*w1 + (1&lt;&lt;wd)) >> (wd+1)) + ((o0 + o1 + 1) >> 1) ) when wd>=1,
+    /// else Clip1(p0*w0 + p1*w1 + ((o0 + o1 + 1) >> 1)).</summary>
+    private static void ApplyExplicitBipredWeights(
+        Span<byte> p0, Span<byte> p1, Span<byte> dst, int w0, int w1, int o0, int o1, int wd)
+    {
+        int offsetCombined = (o0 + o1 + 1) >> 1;
+        if (wd >= 1)
+        {
+            int round = 1 << wd;
+            int shift = wd + 1;
+            for (int i = 0; i < dst.Length; i++)
+            {
+                int v = ((p0[i] * w0 + p1[i] * w1 + round) >> shift) + offsetCombined;
+                dst[i] = ClipByte(v);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < dst.Length; i++)
+            {
+                int v = p0[i] * w0 + p1[i] * w1 + offsetCombined;
+                dst[i] = ClipByte(v);
+            }
+        }
+    }
+
     /// <summary>Apply explicit single-list weighted prediction in place (spec §8.4.2.3.2).</summary>
     private static void ApplyExplicitWeightL0(Span<byte> samples, int w, int o, int denom)
     {
@@ -886,7 +916,7 @@ internal static class MacroblockReconstructor
     private static void ReconstructLumaInterB(
         Macroblock mb, DecodedPicture picture,
         IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1, int mbX, int mbY,
-        bool implicitBipred)
+        bool implicitBipred, PredWeightTable? explicitWeights)
     {
         Span<byte> predBlock = stackalloc byte[256];
         Span<byte> p0 = stackalloc byte[256];
@@ -920,11 +950,20 @@ internal static class MacroblockReconstructor
 
             if (useL0 && useL1)
             {
-                if (implicitBipred)
+                int ri0bi = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
+                int ri1bi = part.RefIdxL1 < 0 ? 0 : (refL1 != null && part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
+                if (explicitWeights is not null)
                 {
-                    int ri0 = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
-                    int ri1 = part.RefIdxL1 < 0 ? 0 : (part.RefIdxL1 is var x && refL1 != null && x < refL1.Count ? x : 0);
-                    var (w0, w1) = ImplicitBipredWeights(picture.PicOrderCnt, refL0[ri0].PicOrderCnt, refL1![ri1].PicOrderCnt);
+                    int wd = explicitWeights.LumaLog2WeightDenom;
+                    int w0 = ri0bi < explicitWeights.LumaWeightL0.Length ? explicitWeights.LumaWeightL0[ri0bi] : (1 << wd);
+                    int w1 = explicitWeights.LumaWeightL1 != null && ri1bi < explicitWeights.LumaWeightL1.Length ? explicitWeights.LumaWeightL1[ri1bi] : (1 << wd);
+                    int o0 = ri0bi < explicitWeights.LumaOffsetL0.Length ? explicitWeights.LumaOffsetL0[ri0bi] : 0;
+                    int o1 = explicitWeights.LumaOffsetL1 != null && ri1bi < explicitWeights.LumaOffsetL1.Length ? explicitWeights.LumaOffsetL1[ri1bi] : 0;
+                    ApplyExplicitBipredWeights(p0[..n], p1[..n], outBuf, w0, w1, o0, o1, wd);
+                }
+                else if (implicitBipred)
+                {
+                    var (w0, w1) = ImplicitBipredWeights(picture.PicOrderCnt, refL0[ri0bi].PicOrderCnt, refL1![ri1bi].PicOrderCnt);
                     for (int i = 0; i < n; i++)
                     {
                         int v = (w0 * p0[i] + w1 * p1[i] + 32) >> 6;
@@ -991,7 +1030,7 @@ internal static class MacroblockReconstructor
     private static void ReconstructChromaInterB(
         Macroblock mb, DecodedPicture picture,
         IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1,
-        int mbX, int mbY, int qPc, bool implicitBipred)
+        int mbX, int mbY, int qPc, bool implicitBipred, PredWeightTable? explicitWeights)
     {
         Span<byte> predBlock = stackalloc byte[64];
         Span<byte> p0 = stackalloc byte[64];
@@ -1031,11 +1070,20 @@ internal static class MacroblockReconstructor
                 }
                 if (useL0 && useL1)
                 {
-                    if (implicitBipred)
+                    int ri0bi = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
+                    int ri1bi = part.RefIdxL1 < 0 ? 0 : (refL1 != null && part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
+                    if (explicitWeights is not null)
                     {
-                        int ri0 = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
-                        int ri1 = part.RefIdxL1 < 0 ? 0 : (refL1 != null && part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
-                        var (w0, w1) = ImplicitBipredWeights(picture.PicOrderCnt, refL0[ri0].PicOrderCnt, refL1![ri1].PicOrderCnt);
+                        int wd = explicitWeights.ChromaLog2WeightDenom;
+                        int w0 = ri0bi < explicitWeights.ChromaWeightL0.GetLength(0) ? explicitWeights.ChromaWeightL0[ri0bi, comp] : (1 << wd);
+                        int w1 = explicitWeights.ChromaWeightL1 != null && ri1bi < explicitWeights.ChromaWeightL1.GetLength(0) ? explicitWeights.ChromaWeightL1[ri1bi, comp] : (1 << wd);
+                        int o0 = ri0bi < explicitWeights.ChromaOffsetL0.GetLength(0) ? explicitWeights.ChromaOffsetL0[ri0bi, comp] : 0;
+                        int o1 = explicitWeights.ChromaOffsetL1 != null && ri1bi < explicitWeights.ChromaOffsetL1.GetLength(0) ? explicitWeights.ChromaOffsetL1[ri1bi, comp] : 0;
+                        ApplyExplicitBipredWeights(p0[..n], p1[..n], outBuf, w0, w1, o0, o1, wd);
+                    }
+                    else if (implicitBipred)
+                    {
+                        var (w0, w1) = ImplicitBipredWeights(picture.PicOrderCnt, refL0[ri0bi].PicOrderCnt, refL1![ri1bi].PicOrderCnt);
                         for (int i = 0; i < n; i++)
                         {
                             int v = (w0 * p0[i] + w1 * p1[i] + 32) >> 6;

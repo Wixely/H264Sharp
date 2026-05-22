@@ -43,7 +43,8 @@ public static class MacroblockParser
         Macroblock? topLeftMb,
         int mbAddress,
         ref int qpYRunning,
-        Macroblock? colocatedMb = null)
+        Macroblock? colocatedMb = null,
+        TemporalDirectContext? tdCtx = null)
     {
         _ = sps; // currently no SPS-dependent fields in I-slice MB layer
         int startBit = reader.BitPosition;
@@ -57,7 +58,7 @@ public static class MacroblockParser
             {
                 return ParseBInterMb(ref reader, mb_initType: (int)mbTypeCode,
                     pps, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, mbAddress, ref qpYRunning, startBit,
-                    colocatedMb);
+                    colocatedMb, tdCtx);
             }
             // Intra branch: mb_type - 23 is the I-slice code.
             type = IntraMbType.FromISliceCodeword(mbTypeCode - 23);
@@ -810,7 +811,8 @@ public static class MacroblockParser
         ref BitReader reader, int mb_initType, PictureParameterSet pps, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         int mbAddress, ref int qpYRunning, int startBit,
-        Macroblock? colocatedMb = null)
+        Macroblock? colocatedMb = null,
+        TemporalDirectContext? tdCtx = null)
     {
         var info = BMbType.Info(mb_initType);
         var mb = new Macroblock
@@ -822,7 +824,7 @@ public static class MacroblockParser
         };
 
         BParseMbPredAndMvs(ref reader, mb, info, sliceHeader,
-            leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+            leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
 
         // CBP for B-inter MBs.
         uint cbpCode = ExpGolomb.ReadUe(ref reader);
@@ -863,13 +865,14 @@ public static class MacroblockParser
     private static void BParseMbPredAndMvs(
         ref BitReader reader, Macroblock mb, BMbTypeInfo info, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
-        Macroblock? colocatedMb = null)
+        Macroblock? colocatedMb = null,
+        TemporalDirectContext? tdCtx = null)
     {
         int rawMb = info.RawMbType;
         if (rawMb == 0)
         {
             // B_Direct_16x16: no per-partition syntax. Derive MVs via direct mode.
-            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
             return;
         }
         if (rawMb == 22)
@@ -883,7 +886,7 @@ public static class MacroblockParser
                 subTypes[i] = (BSubMbType)code;
             }
             BParseB8x8RefAndMv(ref reader, mb, subTypes, sliceHeader,
-                leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+                leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
             return;
         }
         // mb_type 1..21: 1 or 2 partitions, each with a fixed direction.
@@ -1003,7 +1006,8 @@ public static class MacroblockParser
     private static void BParseB8x8RefAndMv(
         ref BitReader reader, Macroblock mb, BSubMbType[] subTypes, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
-        Macroblock? colocatedMb = null)
+        Macroblock? colocatedMb = null,
+        TemporalDirectContext? tdCtx = null)
     {
         uint maxRefL0 = sliceHeader.NumRefIdxL0ActiveMinus1;
         uint maxRefL1 = sliceHeader.NumRefIdxL1ActiveMinus1;
@@ -1090,7 +1094,7 @@ public static class MacroblockParser
         for (int q = 0; q < 4; q++)
         {
             if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
-            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
         }
 
         // Build BInterPartitions list reflecting sub-partition shapes (each carries direction).

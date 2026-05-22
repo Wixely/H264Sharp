@@ -163,6 +163,36 @@ public sealed class BFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeBPyramidTemporalDirect_MatchesReference()
+    {
+        // Temporal direct mode (direct_spatial_mv_pred_flag = 0). Exercises the
+        // §8.4.1.2.3 temporal-direct derivation for B_Direct/B_Skip MBs.
+        var sample = FfmpegFixture.BPyramidTemporalDirectMp4();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+
+        var decoder = new H264Decoder.H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(stream);
+
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameBytes = yLen + 2 * cLen;
+
+        Assert.Equal(4, frames.Count);
+        int worstMaxY = 0;
+        for (int f = 0; f < 4; f++)
+        {
+            var pic = frames[f];
+            int offset = f * frameBytes;
+            int maxY = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(pic.Y[i] - reference[offset + i]));
+            worstMaxY = Math.Max(worstMaxY, maxY);
+        }
+
+        Assert.True(worstMaxY <= 2, $"luma max abs error temporal-direct B-frames = {worstMaxY}");
+    }
+
+    [Fact]
     public void DecodeThreeFramesBFrames32x16CabacDeblock_ByteExact()
     {
         // Same as the CABAC B-frame test but with the deblocking filter ENABLED.

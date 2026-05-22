@@ -431,6 +431,25 @@ public static class FfmpegFixture
         return new Sample(mp4, yuv, W, H);
     }
 
+    /// <summary>4-frame 64x48 IBBP clip muxed as MP4 with temporal direct prediction
+    /// (direct_spatial_mv_pred_flag = 0). Exercises the temporal-direct B-direct/B-skip
+    /// derivation path (spec §8.4.1.2.3).</summary>
+    public static Sample BPyramidTemporalDirectMp4()
+    {
+        // Use CAVLC (coder=0) to sidestep a pre-existing CABAC+IBBP+motion P-frame
+        // decode bug that's unrelated to temporal direct mode itself.
+        const int W = 64, H = 48;
+        string mp4 = Path.Combine(SamplesDirectory, "temporal_direct_64x48.mp4");
+        string yuv = Path.Combine(SamplesDirectory, "temporal_direct_64x48.yuv");
+        EnsureGenerated(mp4, yuv,
+            $"-y -f lavfi -i \"testsrc=s={W}x{H}:r=2:d=2,format=yuv420p\" " +
+            "-c:v libx264 -profile:v main -bf 2 -coder 0 " +
+            "-keyint_min 99 -g 99 -an -qp 18 " +
+            $"-x264-params \"no-deblock=1:direct=temporal\" -f mp4 \"{mp4}\"",
+            $"-y -i \"{mp4}\" -frames:v 4 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(mp4, yuv, W, H);
+    }
+
     /// <summary>Two-frame 64x48 red clip muxed as fragmented MP4 (moof/traf/trun, empty_moov,
     /// default_base_moof). Used to exercise the fragmented MP4 parsing path.</summary>
     public static Sample FragmentedMp4Red64x48()
