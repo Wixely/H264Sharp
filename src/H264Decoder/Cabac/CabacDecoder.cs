@@ -84,6 +84,11 @@ internal sealed class CabacDecoder
     public int DecodeBin(int ctxIdx)
     {
         ref var ctx = ref Contexts.Get(ctxIdx);
+        byte preState = ctx.StateIdx;
+        byte preMps = ctx.ValMPS;
+        uint preRange = _codIRange;
+        uint preOff = _codIOffset;
+
         uint rangeLPS = CabacTables.RangeTabLPS[ctx.StateIdx, (_codIRange >> 6) & 3];
         _codIRange -= rangeLPS;
 
@@ -110,32 +115,52 @@ internal sealed class CabacDecoder
             _codIRange <<= 1;
             _codIOffset = (_codIOffset << 1) | ReadBit();
         }
+        CabacTrace.Bin(ctxIdx, preState, preMps, preRange, preOff, binVal);
         return binVal;
     }
 
     /// <summary>Decode one bypass (equal-probability) bin — no context update.</summary>
     public int DecodeBypass()
     {
+        uint preRange = _codIRange;
+        uint preOff = _codIOffset;
         _codIOffset = (_codIOffset << 1) | ReadBit();
+        int binVal;
         if (_codIOffset >= _codIRange)
         {
             _codIOffset -= _codIRange;
-            return 1;
+            binVal = 1;
         }
-        return 0;
+        else
+        {
+            binVal = 0;
+        }
+        CabacTrace.Bypass(preRange, preOff, binVal);
+        return binVal;
     }
 
     /// <summary>Decode the terminating bin. Returns 1 at end of slice (range collapses).</summary>
     public int DecodeTerminate()
     {
+        uint preRange = _codIRange;
+        uint preOff = _codIOffset;
         _codIRange -= 2;
-        if (_codIOffset >= _codIRange) return 1;
-        // Renormalize and continue
-        while (_codIRange < 256)
+        int binVal;
+        if (_codIOffset >= _codIRange)
         {
-            _codIRange <<= 1;
-            _codIOffset = (_codIOffset << 1) | ReadBit();
+            binVal = 1;
         }
-        return 0;
+        else
+        {
+            binVal = 0;
+            // Renormalize and continue
+            while (_codIRange < 256)
+            {
+                _codIRange <<= 1;
+                _codIOffset = (_codIOffset << 1) | ReadBit();
+            }
+        }
+        CabacTrace.Terminate(preRange, preOff, binVal);
+        return binVal;
     }
 }

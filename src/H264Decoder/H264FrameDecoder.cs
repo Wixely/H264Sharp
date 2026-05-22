@@ -391,12 +391,18 @@ public sealed class H264FrameDecoder
         byte[] rbspBytes = nal.Rbsp.ToArray();
         var cabac = new CabacDecoder(rbspBytes, reader.BitPosition, contexts);
 
+        if (CabacTrace.Enabled)
+        {
+            CabacTrace.Mark($"SLICE type={header.SliceType} frame_num={header.FrameNum} qp={sliceQp} firstMb={addr} totalMbs={totalMbs}");
+        }
+
         int prevMbQpDeltaState = 0; // CABAC state for mb_qp_delta binIdx 0 ctxIdxInc
 
         while (addr < totalMbs)
         {
             int mbX = addr % mbsPerRow;
             int mbY = addr / mbsPerRow;
+            if (CabacTrace.Enabled) CabacTrace.Mark($"MB {addr} ({mbX},{mbY}) bins-so-far={CabacTrace.BinCount}");
             Macroblock? leftMb = mbX > 0 ? mbs[addr - 1] : null;
             Macroblock? topMb = mbY > 0 ? mbs[addr - mbsPerRow] : null;
             Macroblock? topRightMb = (mbY > 0 && mbX + 1 < mbsPerRow) ? mbs[addr - mbsPerRow + 1] : null;
