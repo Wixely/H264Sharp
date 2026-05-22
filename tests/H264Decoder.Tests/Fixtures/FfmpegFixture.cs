@@ -258,6 +258,21 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Three-frame 16x16 red clip with B-frames enabled (-bf 2): IDR + P + B reorder.
+    /// Used to exercise the B-slice header parser, POC computation, and L0/L1 list construction.</summary>
+    public static Sample ThreeFramesBFrames16x16()
+    {
+        const int W = 16, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_bframes_16x16.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_bframes_16x16.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i color=c=red:s={W}x{H}:d=1.5:r=2,format=yuv420p -frames:v 3 " +
+            "-c:v libx264 -profile:v main -bf 2 -keyint_min 99 -g 99 -coder 1 -an " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     private static void EnsureGenerated(string h264, string yuv, string h264Args, string yuvArgs)
     {
         lock (_lock)

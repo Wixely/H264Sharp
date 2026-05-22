@@ -40,6 +40,10 @@ public sealed class SliceHeader
     public uint NumRefIdxL0ActiveMinus1 { get; init; }
     public bool NumRefIdxActiveOverrideFlag { get; init; }
 
+    // B-slice fields (stage 1: parsed but MB-level B decoding not yet implemented).
+    public bool DirectSpatialMvPredFlag { get; init; }
+    public uint NumRefIdxL1ActiveMinus1 { get; init; }
+
     // CABAC
     public uint CabacInitIdc { get; init; }
 
@@ -88,9 +92,9 @@ public sealed class SliceHeader
             throw new InvalidDataException($"slice_type {sliceTypeRaw} out of range");
         }
         var sliceType = (SliceType)(sliceTypeRaw % 5);
-        if (sliceType != SliceType.I && sliceType != SliceType.P)
+        if (sliceType != SliceType.I && sliceType != SliceType.P && sliceType != SliceType.B)
         {
-            throw new NotSupportedException($"slice_type {sliceType} not supported (I/P only)");
+            throw new NotSupportedException($"slice_type {sliceType} not supported (I/P/B only)");
         }
         bool allSame = sliceTypeRaw >= 5;
         uint ppsId = ExpGolomb.ReadUe(ref r);
@@ -126,17 +130,29 @@ public sealed class SliceHeader
             _ = ExpGolomb.ReadUe(ref r); // redundant_pic_cnt
         }
 
-        // P-slice specific: num_ref_idx_active_override + ref_pic_list_modification
+        // B-slice: direct_spatial_mv_pred_flag (spec §7.3.3).
+        bool directSpatialMvPred = false;
+        if (sliceType == SliceType.B)
+        {
+            directSpatialMvPred = r.ReadBit() == 1;
+        }
+
+        // num_ref_idx_active_override + ref_pic_list_modification — for P, SP and B.
         bool numRefIdxOverride = false;
         uint numRefIdxL0ActiveMinus1 = pps.NumRefIdxL0DefaultActiveMinus1;
-        if (sliceType == SliceType.P)
+        uint numRefIdxL1ActiveMinus1 = pps.NumRefIdxL1DefaultActiveMinus1;
+        if (sliceType == SliceType.P || sliceType == SliceType.SP || sliceType == SliceType.B)
         {
             numRefIdxOverride = r.ReadBit() == 1;
             if (numRefIdxOverride)
             {
                 numRefIdxL0ActiveMinus1 = ExpGolomb.ReadUe(ref r);
+                if (sliceType == SliceType.B)
+                {
+                    numRefIdxL1ActiveMinus1 = ExpGolomb.ReadUe(ref r);
+                }
             }
-            // ref_pic_list_modification for P-slice: reads ref_pic_list_modification_flag_l0
+            // ref_pic_list_modification — list 0 for P/SP/B, plus list 1 for B.
             bool listModL0 = r.ReadBit() == 1;
             if (listModL0)
             {
@@ -147,15 +163,33 @@ public sealed class SliceHeader
                     _ = ExpGolomb.ReadUe(ref r); // abs_diff_pic_num_minus1 / long_term_pic_num
                 }
             }
+            if (sliceType == SliceType.B)
+            {
+                bool listModL1 = r.ReadBit() == 1;
+                if (listModL1)
+                {
+                    while (true)
+                    {
+                        uint op = ExpGolomb.ReadUe(ref r);
+                        if (op == 3) break;
+                        _ = ExpGolomb.ReadUe(ref r);
+                    }
+                }
+            }
         }
 
-        // pred_weight_table() (§7.3.3.2). x264 emits this when weighted_pred_flag=1 even if
-        // no actual weights are used. We parse-and-discard since weighted prediction isn't
-        // implemented in our reconstructor (the default unweighted MC path produces correct
-        // output when all weights are zero, which is the common case).
-        if (pps.WeightedPredFlag && (sliceType == SliceType.P || sliceType == SliceType.SP))
+        // pred_weight_table() (§7.3.3.2). Emitted for P/SP with weighted_pred_flag=1 or
+        // for B with weighted_bipred_idc==1 (explicit). We parse-and-discard since
+        // weighted prediction isn't implemented in our reconstructor.
+        bool weightedForP = pps.WeightedPredFlag && (sliceType == SliceType.P || sliceType == SliceType.SP);
+        bool weightedForB = pps.WeightedBipredIdc == 1 && sliceType == SliceType.B;
+        if (weightedForP || weightedForB)
         {
             SkipPredWeightTable(ref r, numRefIdxL0ActiveMinus1, hasChroma: true);
+            if (weightedForB)
+            {
+                SkipPredWeightTable(ref r, numRefIdxL1ActiveMinus1, hasChroma: true);
+            }
         }
 
         bool noOutputPriorPics = false;
@@ -229,7 +263,9 @@ public sealed class SliceHeader
             SliceAlphaC0OffsetDiv2 = alphaOffset / 2,
             SliceBetaOffsetDiv2 = betaOffset / 2,
             NumRefIdxL0ActiveMinus1 = numRefIdxL0ActiveMinus1,
+            NumRefIdxL1ActiveMinus1 = numRefIdxL1ActiveMinus1,
             NumRefIdxActiveOverrideFlag = numRefIdxOverride,
+            DirectSpatialMvPredFlag = directSpatialMvPred,
             CabacInitIdc = cabacInitIdc,
         };
     }

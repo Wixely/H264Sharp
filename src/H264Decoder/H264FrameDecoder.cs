@@ -64,6 +64,9 @@ public sealed class H264FrameDecoder
         // DPB: short-term reference pictures, newest first (index 0 = most recent).
         var dpb = new List<DecodedPicture>();
         var outputs = new List<DecodedPicture>();
+        // POC type-0 running state (spec §8.2.1.1).
+        int prevPicOrderCntMsb = 0;
+        int prevPicOrderCntLsb = 0;
 
         foreach (var n in nals)
         {
@@ -83,10 +86,13 @@ public sealed class H264FrameDecoder
                     }
                     if (n.NalUnitType == NalUnitType.SliceIdr)
                     {
-                        // IDR clears the DPB (per spec §8.2.5.1).
+                        // IDR clears the DPB (per spec §8.2.5.1) and resets POC state.
                         dpb.Clear();
+                        prevPicOrderCntMsb = 0;
+                        prevPicOrderCntLsb = 0;
                     }
-                    DecodedPicture pic = DecodeSlice(n, sps, pps, dpb);
+                    DecodedPicture pic = DecodeSlice(n, sps, pps, dpb,
+                        ref prevPicOrderCntMsb, ref prevPicOrderCntLsb);
                     outputs.Add(pic);
                     if (n.NalRefIdc != 0)
                     {
@@ -100,32 +106,70 @@ public sealed class H264FrameDecoder
         }
 
         if (outputs.Count == 0) throw new InvalidDataException("no slices in bitstream");
+        // Stage 1: sort by POC for display order. TODO: replace with proper §C.2.4 bumping
+        // process once B-frame decoding lands and we need real-time output.
+        outputs.Sort((a, b) => a.PicOrderCnt.CompareTo(b.PicOrderCnt));
         return outputs;
     }
 
     private DecodedPicture DecodeSlice(
         NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps,
-        List<DecodedPicture> dpb)
+        List<DecodedPicture> dpb,
+        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb)
     {
         var header = SliceHeader.Parse(nal.Rbsp.Span, nal, sps, pps);
 
         bool isPSlice = header.SliceType == SliceType.P;
+        bool isBSlice = header.SliceType == SliceType.B;
         if (isPSlice && dpb.Count == 0)
         {
             throw new InvalidDataException("P-slice with empty DPB");
         }
+        if (isBSlice && dpb.Count == 0)
+        {
+            throw new InvalidDataException("B-slice with empty DPB");
+        }
 
-        // Build the active L0 reference picture list for this slice: take the first
-        // num_ref_idx_l0_active_minus1+1 entries of the DPB (which is newest-first).
-        // We do not honour ref_pic_list_modification — typical x264 default ordering.
-        int numActiveRefs = (int)(header.NumRefIdxL0ActiveMinus1 + 1);
-        var refPicListL0 = isPSlice
-            ? dpb.Take(Math.Min(numActiveRefs, dpb.Count)).ToList()
-            : new List<DecodedPicture>();
+        // Compute POC (spec §8.2.1) for this picture. We update prev* state below
+        // after computing so reference-list construction can use this picture's POC.
+        int picOrderCnt = ComputePicOrderCnt(header, sps,
+            ref prevPicOrderCntMsb, ref prevPicOrderCntLsb, nal.NalRefIdc != 0);
+
+        // Build active reference picture lists per spec §8.2.4.
+        int numActiveL0 = (int)(header.NumRefIdxL0ActiveMinus1 + 1);
+        int numActiveL1 = (int)(header.NumRefIdxL1ActiveMinus1 + 1);
+        List<DecodedPicture> refPicListL0;
+        List<DecodedPicture> refPicListL1 = new();
+        if (isBSlice)
+        {
+            (refPicListL0, refPicListL1) = BuildBSliceRefLists(dpb, picOrderCnt, numActiveL0, numActiveL1);
+        }
+        else if (isPSlice)
+        {
+            // P-slice L0: DPB newest-first (already maintained that way).
+            refPicListL0 = dpb.Take(Math.Min(numActiveL0, dpb.Count)).ToList();
+        }
+        else
+        {
+            refPicListL0 = new List<DecodedPicture>();
+        }
+        _ = refPicListL1; // stage 1: parsed but not yet consumed by MB decoder.
 
         int width = (int)sps.CroppedWidth;
         int height = (int)sps.CroppedHeight;
-        var picture = new DecodedPicture(width, height) { FrameNum = (int)header.FrameNum };
+        var picture = new DecodedPicture(width, height)
+        {
+            FrameNum = (int)header.FrameNum,
+            PicOrderCnt = picOrderCnt,
+        };
+
+        // Stage 1: B-slice header parsing + POC + L0/L1 lists are wired through but
+        // per-MB B decoding (mb_type, bipred MC, B_Direct, B_Skip) is not implemented.
+        if (isBSlice)
+        {
+            throw new NotSupportedException(
+                "B-slice macroblock decoding not yet implemented (header + POC + ref lists parsed)");
+        }
 
         var reader = new BitReader(nal.Rbsp.Span);
         SkipSliceHeader(ref reader, nal, sps, pps);
@@ -345,10 +389,19 @@ public sealed class H264FrameDecoder
         }
         if (pps.RedundantPicCntPresentFlag) _ = ExpGolomb.ReadUe(ref r);
         uint effectiveNumRefL0 = pps.NumRefIdxL0DefaultActiveMinus1;
-        if (sliceType == SliceType.P)
+        uint effectiveNumRefL1 = pps.NumRefIdxL1DefaultActiveMinus1;
+        if (sliceType == SliceType.B)
+        {
+            _ = r.ReadBit(); // direct_spatial_mv_pred_flag
+        }
+        if (sliceType == SliceType.P || sliceType == SliceType.SP || sliceType == SliceType.B)
         {
             bool overrideFlag = r.ReadBit() == 1;
-            if (overrideFlag) effectiveNumRefL0 = ExpGolomb.ReadUe(ref r);
+            if (overrideFlag)
+            {
+                effectiveNumRefL0 = ExpGolomb.ReadUe(ref r);
+                if (sliceType == SliceType.B) effectiveNumRefL1 = ExpGolomb.ReadUe(ref r);
+            }
             bool listModL0 = r.ReadBit() == 1;
             if (listModL0)
             {
@@ -359,11 +412,27 @@ public sealed class H264FrameDecoder
                     _ = ExpGolomb.ReadUe(ref r);
                 }
             }
+            if (sliceType == SliceType.B)
+            {
+                bool listModL1 = r.ReadBit() == 1;
+                if (listModL1)
+                {
+                    while (true)
+                    {
+                        uint op = ExpGolomb.ReadUe(ref r);
+                        if (op == 3) break;
+                        _ = ExpGolomb.ReadUe(ref r);
+                    }
+                }
+            }
         }
-        // pred_weight_table for P/SP slices when weighted_pred_flag=1 (must precede dec_ref_pic_marking).
-        if (pps.WeightedPredFlag && sliceType == SliceType.P)
+        // pred_weight_table (must precede dec_ref_pic_marking).
+        bool wForP = pps.WeightedPredFlag && (sliceType == SliceType.P || sliceType == SliceType.SP);
+        bool wForB = pps.WeightedBipredIdc == 1 && sliceType == SliceType.B;
+        if (wForP || wForB)
         {
             SliceHeader.SkipPredWeightTable(ref r, effectiveNumRefL0, hasChroma: true);
+            if (wForB) SliceHeader.SkipPredWeightTable(ref r, effectiveNumRefL1, hasChroma: true);
         }
 
         if (nal.NalRefIdc != 0)
@@ -394,5 +463,67 @@ public sealed class H264FrameDecoder
             uint idc = ExpGolomb.ReadUe(ref r);
             if (idc != 1) { _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r); }
         }
+    }
+
+    /// <summary>Picture Order Count derivation (spec §8.2.1). Frame-coded subset: returns
+    /// PicOrderCnt = min(TopFieldOrderCnt, BottomFieldOrderCnt). Updates prev* state for
+    /// reference pictures (NalRefIdc != 0).</summary>
+    private static int ComputePicOrderCnt(
+        SliceHeader header, SequenceParameterSet sps,
+        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb, bool isReference)
+    {
+        if (header.IdrPicFlag)
+        {
+            prevPicOrderCntMsb = 0;
+            prevPicOrderCntLsb = 0;
+            return 0;
+        }
+
+        if (sps.PicOrderCntType == 0)
+        {
+            int maxPicOrderCntLsb = 1 << ((int)sps.Log2MaxPicOrderCntLsbMinus4 + 4);
+            int picOrderCntLsb = (int)header.PicOrderCntLsb;
+            int picOrderCntMsb;
+            if (picOrderCntLsb < prevPicOrderCntLsb &&
+                (prevPicOrderCntLsb - picOrderCntLsb) >= (maxPicOrderCntLsb / 2))
+            {
+                picOrderCntMsb = prevPicOrderCntMsb + maxPicOrderCntLsb;
+            }
+            else if (picOrderCntLsb > prevPicOrderCntLsb &&
+                     (picOrderCntLsb - prevPicOrderCntLsb) > (maxPicOrderCntLsb / 2))
+            {
+                picOrderCntMsb = prevPicOrderCntMsb - maxPicOrderCntLsb;
+            }
+            else
+            {
+                picOrderCntMsb = prevPicOrderCntMsb;
+            }
+            int topFieldOrderCnt = picOrderCntMsb + picOrderCntLsb;
+            int bottomFieldOrderCnt = topFieldOrderCnt + header.DeltaPicOrderCntBottom;
+            int picOrderCnt = Math.Min(topFieldOrderCnt, bottomFieldOrderCnt);
+            if (isReference)
+            {
+                prevPicOrderCntMsb = picOrderCntMsb;
+                prevPicOrderCntLsb = picOrderCntLsb;
+            }
+            return picOrderCnt;
+        }
+
+        // pic_order_cnt_type == 2: decode-order = display-order. Use frame_num*2 as POC.
+        return (int)header.FrameNum * 2;
+    }
+
+    /// <summary>B-slice reference list construction per spec §8.2.4.2.3. Short-term only;
+    /// long-term refs are not yet supported.</summary>
+    private static (List<DecodedPicture> l0, List<DecodedPicture> l1) BuildBSliceRefLists(
+        List<DecodedPicture> dpb, int currentPoc, int numActiveL0, int numActiveL1)
+    {
+        // L0: past (POC < current, descending) followed by future (POC > current, ascending).
+        var past = dpb.Where(p => p.PicOrderCnt < currentPoc).OrderByDescending(p => p.PicOrderCnt).ToList();
+        var future = dpb.Where(p => p.PicOrderCnt > currentPoc).OrderBy(p => p.PicOrderCnt).ToList();
+        var l0 = past.Concat(future).Take(Math.Min(numActiveL0, dpb.Count)).ToList();
+        // L1: future (ascending) followed by past (descending).
+        var l1 = future.Concat(past).Take(Math.Min(numActiveL1, dpb.Count)).ToList();
+        return (l0, l1);
     }
 }

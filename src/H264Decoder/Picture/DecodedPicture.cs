@@ -17,6 +17,9 @@ public sealed class DecodedPicture
     /// <summary>frame_num of the slice that produced this picture (for DPB ordering).</summary>
     public int FrameNum { get; set; }
 
+    /// <summary>Picture Order Count (spec §8.2.1) — display order key. Lower POC = earlier display.</summary>
+    public int PicOrderCnt { get; set; }
+
     public DecodedPicture(int width, int height)
     {
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)
