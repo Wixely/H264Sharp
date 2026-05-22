@@ -510,8 +510,9 @@ internal static class CabacSliceP
 
     /// <summary>
     /// For luma 8x8 block index i (0..3), return condTermFlag for neighbor.
-    /// Returns 1 if the neighbor's 8x8 CBP bit is 0, else 0. For unavailable
-    /// or P_Skip neighbor, returns 0 (treat as bit-set).
+    /// Per H.264 §9.3.3.1.1.4 / FFmpeg behavior: unavailable neighbor in inter-current
+    /// path uses cbp=0x0F (all bits set → condTermFlag=0); P_Skip neighbor has CbpLuma=0
+    /// (all bits clear → condTermFlag=1). Otherwise condTermFlag = (neighbor bit == 0) ? 1 : 0.
     /// </summary>
     private static int LumaCbpNeighbor8x8(int i, bool isLeft, Macroblock cur, int cbpSoFar,
         Macroblock? leftMb, Macroblock? topMb)
@@ -528,8 +529,10 @@ internal static class CabacSliceP
                 int bit = (cbpSoFar >> nbIdx) & 1;
                 return bit == 0 ? 1 : 0;
             }
-            if (leftMb == null || leftMb.IsSkipped) return 0;
-            int extBit = (leftMb.CbpLuma >> (cy * 2 + 1)) & 1;
+            // External left: unavailable → treat as fully coded (bit=1, condTerm=0); P_Skip → cbp=0.
+            if (leftMb == null) return 0;
+            int extCbp = leftMb.IsSkipped ? 0 : leftMb.CbpLuma;
+            int extBit = (extCbp >> (cy * 2 + 1)) & 1;
             return extBit == 0 ? 1 : 0;
         }
         else
@@ -541,8 +544,9 @@ internal static class CabacSliceP
                 int bit = (cbpSoFar >> nbIdx) & 1;
                 return bit == 0 ? 1 : 0;
             }
-            if (topMb == null || topMb.IsSkipped) return 0;
-            int extBit = (topMb.CbpLuma >> (1 * 2 + cx)) & 1;
+            if (topMb == null) return 0;
+            int extCbp = topMb.IsSkipped ? 0 : topMb.CbpLuma;
+            int extBit = (extCbp >> (1 * 2 + cx)) & 1;
             return extBit == 0 ? 1 : 0;
         }
     }

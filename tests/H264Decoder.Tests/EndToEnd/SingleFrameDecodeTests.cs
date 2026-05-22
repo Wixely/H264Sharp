@@ -341,7 +341,66 @@ public sealed class SingleFrameDecodeTests
         }
     }
 
-    [Fact(Skip = "Pending: P-frame frame 1 diverges by ~234 luma. Investigation showed errors accumulate from MB#6 onwards (the first P_8x8 MB). MB#10 reads mvdY=-240 — a clear CABAC mis-sync from earlier bins. Bug is in CABAC P-slice parsing of P_8x8 sub-MB partitions (likely a context or bin-count error in mvd/sub_mb_type/residual reading) but the exact desync point was not isolated.")]
+    [Fact]
+    public void DecodeCabacTextureTestsrc32x32_ByteExact_MultiRowPskipNeighbor()
+    {
+        // Reproduces the multi-row P-slice desync: row-0 has 2 P_Skip MBs and row-1 has 2
+        // P_L0_16x16 MBs, so the first non-skip P-MB's top neighbor is a P_Skip — exactly
+        // the case the CBP-luma condTermFlag rule for P_Skip neighbors must handle correctly.
+        var sample = FfmpegFixture.TextureTestsrc32x32Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 1, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 1, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 1, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact]
+    public void DecodeCabacTextureTestsrc16x16_ByteExact()
+    {
+        // Minimum-complexity textured CABAC P-slice reproducer: 16x16 testsrc, Main profile,
+        // CABAC, partitions=none (P_L0_16x16 only), 8x8dct=0, no-deblock. Single MB per frame.
+        var sample = FfmpegFixture.TextureTestsrc16x16Cabac();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+        byte[] reference = File.ReadAllBytes(sample.YuvPath);
+
+        var frames = new H264FrameDecoder().DecodeAllFrames(stream);
+        Assert.Equal(2, frames.Count);
+
+        int yLen = sample.Width * sample.Height;
+        int cLen = yLen / 4;
+        int frameStride = yLen + 2 * cLen;
+        for (int f = 0; f < 2; f++)
+        {
+            var p = frames[f];
+            int off = f * frameStride;
+            int maxY = 0, maxU = 0, maxV = 0;
+            for (int i = 0; i < yLen; i++) maxY = Math.Max(maxY, Math.Abs(p.Y[i] - reference[off + i]));
+            for (int i = 0; i < cLen; i++) maxU = Math.Max(maxU, Math.Abs(p.U[i] - reference[off + yLen + i]));
+            for (int i = 0; i < cLen; i++) maxV = Math.Max(maxV, Math.Abs(p.V[i] - reference[off + yLen + cLen + i]));
+            Assert.True(maxY <= 1, $"frame {f} luma max err = {maxY}");
+            Assert.True(maxU <= 1, $"frame {f} U max err = {maxU}");
+            Assert.True(maxV <= 1, $"frame {f} V max err = {maxV}");
+        }
+    }
+
+    [Fact(Skip = "Pending: P-frame frame 1 diverges by ~234 luma. Distinct from the textured P_L0_16x16 desync (now fixed via the CBP-luma P_Skip-neighbor condTermFlag rule). Remaining failure is specific to the P_8x8 sub-MB-partition path (sub_mb_type / per-sub-partition mvd / per-sub-partition ref_idx).")]
     public void DecodeCabacTwoFramesAllPartitions_AllShapes()
     {
         var sample = FfmpegFixture.TwoFramesAllPartitions128x96Cabac();
@@ -394,12 +453,9 @@ public sealed class SingleFrameDecodeTests
         Assert.True(maxV <= 2, $"v max abs error = {maxV}");
     }
 
-    [Fact(Skip = "Stage 5 CABAC ctxBlockCat=5 8x8 luma decode desyncs at MB5 (transform_size_8x8_flag " +
-                 "reads 0 when it should be 1). All neighbor state (leftMb.TransformSize8x8) is propagated " +
-                 "correctly; CABAC engine bits are misaligned by the time MB5 is reached. Suspect 1 " +
-                 "(residual reader bit count) and suspect 2 (LumaAcCbf back-propagation) verified clean " +
-                 "in isolation, but a subtle bug in one of MB0..MB4's CABAC reads remains; root cause " +
-                 "still under investigation.")]
+    [Fact(Skip = "Stage 5 CABAC ctxBlockCat=5 8x8 luma decode still desyncs in I-slice Intra_8x8 path " +
+                 "(distinct from the inter CBP-luma fix; this is intra). Suspect resides in CabacSliceI " +
+                 "intra_8x8 / 8x8 residual reading. Tests pass for inter; intra 8x8 mandelbrot still fails.")]
     public void DecodeMandelbrot128x96HighCabac8x8_Intra8x8()
     {
         // High-profile CABAC clip with 8x8 transform + Intra_8x8 prediction. Exercises Stage 5.

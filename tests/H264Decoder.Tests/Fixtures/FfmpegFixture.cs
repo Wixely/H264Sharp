@@ -126,6 +126,38 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>Two-frame 16x16 textured testsrc clip, Main/CABAC, partitions=none and 8x8dct=0.
+    /// Forces x264 to use only P_L0_16x16 inter MBs with no sub-MB partitions and 4x4 transform.
+    /// Minimum-complexity textured P-slice CABAC reproducer for the orchestration desync.</summary>
+    public static Sample TextureTestsrc16x16Cabac()
+    {
+        const int W = 16, H = 16;
+        string h264 = Path.Combine(SamplesDirectory, "texture_testsrc_16x16_cabac.h264");
+        string yuv = Path.Combine(SamplesDirectory, "texture_testsrc_16x16_cabac.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=s={W}x{H}:r=2:d=1,format=yuv420p\" -frames:v 2 " +
+            "-c:v libx264 -profile:v main -bf 0 -keyint_min 99 -g 99 -coder 1 -an -qp 18 " +
+            $"-x264-params \"no-deblock=1:partitions=none:8x8dct=0\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
+    /// <summary>Two-frame 32x32 textured testsrc clip (multi-row P-slice). Forces a mix of P_Skip
+    /// and P_L0_16x16 MBs so that a P_L0_16x16 has a P_Skip top neighbor — the exact case that
+    /// triggers the CABAC CBP-luma condTermFlag-from-skipped-neighbor desync.</summary>
+    public static Sample TextureTestsrc32x32Cabac()
+    {
+        const int W = 32, H = 32;
+        string h264 = Path.Combine(SamplesDirectory, "texture_testsrc_32x32_cabac.h264");
+        string yuv = Path.Combine(SamplesDirectory, "texture_testsrc_32x32_cabac.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=s={W}x{H}:r=2:d=1,format=yuv420p\" -frames:v 2 " +
+            "-c:v libx264 -profile:v main -bf 0 -keyint_min 99 -g 99 -coder 1 -an -qp 18 " +
+            $"-x264-params \"no-deblock=1:partitions=none:8x8dct=0\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 128x96 CABAC clip exercising every P-slice partition shape (subme=8, partitions=all).</summary>
     public static Sample TwoFramesAllPartitions128x96Cabac()
     {
