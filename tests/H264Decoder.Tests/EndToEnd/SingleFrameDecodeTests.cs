@@ -400,21 +400,7 @@ public sealed class SingleFrameDecodeTests
         }
     }
 
-    [Fact(Skip = "Pending: P-frame frame 1 maxY=234. Bisected to MB8 (P_8x8 with mixed sub_mb_types " +
-                 "q0=PL0_8x8, q1..q3=PL0_4x4). Telemetry confirms: (a) mb_type, sub_mb_types, ref_idx " +
-                 "parse correctly; (b) NeighborAbsMvdSumX/Y values are consistent with spec §9.5.3.1.1.7. " +
-                 "Bisection bit positions (current): MB6 starts 3240, MB7 starts 4361, MB8 starts 4942, " +
-                 "MB9 starts 5467 (intra branch wrongly taken — should be P_L0 per ffmpeg -debug mb_type). " +
-                 "FFmpeg shows row1 = '>- > I I I I > >-' meaning MB9 IS inter, MB10..13 are Intra16x16. " +
-                 "Verified: (a) CABAC engine (DecodeBin/Bypass/Terminate) matches spec §9.3.3 exactly; " +
-                 "(b) LumaAcNeighborCbfInter is structurally identical to LumaAcNeighborCbfIntra (only " +
-                 "unavailable-neighbor default differs: inter→0, intra→1, as per spec §9.3.3.1.1.9); " +
-                 "(c) coeff_abs_level_minus1 cap for ctxBlockCat=3 was off-by-one and FIXED (was Min(4,..) " +
-                 "should be Min(3,..) per spec; fix kept) — but this fix did NOT resolve the AllPartitions " +
-                 "desync. Suspect remaining: the bug is exercised first at MB6 (or earlier inter MB) but " +
-                 "doesn't surface until MB9 mb_type ctxIdxInc lookup. Next diagnostic: instrument " +
-                 "DecodeBin to dump (ctxIdx, MPS, StateIdx) every bin for MB6 onward and bisect against " +
-                 "a reference (e.g., JM h264 reference decoder built with -DTRACE).")]
+    [Fact]
     public void DecodeCabacTwoFramesAllPartitions_AllShapes()
     {
         var sample = FfmpegFixture.TwoFramesAllPartitions128x96Cabac();

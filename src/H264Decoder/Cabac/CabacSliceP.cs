@@ -127,7 +127,8 @@ internal static class CabacSliceP
         }
 
         int b1 = cabac.DecodeBin(15);
-        int b2 = cabac.DecodeBin(16);
+        // Spec Table 9-39: bin2 uses ctxIdxInc=2 when bin1==0 (ctx 16) and ctxIdxInc=3 when bin1==1 (ctx 17).
+        int b2 = cabac.DecodeBin(b1 == 0 ? 16 : 17);
         if (b1 == 0)
         {
             // "0 0 0" => 0, "0 0 1" => 3
