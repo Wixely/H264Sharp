@@ -112,7 +112,9 @@ internal static class CabacResidual
             else
             {
                 // Truncated-unary prefix continuation. ctxIdxInc for binIdx>0 is constant per coeff.
-                int ctxIdxIncK = 5 + Math.Min(4, numDecodAbsLevelGt1);
+                // Spec §9.3.3.1.1.7: cap is Min(4 - (ctxBlockCat==3 ? 1 : 0), numDecodAbsLevelGt1).
+                int cap = (ctxBlockCat == CatChromaDc) ? 3 : 4;
+                int ctxIdxIncK = 5 + Math.Min(cap, numDecodAbsLevelGt1);
                 int ctxIdxK = absBase + ctxIdxIncK;
 
                 int prefixOnes = 1;          // bin0 was already a '1'
