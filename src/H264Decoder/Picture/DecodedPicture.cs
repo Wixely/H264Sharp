@@ -20,6 +20,14 @@ public sealed class DecodedPicture
     /// <summary>Picture Order Count (spec §8.2.1) — display order key. Lower POC = earlier display.</summary>
     public int PicOrderCnt { get; set; }
 
+    /// <summary>Per-MB decoded syntax/state, indexed by mbAddress. Used by spatial-direct
+    /// derivation (spec §8.4.1.2.2) to access the colocated MB in refPicListL1[0].</summary>
+    public Syntax.Macroblock[]? Macroblocks { get; set; }
+
+    /// <summary>Number of MBs per row (PicWidthInMbs). Needed to map (mbX, mbY) ↔ mbAddress
+    /// when this picture is queried as a colocated reference.</summary>
+    public int MbsPerRow { get; set; }
+
     public DecodedPicture(int width, int height)
     {
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)

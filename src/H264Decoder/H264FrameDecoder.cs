@@ -159,6 +159,7 @@ public sealed class H264FrameDecoder
         {
             FrameNum = (int)header.FrameNum,
             PicOrderCnt = picOrderCnt,
+            MbsPerRow = (int)sps.PicWidthInMbs,
         };
 
         var reader = new BitReader(nal.Rbsp.Span);
@@ -168,6 +169,7 @@ public sealed class H264FrameDecoder
         int totalMbs = mbsPerRow * (int)sps.PicHeightInMbs;
         int qpY = header.SliceQpY(pps);
         Macroblock[] mbs = new Macroblock[totalMbs];
+        bool implicitBipred = isBSlice && pps.WeightedBipredIdc == 2;
 
         int addr = (int)header.FirstMbInSlice;
 
@@ -175,7 +177,7 @@ public sealed class H264FrameDecoder
         if (pps.EntropyCodingModeFlag)
         {
             DecodeSliceCabac(nal, sps, pps, header, ref reader, mbs, picture, refPicListL0, refPicListL1,
-                mbsPerRow, totalMbs, ref qpY, addr);
+                mbsPerRow, totalMbs, ref qpY, addr, implicitBipred);
             if (header.DisableDeblockingFilterIdc != 1 && !isPSlice && !isBSlice)
             {
                 bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
@@ -186,6 +188,7 @@ public sealed class H264FrameDecoder
                     filterMbEdges);
             }
             LastMacroblocks = mbs;
+            picture.Macroblocks = mbs;
             return picture;
         }
 
@@ -225,22 +228,26 @@ public sealed class H264FrameDecoder
 
             if (isBSlice && mbSkipRun > 0)
             {
-                Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
+                Macroblock? colMb = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
+                Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb);
                 mbs[addr] = skipMb;
                 MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
+                    implicitBipred);
                 mbSkipRun--;
                 addr++;
                 continue;
             }
 
+            Macroblock? colMbInter = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
             Macroblock mb = MacroblockParser.Parse(
                 ref reader, sps, pps, header,
-                leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY);
+                leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY, colMbInter);
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
+                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
+                implicitBipred);
 
             addr++;
 
@@ -266,6 +273,7 @@ public sealed class H264FrameDecoder
         }
 
         LastMacroblocks = mbs;
+        picture.Macroblocks = mbs;
         return picture;
     }
 
@@ -290,7 +298,8 @@ public sealed class H264FrameDecoder
     /// <summary>Placeholder Macroblock for a B_Skip — uses B_Direct_16x16 spatial direct derivation
     /// to fill MVs; no residual.</summary>
     private static Macroblock BSkipPlaceholder(int addr, SliceHeader header,
-        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        Macroblock? colocatedMb)
     {
         var mb = new Macroblock
         {
@@ -300,7 +309,7 @@ public sealed class H264FrameDecoder
             IsBSkip = true,
             IsBInter = true,
         };
-        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb);
+        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
         return mb;
     }
 
@@ -309,7 +318,7 @@ public sealed class H264FrameDecoder
         NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps, SliceHeader header,
         ref BitReader reader, Macroblock[] mbs, DecodedPicture picture,
         List<DecodedPicture> refPicListL0, List<DecodedPicture> refPicListL1,
-        int mbsPerRow, int totalMbs, ref int qpY, int addr)
+        int mbsPerRow, int totalMbs, ref int qpY, int addr, bool implicitBipred)
     {
         bool isPSlice = header.SliceType == SliceType.P;
         bool isBSlice = header.SliceType == SliceType.B;
@@ -361,10 +370,12 @@ public sealed class H264FrameDecoder
                 prevMbQpDeltaState = 0;
                 if (isBSlice)
                 {
-                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
+                    Macroblock? colMbSkip = GetColocatedMb(refPicListL1, addr);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
+                        implicitBipred);
                 }
                 else
                 {
@@ -387,12 +398,14 @@ public sealed class H264FrameDecoder
             else if (isBSlice)
             {
                 // B-slice non-skip MB.
+                Macroblock? colMbB = GetColocatedMb(refPicListL1, addr);
                 Macroblock mb = CabacSliceB.ParseMb(cabac, header,
                     leftMb, topMb, topRightMb, topLeftMb, addr,
-                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag);
+                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag, colMbB);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
+                    implicitBipred);
             }
             else
             {
@@ -573,6 +586,17 @@ public sealed class H264FrameDecoder
                 _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r);
             }
         }
+    }
+
+    /// <summary>Returns the colocated MB (same mbAddress) in refPicListL1[0], or null if L1[0]
+    /// has no retained MB state (e.g. picture decoded before MB plumbing landed).</summary>
+    private static Macroblock? GetColocatedMb(List<DecodedPicture> refPicListL1, int mbAddress)
+    {
+        if (refPicListL1.Count == 0) return null;
+        var p = refPicListL1[0];
+        if (p.Macroblocks is null) return null;
+        if ((uint)mbAddress >= (uint)p.Macroblocks.Length) return null;
+        return p.Macroblocks[mbAddress];
     }
 
     /// <summary>B-slice reference list construction per spec §8.2.4.2.3. Short-term only;

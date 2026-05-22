@@ -90,13 +90,14 @@ public sealed class BFrameDecodeTests
             worstMaxY = Math.Max(worstMaxY, maxY);
         }
 
-        // I (frame 0) and P (frame 3) must be byte-exact; B-frames may have small error
-        // pending implementation of the collocated-MV per-sub-block override.
+        // I (frame 0) and P (frame 3) must be byte-exact. After stage 4 (implicit weighted
+        // bipred + per-4x4 colocated-MV override) the FIRST B-frame is also byte-exact.
+        // The second B-frame still drifts on a non-direct B_L0_L1_16x8 MB (mb_type 8):
+        // a pre-existing MV-prediction issue tracked separately.
         Assert.True(perFrame[0] <= 2, $"I-frame luma diff = {perFrame[0]}");
         Assert.True(perFrame[3] <= 2, $"P-frame luma diff = {perFrame[3]}");
-        // Document current B-frame error (regression detection): expect <= 50.
-        Assert.True(perFrame[1] <= 50 && perFrame[2] <= 50,
-            $"B-frame luma error too large: B1={perFrame[1]} B2={perFrame[2]}");
+        Assert.True(perFrame[1] <= 2, $"B1-frame luma diff = {perFrame[1]} (should be byte-exact after stage 4)");
+        Assert.True(perFrame[2] <= 50, $"B2-frame luma diff = {perFrame[2]} (regression detection only)");
     }
 
     [Fact]

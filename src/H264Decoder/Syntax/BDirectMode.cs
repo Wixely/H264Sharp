@@ -9,33 +9,36 @@ internal static class BDirectMode
     /// <summary>Apply spatial direct mode for a full B_Direct_16x16 (or B_Skip) MB.</summary>
     public static void ApplyDirect16x16(
         Macroblock mb, SliceHeader sliceHeader,
-        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        Macroblock? colocatedMb = null)
     {
         if (!sliceHeader.DirectSpatialMvPredFlag)
         {
             throw new NotSupportedException("Temporal direct mode not yet supported");
         }
-        DeriveSpatialDirect(mb, 0, 0, 4, 4, leftMb, topMb, topRightMb, topLeftMb);
+        DeriveSpatialDirect(mb, 0, 0, 4, 4, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
     }
 
     /// <summary>Apply spatial direct mode for one 8x8 quadrant within a B_8x8 MB.</summary>
     public static void ApplyDirect8x8(
         Macroblock mb, int quadrant, SliceHeader sliceHeader,
-        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        Macroblock? colocatedMb = null)
     {
         if (!sliceHeader.DirectSpatialMvPredFlag)
         {
             throw new NotSupportedException("Temporal direct mode not yet supported");
         }
         int qx = (quadrant & 1) * 2, qy = (quadrant >> 1) * 2;
-        DeriveSpatialDirect(mb, qx, qy, 2, 2, leftMb, topMb, topRightMb, topLeftMb);
+        DeriveSpatialDirect(mb, qx, qy, 2, 2, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
     }
 
     /// <summary>Spatial direct derivation (spec §8.4.1.2.2) for a rectangle of 4x4 blocks.
     /// Region covered: [bx0..bx0+bw, by0..by0+bh] in 4x4 units.</summary>
     private static void DeriveSpatialDirect(
         Macroblock mb, int bx0, int by0, int bw, int bh,
-        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        Macroblock? colocatedMb)
     {
         // refIdxLX derivation: minimum positive ref over neighbors A, B, C at the
         // partition's top-left position (spec §8.4.1.2.1).
@@ -80,22 +83,81 @@ internal static class BDirectMode
         MacroblockParser.FillBlockMvsL1(mb, bx0, by0, bw, bh, mvL1X, mvL1Y);
         MacroblockParser.SetPredFlag(mb.PredFlagL0Block, bx0, by0, bw, bh, pf0);
         MacroblockParser.SetPredFlag(mb.PredFlagL1Block, bx0, by0, bw, bh, pf1);
-        // Note: for full spec compliance, per-4x4 collocated-block check should drop
-        // MVs to zero for sub-blocks whose collocated L1[0] block has refIdx=0 and small MV.
-        // We omit that refinement for now — most spatial-direct content from x264 still
-        // matches because of the residual that follows.
 
-        // For B_Direct_16x16 (full MB), also register a single BMvPartition for
-        // bookkeeping (used by reconstruction).
+        // Per-4x4 colocated-MV override (spec §8.4.1.2.2): for each 4x4 block whose
+        // colocated L1[0] block has refIdx 0 and |MV| <= 1, force the direct MV to (0,0)
+        // for the direction whose refIdx is 0. Short-term refs only — long-term refs
+        // are excluded from this override (we don't yet support long-term refs).
+        bool colIsIntra = colocatedMb is null
+            || colocatedMb.IsPcm
+            || (!colocatedMb.IsBInter && !colocatedMb.IsSkipped
+                && colocatedMb.Type.PredMode != MbPartPredMode.PredL0);
+        if (colocatedMb is not null && !colIsIntra)
+        {
+            for (int by = by0; by < by0 + bh; by++)
+                for (int bx = bx0; bx < bx0 + bw; bx++)
+                {
+                    int idx = MacroblockParser.SpatialToRaster(bx, by);
+                    int q = MacroblockParser.QuadrantOf(bx, by);
+                    // Choose the L0 motion of the colocated MB (or its L1 if the colocated
+                    // MB has no L0 — i.e., L1-only inter partition).
+                    int colRefIdx, colMvX, colMvY;
+                    if (colocatedMb.IsBInter || colocatedMb.IsBSkip)
+                    {
+                        bool colHasL0 = colocatedMb.PredFlagL0Block[idx] != 0;
+                        if (colHasL0)
+                        {
+                            colRefIdx = colocatedMb.RefIdxL08x8[q];
+                            colMvX = colocatedMb.MvL0XBlock[idx];
+                            colMvY = colocatedMb.MvL0YBlock[idx];
+                        }
+                        else
+                        {
+                            colRefIdx = colocatedMb.RefIdxL18x8[q];
+                            colMvX = colocatedMb.MvL1XBlock[idx];
+                            colMvY = colocatedMb.MvL1YBlock[idx];
+                        }
+                    }
+                    else
+                    {
+                        // P-slice colocated MB (including P_Skip).
+                        colRefIdx = colocatedMb.RefIdxL08x8[q];
+                        colMvX = colocatedMb.MvL0XBlock[idx];
+                        colMvY = colocatedMb.MvL0YBlock[idx];
+                    }
+                    bool colSmall = colRefIdx == 0
+                        && Math.Abs(colMvX) <= 1 && Math.Abs(colMvY) <= 1;
+                    if (!colSmall) continue;
+                    if (refL0 == 0)
+                    {
+                        mb.MvL0XBlock[idx] = 0; mb.MvL0YBlock[idx] = 0;
+                    }
+                    if (refL1 == 0)
+                    {
+                        mb.MvL1XBlock[idx] = 0; mb.MvL1YBlock[idx] = 0;
+                    }
+                }
+        }
+
+        // For B_Direct_16x16 (full MB), emit per-4x4 BInterPartitions so the
+        // reconstructor sees any per-block MV variation introduced by the override.
         if (bw == 4 && bh == 4)
         {
             BPredDir dir;
             if (pf0 != 0 && pf1 != 0) dir = BPredDir.Bi;
             else if (pf0 != 0) dir = BPredDir.L0;
             else dir = BPredDir.L1;
-            mb.BInterPartitions.Add(new BMvPartition(0, 0, 16, 16, dir,
-                refL0 < 0 ? 0 : refL0, mvL0X, mvL0Y,
-                refL1 < 0 ? 0 : refL1, mvL1X, mvL1Y));
+            int r0 = refL0 < 0 ? 0 : refL0;
+            int r1 = refL1 < 0 ? 0 : refL1;
+            for (int by = 0; by < 4; by++)
+                for (int bx = 0; bx < 4; bx++)
+                {
+                    int idx = MacroblockParser.SpatialToRaster(bx, by);
+                    mb.BInterPartitions.Add(new BMvPartition(
+                        bx * 4, by * 4, 4, 4, dir,
+                        r0, mb.MvL0XBlock[idx], mb.MvL0YBlock[idx],
+                        r1, mb.MvL1XBlock[idx], mb.MvL1YBlock[idx]));
+                }
         }
     }
 

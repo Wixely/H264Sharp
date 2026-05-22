@@ -19,7 +19,8 @@ internal static class CabacSliceB
         int mbAddress,
         ref int qpYRunning,
         ref int prevMbQpDeltaState,
-        bool transform8x8ModeFlag = false)
+        bool transform8x8ModeFlag = false,
+        Macroblock? colocatedMb = null)
     {
         int mbTypeCode = DecodeMbTypeB(cabac, leftMb, topMb);
 
@@ -46,7 +47,7 @@ internal static class CabacSliceB
         };
 
         // ---- mb_pred / sub_mb_pred ----
-        ParseBInterMbPred(cabac, mb, info, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
+        ParseBInterMbPred(cabac, mb, info, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
 
         // ---- coded_block_pattern (separate luma/chroma CABAC binarizations, same as P) ----
         int cbpLuma = CabacSliceP.DecodeCbpLuma(cabac, mb, leftMb, topMb);
@@ -325,13 +326,14 @@ internal static class CabacSliceB
     // ---------------------------------------------------------------------
     private static void ParseBInterMbPred(
         CabacDecoder cabac, Macroblock mb, BMbTypeInfo info, SliceHeader sliceHeader,
-        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        Macroblock? colocatedMb = null)
     {
         int rawMb = info.RawMbType;
         if (rawMb == 0)
         {
             // B_Direct_16x16: no syntax; derive via direct mode.
-            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
+            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
             return;
         }
 
@@ -344,7 +346,7 @@ internal static class CabacSliceB
                 subTypes[i] = DecodeSubMbTypeB(cabac);
             }
             ParseB8x8RefAndMv(cabac, mb, subTypes, sliceHeader,
-                leftMb, topMb, topRightMb, topLeftMb);
+                leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
             return;
         }
 
@@ -470,7 +472,8 @@ internal static class CabacSliceB
 
     private static void ParseB8x8RefAndMv(
         CabacDecoder cabac, Macroblock mb, BSubMbType[] subTypes, SliceHeader sliceHeader,
-        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb)
+        Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
+        Macroblock? colocatedMb = null)
     {
         uint maxRefL0 = sliceHeader.NumRefIdxL0ActiveMinus1;
         uint maxRefL1 = sliceHeader.NumRefIdxL1ActiveMinus1;
@@ -564,7 +567,7 @@ internal static class CabacSliceB
         for (int q = 0; q < 4; q++)
         {
             if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
-            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb);
+            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
         }
 
         // Build BInterPartitions.

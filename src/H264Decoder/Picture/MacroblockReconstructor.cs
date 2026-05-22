@@ -37,7 +37,8 @@ internal static class MacroblockReconstructor
         Macroblock? topRightMb,
         IReadOnlyList<DecodedPicture>? refPicListL0 = null,
         IReadOnlyList<DecodedPicture>? refPicListL1 = null,
-        PredWeightTable? predWeights = null)
+        PredWeightTable? predWeights = null,
+        bool implicitBipred = false)
     {
         if (mb.IsPcm)
         {
@@ -47,9 +48,9 @@ internal static class MacroblockReconstructor
         if (mb.IsBInter || mb.IsBSkip)
         {
             if (refPicListL0 is null) throw new InvalidOperationException("B-inter reconstruction requires L0 ref list");
-            ReconstructLumaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY);
+            ReconstructLumaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, implicitBipred);
             int qPcB = ChromaQp(mb.QpY, chromaQpIndexOffset);
-            ReconstructChromaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, qPcB);
+            ReconstructChromaInterB(mb, picture, refPicListL0, refPicListL1, mbX, mbY, qPcB, implicitBipred);
             return;
         }
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
@@ -821,10 +822,31 @@ internal static class MacroblockReconstructor
 
     private static byte ClipByte(int v) => (byte)(v < 0 ? 0 : v > 255 ? 255 : v);
 
+    /// <summary>Implicit weighted bipred weights per spec §8.4.2.3.2 (weighted_bipred_idc==2).
+    /// Returns (w0, w1) on a /64 scale to combine as (w0*p0 + w1*p1 + 32) >> 6.
+    /// Short-term refs only — long-term refs use the equal-weight fallback (32,32).</summary>
+    private static (int w0, int w1) ImplicitBipredWeights(int currPoc, int pocL0, int pocL1)
+    {
+        int diff = pocL1 - pocL0;
+        if (diff == 0) return (32, 32);
+        int td = Clip3(-128, 127, pocL1 - pocL0);
+        int tb = Clip3(-128, 127, currPoc - pocL0);
+        if (td == 0) return (32, 32);
+        int tx = (16384 + (Math.Abs(td) >> 1)) / td;
+        int dsf = Clip3(-1024, 1023, (tb * tx + 32) >> 6);
+        if (dsf < -256 || dsf > 515) return (32, 32);
+        int w1 = dsf >> 2;
+        int w0 = 64 - w1;
+        return (w0, w1);
+    }
+
+    private static int Clip3(int lo, int hi, int v) => v < lo ? lo : v > hi ? hi : v;
+
     // ---------------- Luma (B-slice inter) ----------------
     private static void ReconstructLumaInterB(
         Macroblock mb, DecodedPicture picture,
-        IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1, int mbX, int mbY)
+        IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1, int mbX, int mbY,
+        bool implicitBipred)
     {
         Span<byte> predBlock = stackalloc byte[256];
         Span<byte> p0 = stackalloc byte[256];
@@ -858,7 +880,21 @@ internal static class MacroblockReconstructor
 
             if (useL0 && useL1)
             {
-                for (int i = 0; i < n; i++) outBuf[i] = (byte)((p0[i] + p1[i] + 1) >> 1);
+                if (implicitBipred)
+                {
+                    int ri0 = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
+                    int ri1 = part.RefIdxL1 < 0 ? 0 : (part.RefIdxL1 is var x && refL1 != null && x < refL1.Count ? x : 0);
+                    var (w0, w1) = ImplicitBipredWeights(picture.PicOrderCnt, refL0[ri0].PicOrderCnt, refL1![ri1].PicOrderCnt);
+                    for (int i = 0; i < n; i++)
+                    {
+                        int v = (w0 * p0[i] + w1 * p1[i] + 32) >> 6;
+                        outBuf[i] = ClipByte(v);
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < n; i++) outBuf[i] = (byte)((p0[i] + p1[i] + 1) >> 1);
+                }
             }
             else if (useL0)
             {
@@ -908,7 +944,7 @@ internal static class MacroblockReconstructor
     private static void ReconstructChromaInterB(
         Macroblock mb, DecodedPicture picture,
         IReadOnlyList<DecodedPicture> refL0, IReadOnlyList<DecodedPicture>? refL1,
-        int mbX, int mbY, int qPc)
+        int mbX, int mbY, int qPc, bool implicitBipred)
     {
         Span<byte> predBlock = stackalloc byte[64];
         Span<byte> p0 = stackalloc byte[64];
@@ -948,7 +984,21 @@ internal static class MacroblockReconstructor
                 }
                 if (useL0 && useL1)
                 {
-                    for (int i = 0; i < n; i++) outBuf[i] = (byte)((p0[i] + p1[i] + 1) >> 1);
+                    if (implicitBipred)
+                    {
+                        int ri0 = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
+                        int ri1 = part.RefIdxL1 < 0 ? 0 : (refL1 != null && part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
+                        var (w0, w1) = ImplicitBipredWeights(picture.PicOrderCnt, refL0[ri0].PicOrderCnt, refL1![ri1].PicOrderCnt);
+                        for (int i = 0; i < n; i++)
+                        {
+                            int v = (w0 * p0[i] + w1 * p1[i] + 32) >> 6;
+                            outBuf[i] = ClipByte(v);
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < n; i++) outBuf[i] = (byte)((p0[i] + p1[i] + 1) >> 1);
+                    }
                 }
                 else if (useL0)
                 {
