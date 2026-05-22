@@ -393,4 +393,19 @@ public sealed class CorpusDecodeTests
         Assert.True(pass + close + desync + thrw + genFail == corpus.Count, "Result count mismatch");
         Assert.True(pass >= 1, $"Expected at least 1 PASS, got pass={pass} close={close} desync={desync} throw={thrw} genFail={genFail}");
     }
+
+    /// <summary>
+    /// Regression guard for the CABAC P-slice mb_type bin0 ctxIdxInc bug (spec Table 9-39).
+    /// The smallest reproducer: 32x16 (2 MB) shifted CABAC P-slice — used to THROW
+    /// "Intra_16x16 Vertical: top not available" because mb_type bin0 incorrectly used
+    /// (condA+condB)-derived ctxIdxInc instead of the spec-mandated fixed 0.
+    /// </summary>
+    [Fact]
+    public void DecodeShiftedCabacPSlice32x16_DecodesWithoutThrowing()
+    {
+        var clip = BuildCorpus().Single(c => c.Name == "main_cabac_shifted_32x16");
+        var result = RunOne(clip);
+        Assert.True(result.Result == Result.PASS || result.Result == Result.CLOSE,
+            $"Expected PASS/CLOSE, got {result.Result}: {result.Error}");
+    }
 }

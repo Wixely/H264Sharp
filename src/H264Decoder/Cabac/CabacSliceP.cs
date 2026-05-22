@@ -117,12 +117,9 @@ internal static class CabacSliceP
     // ---------------------------------------------------------------------
     private static int DecodeMbTypeP(CabacDecoder cabac, Macroblock? leftMb, Macroblock? topMb)
     {
-        // ctxIdxInc for binIdx 0: condTermFlagN = 0 if (mbN unavail || P_Skip ||
-        // mb_type(N) == P_L0_16x16); else 1. So intra neighbors and inter
-        // partitions other than 16x16 contribute 1 to ctxIdxInc.
-        int condA = (leftMb != null && !leftMb.IsSkipped && !IsP_L0_16x16(leftMb)) ? 1 : 0;
-        int condB = (topMb != null && !topMb.IsSkipped && !IsP_L0_16x16(topMb)) ? 1 : 0;
-        int b0 = cabac.DecodeBin(14 + condA + condB);
+        // Per spec Table 9-39: P/SP-slice mb_type binIdx 0 uses ctxIdxInc=0 (fixed).
+        // (Unlike I-slice, no neighbor-derived condA/condB applies here.)
+        int b0 = cabac.DecodeBin(14);
         if (b0 == 1)
         {
             // Intra branch — caller throws NotSupported.
