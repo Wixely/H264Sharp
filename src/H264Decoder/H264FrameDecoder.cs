@@ -61,12 +61,17 @@ public sealed class H264FrameDecoder
     {
         SequenceParameterSet? sps = null;
         PictureParameterSet? pps = null;
-        // DPB: short-term reference pictures, newest first (index 0 = most recent).
+        // DPB: reference pictures, newest first (index 0 = most recently inserted).
+        // Both short-term and long-term entries live here; long-term entries are pinned
+        // (immune to sliding-window eviction) until cleared by MMCO ops.
         var dpb = new List<DecodedPicture>();
         var outputs = new List<DecodedPicture>();
         // POC type-0 running state (spec §8.2.1.1).
         int prevPicOrderCntMsb = 0;
         int prevPicOrderCntLsb = 0;
+        // MaxLongTermFrameIdx (spec §8.2.5). -1 == "no long-term frame indices" (initial state
+        // and after IDR with long_term_reference_flag=0). Raised by MMCO op 4 / IDR LT=1.
+        int maxLongTermFrameIdx = -1;
         // Monotonic counter assigned to each decoded picture; used by callers to map
         // an MP4-sample-table index back into the POC-sorted output list.
         int decodeOrderCounter = 0;
@@ -93,17 +98,17 @@ public sealed class H264FrameDecoder
                         dpb.Clear();
                         prevPicOrderCntMsb = 0;
                         prevPicOrderCntLsb = 0;
+                        maxLongTermFrameIdx = -1;
                     }
+                    SliceHeader hdr;
                     DecodedPicture pic = DecodeSlice(n, sps, pps, dpb,
-                        ref prevPicOrderCntMsb, ref prevPicOrderCntLsb);
+                        ref prevPicOrderCntMsb, ref prevPicOrderCntLsb, out hdr);
                     pic.DecodeOrderIndex = decodeOrderCounter++;
                     outputs.Add(pic);
                     if (n.NalRefIdc != 0)
                     {
-                        // Sliding window: insert at front, evict oldest if over capacity.
-                        dpb.Insert(0, pic);
-                        int maxRefs = (int)Math.Max(1u, sps.MaxNumRefFrames);
-                        while (dpb.Count > maxRefs) dpb.RemoveAt(dpb.Count - 1);
+                        ApplyDecRefPicMarking(pic, hdr, dpb, sps,
+                            ref maxLongTermFrameIdx);
                     }
                     break;
             }
@@ -119,9 +124,10 @@ public sealed class H264FrameDecoder
     private DecodedPicture DecodeSlice(
         NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps,
         List<DecodedPicture> dpb,
-        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb)
+        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb,
+        out SliceHeader header)
     {
-        var header = SliceHeader.Parse(nal.Rbsp.Span, nal, sps, pps);
+        header = SliceHeader.Parse(nal.Rbsp.Span, nal, sps, pps);
 
         bool isPSlice = header.SliceType == SliceType.P;
         bool isBSlice = header.SliceType == SliceType.B;
@@ -139,6 +145,24 @@ public sealed class H264FrameDecoder
         int picOrderCnt = ComputePicOrderCnt(header, sps,
             ref prevPicOrderCntMsb, ref prevPicOrderCntLsb, nal.NalRefIdc != 0);
 
+        // Update PicNum / LongTermPicNum on each DPB entry relative to the current frame_num
+        // (spec §8.2.4.1). Short-term: PicNum = FrameNum if no wrap, else FrameNum - MaxFrameNum.
+        int maxFrameNum = 1 << ((int)sps.Log2MaxFrameNumMinus4 + 4);
+        int curFrameNum = (int)header.FrameNum;
+        foreach (var refPic in dpb)
+        {
+            if (!refPic.IsLongTerm)
+            {
+                int fnw = refPic.FrameNum;
+                if (fnw > curFrameNum) fnw -= maxFrameNum;
+                refPic.LongTermPicNum = fnw; // overload: cache short-term PicNum here for list mod
+            }
+            else
+            {
+                refPic.LongTermPicNum = refPic.LongTermFrameIdx;
+            }
+        }
+
         // Build active reference picture lists per spec §8.2.4.
         int numActiveL0 = (int)(header.NumRefIdxL0ActiveMinus1 + 1);
         int numActiveL1 = (int)(header.NumRefIdxL1ActiveMinus1 + 1);
@@ -150,12 +174,22 @@ public sealed class H264FrameDecoder
         }
         else if (isPSlice)
         {
-            // P-slice L0: DPB newest-first (already maintained that way).
-            refPicListL0 = dpb.Take(Math.Min(numActiveL0, dpb.Count)).ToList();
+            refPicListL0 = BuildPSliceRefListL0(dpb, numActiveL0);
         }
         else
         {
             refPicListL0 = new List<DecodedPicture>();
+        }
+        // Apply ref_pic_list_modification (spec §8.2.4.3).
+        if (isPSlice || isBSlice)
+        {
+            ApplyRefPicListModification(refPicListL0, header.RefPicListModificationL0,
+                dpb, curFrameNum, maxFrameNum, numActiveL0);
+        }
+        if (isBSlice)
+        {
+            ApplyRefPicListModification(refPicListL1, header.RefPicListModificationL1,
+                dpb, curFrameNum, maxFrameNum, numActiveL1);
         }
         int width = (int)sps.CroppedWidth;
         int height = (int)sps.CroppedHeight;
@@ -514,12 +548,18 @@ public sealed class H264FrameDecoder
                 bool adaptive = r.ReadBit() == 1;
                 if (adaptive)
                 {
+                    // Walk the MMCO loop with full per-op payload widths (spec §7.3.3.3 / Table 7-9).
                     while (true)
                     {
                         uint mmco = ExpGolomb.ReadUe(ref r);
                         if (mmco == 0) break;
-                        throw new NotSupportedException(
-                            $"memory_management_control_operation {mmco} not supported");
+                        if (mmco == 1 || mmco == 3) _ = ExpGolomb.ReadUe(ref r);
+                        if (mmco == 2) _ = ExpGolomb.ReadUe(ref r);
+                        if (mmco == 3 || mmco == 6) _ = ExpGolomb.ReadUe(ref r);
+                        if (mmco == 4) _ = ExpGolomb.ReadUe(ref r);
+                        if (mmco > 6)
+                            throw new InvalidDataException(
+                                $"memory_management_control_operation {mmco} out of range");
                     }
                 }
             }
@@ -614,17 +654,250 @@ public sealed class H264FrameDecoder
         return p.Macroblocks[mbAddress];
     }
 
-    /// <summary>B-slice reference list construction per spec §8.2.4.2.3. Short-term only;
-    /// long-term refs are not yet supported.</summary>
-    private static (List<DecodedPicture> l0, List<DecodedPicture> l1) BuildBSliceRefLists(
+    /// <summary>B-slice reference list construction per spec §8.2.4.2.3. Short-term refs are
+    /// ordered by POC relative to the current frame; long-term refs are appended (ordered by
+    /// LongTermPicNum ascending) and survive across the standard truncation step.</summary>
+    internal static (List<DecodedPicture> l0, List<DecodedPicture> l1) BuildBSliceRefLists(
         List<DecodedPicture> dpb, int currentPoc, int numActiveL0, int numActiveL1)
     {
-        // L0: past (POC < current, descending) followed by future (POC > current, ascending).
-        var past = dpb.Where(p => p.PicOrderCnt < currentPoc).OrderByDescending(p => p.PicOrderCnt).ToList();
-        var future = dpb.Where(p => p.PicOrderCnt > currentPoc).OrderBy(p => p.PicOrderCnt).ToList();
-        var l0 = past.Concat(future).Take(Math.Min(numActiveL0, dpb.Count)).ToList();
-        // L1: future (ascending) followed by past (descending).
-        var l1 = future.Concat(past).Take(Math.Min(numActiveL1, dpb.Count)).ToList();
+        var shortTerm = dpb.Where(p => !p.IsLongTerm).ToList();
+        var longTerm = dpb.Where(p => p.IsLongTerm).OrderBy(p => p.LongTermPicNum).ToList();
+        // L0: past (POC < current, descending) + future (POC > current, ascending) + long-term.
+        var past = shortTerm.Where(p => p.PicOrderCnt < currentPoc).OrderByDescending(p => p.PicOrderCnt);
+        var future = shortTerm.Where(p => p.PicOrderCnt > currentPoc).OrderBy(p => p.PicOrderCnt);
+        var l0 = past.Concat(future).Concat(longTerm).ToList();
+        if (l0.Count > numActiveL0) l0 = l0.Take(numActiveL0).ToList();
+        // L1: future (ascending) + past (descending) + long-term.
+        var fut1 = shortTerm.Where(p => p.PicOrderCnt > currentPoc).OrderBy(p => p.PicOrderCnt);
+        var past1 = shortTerm.Where(p => p.PicOrderCnt < currentPoc).OrderByDescending(p => p.PicOrderCnt);
+        var l1 = fut1.Concat(past1).Concat(longTerm).ToList();
+        if (l1.Count > numActiveL1) l1 = l1.Take(numActiveL1).ToList();
         return (l0, l1);
+    }
+
+    /// <summary>P-slice L0 construction per spec §8.2.4.2.1. Short-term refs ordered by PicNum
+    /// descending (newest first), followed by long-term refs ordered by LongTermPicNum ascending.
+    /// Truncate to numActiveL0.</summary>
+    internal static List<DecodedPicture> BuildPSliceRefListL0(List<DecodedPicture> dpb, int numActiveL0)
+    {
+        // PicNum has been cached on each short-term entry's LongTermPicNum field by the caller.
+        var shortTerm = dpb.Where(p => !p.IsLongTerm).OrderByDescending(p => p.LongTermPicNum);
+        var longTerm = dpb.Where(p => p.IsLongTerm).OrderBy(p => p.LongTermPicNum);
+        var list = shortTerm.Concat(longTerm).ToList();
+        if (list.Count > numActiveL0) list = list.Take(numActiveL0).ToList();
+        return list;
+    }
+
+    /// <summary>Apply ref_pic_list_modification (spec §8.2.4.3) to an already-built ref list.
+    /// op 0/1 adjust a running picNumPred and insert the matching short-term ref at refIdxL;
+    /// op 2 inserts a long-term ref by LongTermPicNum. After insertion the list is shifted
+    /// (existing entry at the target position moves to the next slot) and truncated to numActive.</summary>
+    internal static void ApplyRefPicListModification(
+        List<DecodedPicture> refList,
+        Syntax.RefPicListModification[] ops,
+        List<DecodedPicture> dpb,
+        int curFrameNum,
+        int maxFrameNum,
+        int numActive)
+    {
+        if (ops.Length == 0) return;
+        int picNumPred = curFrameNum;
+        int refIdxL = 0;
+        foreach (var op in ops)
+        {
+            if (op.ModificationOfPicNumsIdc == 0 || op.ModificationOfPicNumsIdc == 1)
+            {
+                // Short-term modification (§8.2.4.3.1).
+                int absDiff = (int)op.Value + 1;
+                int picNum;
+                if (op.ModificationOfPicNumsIdc == 0)
+                {
+                    picNum = picNumPred - absDiff;
+                    if (picNum < 0) picNum += maxFrameNum;
+                }
+                else
+                {
+                    picNum = picNumPred + absDiff;
+                    if (picNum >= maxFrameNum) picNum -= maxFrameNum;
+                }
+                picNumPred = picNum;
+                // Map picNum to the actual short-term ref (PicNum cached in LongTermPicNum field).
+                int picNumNoWrap = picNum > curFrameNum ? picNum - maxFrameNum : picNum;
+                DecodedPicture? target = dpb.FirstOrDefault(p => !p.IsLongTerm && p.LongTermPicNum == picNumNoWrap);
+                if (target is null) continue;
+                InsertAtIndex(refList, target, refIdxL, numActive);
+                refIdxL++;
+            }
+            else if (op.ModificationOfPicNumsIdc == 2)
+            {
+                // Long-term modification (§8.2.4.3.2).
+                DecodedPicture? target = dpb.FirstOrDefault(p => p.IsLongTerm && p.LongTermPicNum == (int)op.Value);
+                if (target is null) continue;
+                InsertAtIndex(refList, target, refIdxL, numActive);
+                refIdxL++;
+            }
+        }
+        if (refList.Count > numActive) refList.RemoveRange(numActive, refList.Count - numActive);
+    }
+
+    /// <summary>Insert <paramref name="pic"/> at <paramref name="index"/> in <paramref name="list"/>.
+    /// Any existing occurrence of pic elsewhere in the list is removed first (so it isn't
+    /// duplicated). Per spec §8.2.4.3.1 / §8.2.4.3.2, after insertion the list is implicitly
+    /// truncated to numActive at the call site.</summary>
+    private static void InsertAtIndex(List<DecodedPicture> list, DecodedPicture pic, int index, int numActive)
+    {
+        int existing = list.IndexOf(pic);
+        if (existing >= 0) list.RemoveAt(existing);
+        if (index > list.Count) index = list.Count;
+        list.Insert(index, pic);
+    }
+
+    /// <summary>Apply dec_ref_pic_marking + sliding-window after decoding a ref slice (spec §8.2.5).
+    /// Mutates <paramref name="dpb"/> in place: inserts <paramref name="pic"/> at front, processes
+    /// MMCO ops (or sliding-window when no adaptive marking), and updates
+    /// <paramref name="maxLongTermFrameIdx"/>. For IDR with long_term_reference_flag=1, the IDR
+    /// enters as long-term idx 0 with MaxLongTermFrameIdx=0.</summary>
+    internal static void ApplyDecRefPicMarking(
+        DecodedPicture pic,
+        SliceHeader header,
+        List<DecodedPicture> dpb,
+        SequenceParameterSet sps,
+        ref int maxLongTermFrameIdx)
+    {
+        if (header.IdrPicFlag)
+        {
+            // IDR — DPB was cleared by caller. Insert and set long-term state per LT-flag.
+            if (header.LongTermReferenceFlag)
+            {
+                pic.IsLongTerm = true;
+                pic.LongTermFrameIdx = 0;
+                pic.LongTermPicNum = 0;
+                maxLongTermFrameIdx = 0;
+            }
+            else
+            {
+                pic.IsLongTerm = false;
+                maxLongTermFrameIdx = -1;
+            }
+            dpb.Insert(0, pic);
+            return;
+        }
+
+        if (header.AdaptiveRefPicMarkingMode && header.MmcoOps.Length > 0)
+        {
+            // Apply MMCO ops (spec §8.2.5.4). Some ops affect existing DPB entries; op 6 marks
+            // the current picture as long-term and replaces sliding-window for this slice.
+            int maxFrameNum = 1 << ((int)sps.Log2MaxFrameNumMinus4 + 4);
+            int curPicNum = (int)header.FrameNum;
+            bool op5Seen = false;
+            bool op6Seen = false;
+            int op6Idx = 0;
+            foreach (var op in header.MmcoOps)
+            {
+                switch (op.Op)
+                {
+                    case 1:
+                    {
+                        // Mark short-term ref as unused (§8.2.5.4.1).
+                        int picNum = curPicNum - (int)(op.DifferenceOfPicNumsMinus1 + 1);
+                        if (picNum < 0) picNum += maxFrameNum;
+                        int picNumNoWrap = picNum > curPicNum ? picNum - maxFrameNum : picNum;
+                        int idx = dpb.FindIndex(p => !p.IsLongTerm && p.FrameNum == picNumNoWrap);
+                        if (idx >= 0) dpb.RemoveAt(idx);
+                        break;
+                    }
+                    case 2:
+                    {
+                        // Mark long-term ref as unused (§8.2.5.4.2).
+                        int ltPicNum = (int)op.LongTermPicNum;
+                        int idx = dpb.FindIndex(p => p.IsLongTerm && p.LongTermFrameIdx == ltPicNum);
+                        if (idx >= 0) dpb.RemoveAt(idx);
+                        break;
+                    }
+                    case 3:
+                    {
+                        // Mark a short-term ref as long-term (§8.2.5.4.3). Any existing long-term
+                        // with the same idx is first marked unused.
+                        int picNum = curPicNum - (int)(op.DifferenceOfPicNumsMinus1 + 1);
+                        if (picNum < 0) picNum += maxFrameNum;
+                        int picNumNoWrap = picNum > curPicNum ? picNum - maxFrameNum : picNum;
+                        int ltIdx = (int)op.LongTermFrameIdx;
+                        int existing = dpb.FindIndex(p => p.IsLongTerm && p.LongTermFrameIdx == ltIdx);
+                        if (existing >= 0) dpb.RemoveAt(existing);
+                        var st = dpb.FirstOrDefault(p => !p.IsLongTerm && p.FrameNum == picNumNoWrap);
+                        if (st is not null)
+                        {
+                            st.IsLongTerm = true;
+                            st.LongTermFrameIdx = ltIdx;
+                            st.LongTermPicNum = ltIdx;
+                        }
+                        break;
+                    }
+                    case 4:
+                    {
+                        // Update MaxLongTermFrameIdx (§8.2.5.4.4). Any long-term with idx >= new max
+                        // is marked unused. max_long_term_frame_idx_plus1==0 means "no LT idx".
+                        int newMaxPlus1 = (int)op.MaxLongTermFrameIdxPlus1;
+                        maxLongTermFrameIdx = newMaxPlus1 - 1;
+                        if (maxLongTermFrameIdx < 0)
+                        {
+                            dpb.RemoveAll(p => p.IsLongTerm);
+                        }
+                        else
+                        {
+                            int max = maxLongTermFrameIdx;
+                            dpb.RemoveAll(p => p.IsLongTerm && p.LongTermFrameIdx > max);
+                        }
+                        break;
+                    }
+                    case 5:
+                    {
+                        // Mark all as unused (§8.2.5.4.5). Effectively an IDR-style reset; the
+                        // current picture goes in fresh below.
+                        dpb.Clear();
+                        maxLongTermFrameIdx = -1;
+                        op5Seen = true;
+                        break;
+                    }
+                    case 6:
+                    {
+                        // Mark current pic as long-term (§8.2.5.4.6). Defer the actual insert until
+                        // after the loop so op-4 ordering doesn't matter.
+                        op6Seen = true;
+                        op6Idx = (int)op.LongTermFrameIdx;
+                        // Also evict any pre-existing LT with the same idx.
+                        int ex = dpb.FindIndex(p => p.IsLongTerm && p.LongTermFrameIdx == op6Idx);
+                        if (ex >= 0) dpb.RemoveAt(ex);
+                        break;
+                    }
+                }
+            }
+            if (op6Seen)
+            {
+                pic.IsLongTerm = true;
+                pic.LongTermFrameIdx = op6Idx;
+                pic.LongTermPicNum = op6Idx;
+            }
+            else if (op5Seen)
+            {
+                pic.IsLongTerm = false;
+            }
+            dpb.Insert(0, pic);
+            // After op5, only the current pic should remain.
+            return;
+        }
+
+        // No adaptive marking: sliding window (§8.2.5.3) — count short-term entries only,
+        // evict the oldest short-term when the cap is exceeded. Long-term entries are pinned.
+        dpb.Insert(0, pic);
+        int maxRefs = (int)Math.Max(1u, sps.MaxNumRefFrames);
+        while (dpb.Count(p => !p.IsLongTerm) > maxRefs)
+        {
+            // Remove the oldest short-term ref (last short-term in dpb, since newest first).
+            for (int i = dpb.Count - 1; i >= 0; i--)
+            {
+                if (!dpb[i].IsLongTerm) { dpb.RemoveAt(i); break; }
+            }
+        }
     }
 }

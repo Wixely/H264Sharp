@@ -33,6 +33,18 @@ public sealed class DecodedPicture
     /// when this picture is queried as a colocated reference.</summary>
     public int MbsPerRow { get; set; }
 
+    /// <summary>True when this DPB entry has been marked "used for long-term reference"
+    /// (spec §8.2.5). Long-term refs survive sliding-window eviction and are addressed
+    /// by <see cref="LongTermFrameIdx"/> / <see cref="LongTermPicNum"/>.</summary>
+    public bool IsLongTerm { get; set; }
+
+    /// <summary>LongTermFrameIdx assigned via MMCO op 3/6 (spec §8.2.5.4.3 / §8.2.5.4.6).</summary>
+    public int LongTermFrameIdx { get; set; }
+
+    /// <summary>LongTermPicNum used for ref-list construction (spec §8.2.4.1). For frame
+    /// pictures, LongTermPicNum == LongTermFrameIdx.</summary>
+    public int LongTermPicNum { get; set; }
+
     public DecodedPicture(int width, int height)
     {
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)

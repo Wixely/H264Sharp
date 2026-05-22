@@ -22,6 +22,19 @@ public sealed class PredWeightTable
     public int[,]? ChromaOffsetL1 { get; init; }
 }
 
+/// <summary>One ref_pic_list_modification entry (spec §7.3.3.1.1). Op = 0/1 (short-term),
+/// 2 (long-term). Op 3 is the loop terminator and not stored.</summary>
+public readonly record struct RefPicListModification(uint ModificationOfPicNumsIdc, uint Value);
+
+/// <summary>One memory_management_control_operation entry (spec §7.3.3.3). Fields not used
+/// by a particular op are zero. Op 0 is the terminator and not stored.</summary>
+public readonly record struct MmcoOperation(
+    uint Op,
+    uint DifferenceOfPicNumsMinus1,
+    uint LongTermPicNum,
+    uint LongTermFrameIdx,
+    uint MaxLongTermFrameIdxPlus1);
+
 public enum SliceType
 {
     P = 0,
@@ -70,6 +83,21 @@ public sealed class SliceHeader
     // pred_weight_table (§7.3.3.2). Null when the slice does not carry one (then MC is
     // unweighted "default" 1.0 * sample + 0 with no rounding).
     public PredWeightTable? PredWeights { get; init; }
+
+    /// <summary>ref_pic_list_modification entries for list 0 (spec §7.3.3.1.1). Empty when
+    /// ref_pic_list_modification_flag_l0 is 0 or the slice type is I/SI.</summary>
+    public RefPicListModification[] RefPicListModificationL0 { get; init; } = Array.Empty<RefPicListModification>();
+
+    /// <summary>ref_pic_list_modification entries for list 1 (B-slices only).</summary>
+    public RefPicListModification[] RefPicListModificationL1 { get; init; } = Array.Empty<RefPicListModification>();
+
+    /// <summary>True when dec_ref_pic_marking() carried an adaptive marking (non-IDR ref slice
+    /// with adaptive_ref_pic_marking_mode_flag=1). <see cref="MmcoOps"/> is then valid.</summary>
+    public bool AdaptiveRefPicMarkingMode { get; init; }
+
+    /// <summary>Parsed MMCO ops (spec §7.3.3.3) for a non-IDR ref slice with adaptive marking,
+    /// excluding the op=0 terminator. Applied post-decode to mutate the DPB.</summary>
+    public MmcoOperation[] MmcoOps { get; init; } = Array.Empty<MmcoOperation>();
 
     public int SliceQpY(PictureParameterSet pps) => 26 + pps.PicInitQpMinus26 + SliceQpDelta;
 
@@ -182,6 +210,8 @@ public sealed class SliceHeader
         bool numRefIdxOverride = false;
         uint numRefIdxL0ActiveMinus1 = pps.NumRefIdxL0DefaultActiveMinus1;
         uint numRefIdxL1ActiveMinus1 = pps.NumRefIdxL1DefaultActiveMinus1;
+        RefPicListModification[] refPicListModL0 = Array.Empty<RefPicListModification>();
+        RefPicListModification[] refPicListModL1 = Array.Empty<RefPicListModification>();
         if (sliceType == SliceType.P || sliceType == SliceType.SP || sliceType == SliceType.B)
         {
             numRefIdxOverride = r.ReadBit() == 1;
@@ -197,24 +227,14 @@ public sealed class SliceHeader
             bool listModL0 = r.ReadBit() == 1;
             if (listModL0)
             {
-                while (true)
-                {
-                    uint op = ExpGolomb.ReadUe(ref r);
-                    if (op == 3) break;
-                    _ = ExpGolomb.ReadUe(ref r); // abs_diff_pic_num_minus1 / long_term_pic_num
-                }
+                refPicListModL0 = ParseRefPicListModification(ref r);
             }
             if (sliceType == SliceType.B)
             {
                 bool listModL1 = r.ReadBit() == 1;
                 if (listModL1)
                 {
-                    while (true)
-                    {
-                        uint op = ExpGolomb.ReadUe(ref r);
-                        if (op == 3) break;
-                        _ = ExpGolomb.ReadUe(ref r);
-                    }
+                    refPicListModL1 = ParseRefPicListModification(ref r);
                 }
             }
         }
@@ -256,6 +276,8 @@ public sealed class SliceHeader
 
         bool noOutputPriorPics = false;
         bool longTermRef = false;
+        bool adaptiveRefPicMarking = false;
+        MmcoOperation[] mmcoOps = Array.Empty<MmcoOperation>();
         if (nalHeader.NalRefIdc != 0)
         {
             if (idrPicFlag)
@@ -265,19 +287,10 @@ public sealed class SliceHeader
             }
             else
             {
-                bool adaptive = r.ReadBit() == 1;
-                if (adaptive)
+                adaptiveRefPicMarking = r.ReadBit() == 1;
+                if (adaptiveRefPicMarking)
                 {
-                    // memory_management_control_operation loop (§7.3.3.3). We parse the loop
-                    // structure but reject any actual operations — the common case x264 emits
-                    // is adaptive=1 with an empty loop (immediate op=0 terminator).
-                    while (true)
-                    {
-                        uint mmco = ExpGolomb.ReadUe(ref r);
-                        if (mmco == 0) break;
-                        throw new NotSupportedException(
-                            $"memory_management_control_operation {mmco} not supported");
-                    }
+                    mmcoOps = ParseMmcoOps(ref r);
                 }
             }
         }
@@ -330,6 +343,48 @@ public sealed class SliceHeader
             DirectSpatialMvPredFlag = directSpatialMvPred,
             CabacInitIdc = cabacInitIdc,
             PredWeights = predWeights,
+            RefPicListModificationL0 = refPicListModL0,
+            RefPicListModificationL1 = refPicListModL1,
+            AdaptiveRefPicMarkingMode = adaptiveRefPicMarking,
+            MmcoOps = mmcoOps,
         };
+    }
+
+    /// <summary>Parse one ref_pic_list_modification() loop (spec §7.3.3.1.1) up to and
+    /// including the op==3 terminator. Stores (op, value) pairs for op 0/1 (abs_diff_pic_num_minus1)
+    /// and op 2 (long_term_pic_num). The terminator is not stored.</summary>
+    private static RefPicListModification[] ParseRefPicListModification(ref BitReader r)
+    {
+        var list = new List<RefPicListModification>(4);
+        while (true)
+        {
+            uint op = ExpGolomb.ReadUe(ref r);
+            if (op == 3) break;
+            uint value = ExpGolomb.ReadUe(ref r);
+            list.Add(new RefPicListModification(op, value));
+        }
+        return list.ToArray();
+    }
+
+    /// <summary>Parse one dec_ref_pic_marking MMCO loop (spec §7.3.3.3) up to the op==0
+    /// terminator. Each op's payload is read per Table 7-9: op 1/3 read difference_of_pic_nums_minus1;
+    /// op 2 reads long_term_pic_num; op 3/6 read long_term_frame_idx; op 4 reads max_long_term_frame_idx_plus1.
+    /// Op 5 has no payload. Unknown ops (>6) throw.</summary>
+    private static MmcoOperation[] ParseMmcoOps(ref BitReader r)
+    {
+        var list = new List<MmcoOperation>(4);
+        while (true)
+        {
+            uint op = ExpGolomb.ReadUe(ref r);
+            if (op == 0) break;
+            uint diff = 0, longTermPicNum = 0, longTermFrameIdx = 0, maxLtPlus1 = 0;
+            if (op == 1 || op == 3) diff = ExpGolomb.ReadUe(ref r);
+            if (op == 2) longTermPicNum = ExpGolomb.ReadUe(ref r);
+            if (op == 3 || op == 6) longTermFrameIdx = ExpGolomb.ReadUe(ref r);
+            if (op == 4) maxLtPlus1 = ExpGolomb.ReadUe(ref r);
+            if (op > 6) throw new InvalidDataException($"memory_management_control_operation {op} out of range");
+            list.Add(new MmcoOperation(op, diff, longTermPicNum, longTermFrameIdx, maxLtPlus1));
+        }
+        return list.ToArray();
     }
 }
