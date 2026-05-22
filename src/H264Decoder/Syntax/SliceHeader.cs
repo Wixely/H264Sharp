@@ -2,6 +2,26 @@ using H264Decoder.Bitstream;
 
 namespace H264Decoder.Syntax;
 
+/// <summary>Explicit pred_weight_table values (§7.3.3.2 / §8.4.2.3.2). Indices: per ref-idx
+/// per list, plus chroma component 0=Cb, 1=Cr. Per-ref-idx flags absent in the bitstream are
+/// expanded to the no-op default (weight = 1&lt;&lt;denom, offset = 0).</summary>
+public sealed class PredWeightTable
+{
+    public required int LumaLog2WeightDenom { get; init; }
+    public required int ChromaLog2WeightDenom { get; init; }
+
+    // Per ref index. Length = num_ref_idx_active for the list.
+    public required int[] LumaWeightL0 { get; init; }
+    public required int[] LumaOffsetL0 { get; init; }
+    public required int[,] ChromaWeightL0 { get; init; }  // [refIdx, c]
+    public required int[,] ChromaOffsetL0 { get; init; }
+
+    public int[]? LumaWeightL1 { get; init; }
+    public int[]? LumaOffsetL1 { get; init; }
+    public int[,]? ChromaWeightL1 { get; init; }
+    public int[,]? ChromaOffsetL1 { get; init; }
+}
+
 public enum SliceType
 {
     P = 0,
@@ -47,30 +67,51 @@ public sealed class SliceHeader
     // CABAC
     public uint CabacInitIdc { get; init; }
 
+    // pred_weight_table (§7.3.3.2). Null when the slice does not carry one (then MC is
+    // unweighted "default" 1.0 * sample + 0 with no rounding).
+    public PredWeightTable? PredWeights { get; init; }
+
     public int SliceQpY(PictureParameterSet pps) => 26 + pps.PicInitQpMinus26 + SliceQpDelta;
 
-    /// <summary>Parse-and-discard pred_weight_table (§7.3.3.2). We don't apply the weights —
-    /// our MC path is unweighted — but we need to consume the bits so subsequent slice header
-    /// fields align correctly.</summary>
-    internal static void SkipPredWeightTable(ref BitReader r, uint numRefIdxL0ActiveMinus1, bool hasChroma)
+    /// <summary>Parse pred_weight_table (§7.3.3.2) for one list. Records explicit weight/offset
+    /// pairs per ref index (defaults to the no-op weight 1<<denom + offset 0 when the per-ref flag
+    /// is absent). Caller consumes the bits sequentially so subsequent slice header fields align.</summary>
+    internal static void ParseOneListWeights(
+        ref BitReader r, uint numRefIdxActiveMinus1, bool hasChroma,
+        int lumaDenom, int chromaDenom,
+        int[] lumaWeight, int[] lumaOffset,
+        int[,] chromaWeight, int[,] chromaOffset)
     {
-        _ = ExpGolomb.ReadUe(ref r); // luma_log2_weight_denom
-        if (hasChroma) _ = ExpGolomb.ReadUe(ref r); // chroma_log2_weight_denom
-        for (uint i = 0; i <= numRefIdxL0ActiveMinus1; i++)
+        int numActive = (int)(numRefIdxActiveMinus1 + 1);
+        int defaultLuma = 1 << lumaDenom;
+        int defaultChroma = 1 << chromaDenom;
+        for (int i = 0; i < numActive; i++)
         {
             bool lumaFlag = r.ReadBit() == 1;
             if (lumaFlag)
             {
-                _ = ExpGolomb.ReadSe(ref r); // luma_weight_l0[i]
-                _ = ExpGolomb.ReadSe(ref r); // luma_offset_l0[i]
+                lumaWeight[i] = ExpGolomb.ReadSe(ref r);
+                lumaOffset[i] = ExpGolomb.ReadSe(ref r);
+            }
+            else
+            {
+                lumaWeight[i] = defaultLuma;
+                lumaOffset[i] = 0;
             }
             if (hasChroma)
             {
                 bool chromaFlag = r.ReadBit() == 1;
                 if (chromaFlag)
                 {
-                    _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r); // weight,offset Cb
-                    _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r); // weight,offset Cr
+                    chromaWeight[i, 0] = ExpGolomb.ReadSe(ref r);
+                    chromaOffset[i, 0] = ExpGolomb.ReadSe(ref r);
+                    chromaWeight[i, 1] = ExpGolomb.ReadSe(ref r);
+                    chromaOffset[i, 1] = ExpGolomb.ReadSe(ref r);
+                }
+                else
+                {
+                    chromaWeight[i, 0] = defaultChroma; chromaOffset[i, 0] = 0;
+                    chromaWeight[i, 1] = defaultChroma; chromaOffset[i, 1] = 0;
                 }
             }
         }
@@ -183,13 +224,34 @@ public sealed class SliceHeader
         // weighted prediction isn't implemented in our reconstructor.
         bool weightedForP = pps.WeightedPredFlag && (sliceType == SliceType.P || sliceType == SliceType.SP);
         bool weightedForB = pps.WeightedBipredIdc == 1 && sliceType == SliceType.B;
+        PredWeightTable? predWeights = null;
         if (weightedForP || weightedForB)
         {
-            SkipPredWeightTable(ref r, numRefIdxL0ActiveMinus1, hasChroma: true);
+            int lumaDenom = (int)ExpGolomb.ReadUe(ref r);
+            int chromaDenom = (int)ExpGolomb.ReadUe(ref r); // 4:2:0 always has chroma
+            int n0 = (int)(numRefIdxL0ActiveMinus1 + 1);
+            var lW0 = new int[n0]; var lO0 = new int[n0];
+            var cW0 = new int[n0, 2]; var cO0 = new int[n0, 2];
+            ParseOneListWeights(ref r, numRefIdxL0ActiveMinus1, hasChroma: true,
+                lumaDenom, chromaDenom, lW0, lO0, cW0, cO0);
+            int[]? lW1 = null, lO1 = null; int[,]? cW1 = null, cO1 = null;
             if (weightedForB)
             {
-                SkipPredWeightTable(ref r, numRefIdxL1ActiveMinus1, hasChroma: true);
+                int n1 = (int)(numRefIdxL1ActiveMinus1 + 1);
+                lW1 = new int[n1]; lO1 = new int[n1];
+                cW1 = new int[n1, 2]; cO1 = new int[n1, 2];
+                ParseOneListWeights(ref r, numRefIdxL1ActiveMinus1, hasChroma: true,
+                    lumaDenom, chromaDenom, lW1, lO1, cW1, cO1);
             }
+            predWeights = new PredWeightTable
+            {
+                LumaLog2WeightDenom = lumaDenom,
+                ChromaLog2WeightDenom = chromaDenom,
+                LumaWeightL0 = lW0, LumaOffsetL0 = lO0,
+                ChromaWeightL0 = cW0, ChromaOffsetL0 = cO0,
+                LumaWeightL1 = lW1, LumaOffsetL1 = lO1,
+                ChromaWeightL1 = cW1, ChromaOffsetL1 = cO1,
+            };
         }
 
         bool noOutputPriorPics = false;
@@ -267,6 +329,7 @@ public sealed class SliceHeader
             NumRefIdxActiveOverrideFlag = numRefIdxOverride,
             DirectSpatialMvPredFlag = directSpatialMvPred,
             CabacInitIdc = cabacInitIdc,
+            PredWeights = predWeights,
         };
     }
 }

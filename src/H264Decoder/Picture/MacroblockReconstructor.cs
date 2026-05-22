@@ -36,7 +36,8 @@ internal static class MacroblockReconstructor
         Macroblock? topMb,
         Macroblock? topRightMb,
         IReadOnlyList<DecodedPicture>? refPicListL0 = null,
-        IReadOnlyList<DecodedPicture>? refPicListL1 = null)
+        IReadOnlyList<DecodedPicture>? refPicListL1 = null,
+        PredWeightTable? predWeights = null)
     {
         if (mb.IsPcm)
         {
@@ -70,7 +71,7 @@ internal static class MacroblockReconstructor
         {
             if (refPicListL0 is null || refPicListL0.Count == 0)
                 throw new InvalidOperationException("PredL0 reconstruction requires a non-empty L0 reference list");
-            ReconstructLumaInterP16x16(mb, picture, refPicListL0, mbX, mbY);
+            ReconstructLumaInterP16x16(mb, picture, refPicListL0, mbX, mbY, predWeights);
         }
         else
         {
@@ -82,7 +83,7 @@ internal static class MacroblockReconstructor
         {
             if (refPicListL0 is null || refPicListL0.Count == 0)
                 throw new InvalidOperationException("PredL0 chroma reconstruction requires a non-empty L0 reference list");
-            ReconstructChromaInter(mb, picture, refPicListL0, mbX, mbY, qPc);
+            ReconstructChromaInter(mb, picture, refPicListL0, mbX, mbY, qPc, predWeights);
         }
         else
         {
@@ -523,7 +524,8 @@ internal static class MacroblockReconstructor
 
     // ---------------- Luma (PredL0, all P partition shapes) ----------------
     private static void ReconstructLumaInterP16x16(
-        Macroblock mb, DecodedPicture picture, IReadOnlyList<DecodedPicture> refPicListL0, int mbX, int mbY)
+        Macroblock mb, DecodedPicture picture, IReadOnlyList<DecodedPicture> refPicListL0, int mbX, int mbY,
+        PredWeightTable? predWeights)
     {
         // Build the 16x16 prediction by running MC for each motion partition.
         Span<byte> predBlock = stackalloc byte[256];
@@ -539,6 +541,14 @@ internal static class MacroblockReconstructor
                 mbX * 16 + part.X, mbY * 16 + part.Y,
                 part.MvL0X, part.MvL0Y,
                 part.Width, part.Height, partOut);
+            // Apply weighted prediction (§8.4.2.3.2) when the slice carries a pred_weight_table.
+            if (predWeights is not null && refIdx < predWeights.LumaWeightL0.Length)
+            {
+                int wd = predWeights.LumaLog2WeightDenom;
+                int w = predWeights.LumaWeightL0[refIdx];
+                int o = predWeights.LumaOffsetL0[refIdx];
+                ApplyExplicitWeightL0(partOut, w, o, wd);
+            }
             for (int yy = 0; yy < part.Height; yy++)
                 for (int xx = 0; xx < part.Width; xx++)
                     predBlock[(part.Y + yy) * 16 + (part.X + xx)] = partOut[yy * part.Width + xx];
@@ -577,6 +587,28 @@ internal static class MacroblockReconstructor
         }
     }
 
+    /// <summary>Apply explicit single-list weighted prediction in place (spec §8.4.2.3.2).</summary>
+    private static void ApplyExplicitWeightL0(Span<byte> samples, int w, int o, int denom)
+    {
+        if (denom != 0)
+        {
+            int round = 1 << (denom - 1);
+            for (int i = 0; i < samples.Length; i++)
+            {
+                int v = ((samples[i] * w + round) >> denom) + o;
+                samples[i] = ClipByte(v);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < samples.Length; i++)
+            {
+                int v = samples[i] * w + o;
+                samples[i] = ClipByte(v);
+            }
+        }
+    }
+
     /// <summary>Copy 16x16 luma block from reference picture starting at (srcX, srcY) using edge replication for off-picture samples.</summary>
     private static void CopyLumaWithEdgeReplication(DecodedPicture src, int srcX, int srcY, Span<byte> dst16x16)
     {
@@ -596,7 +628,8 @@ internal static class MacroblockReconstructor
 
     /// <summary>Reconstruct chroma for an inter MB. Chroma MV is derived from luma MV.</summary>
     private static void ReconstructChromaInter(
-        Macroblock mb, DecodedPicture picture, IReadOnlyList<DecodedPicture> refPicListL0, int mbX, int mbY, int qPc)
+        Macroblock mb, DecodedPicture picture, IReadOnlyList<DecodedPicture> refPicListL0, int mbX, int mbY, int qPc,
+        PredWeightTable? predWeights = null)
     {
         Span<byte> predBlock = stackalloc byte[64];
         Span<byte> partPred = stackalloc byte[64];
@@ -625,6 +658,13 @@ internal static class MacroblockReconstructor
                     mbX * 8 + cx, mbY * 8 + cy,
                     part.MvL0X, part.MvL0Y,
                     cw, ch, partOut);
+                if (predWeights is not null && refIdx < predWeights.ChromaWeightL0.GetLength(0))
+                {
+                    int wd = predWeights.ChromaLog2WeightDenom;
+                    int w = predWeights.ChromaWeightL0[refIdx, comp];
+                    int o = predWeights.ChromaOffsetL0[refIdx, comp];
+                    ApplyExplicitWeightL0(partOut, w, o, wd);
+                }
                 for (int yy = 0; yy < ch; yy++)
                     for (int xx = 0; xx < cw; xx++)
                         predBlock[(cy + yy) * 8 + (cx + xx)] = partOut[yy * cw + xx];

@@ -217,7 +217,7 @@ public sealed class H264FrameDecoder
                 Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
                 mbs[addr] = skipMb;
                 MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);
                 mbSkipRun--;
                 addr++;
                 continue;
@@ -228,7 +228,7 @@ public sealed class H264FrameDecoder
                 Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
                 mbs[addr] = skipMb;
                 MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
                 mbSkipRun--;
                 addr++;
                 continue;
@@ -240,7 +240,7 @@ public sealed class H264FrameDecoder
             mbs[addr] = mb;
 
             MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
+                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
 
             addr++;
 
@@ -364,7 +364,7 @@ public sealed class H264FrameDecoder
                     Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
                 }
                 else
                 {
@@ -372,7 +372,7 @@ public sealed class H264FrameDecoder
                     Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);
                 }
             }
             else if (!isPSlice && !isBSlice)
@@ -392,7 +392,7 @@ public sealed class H264FrameDecoder
                     ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights);
             }
             else
             {
@@ -402,7 +402,7 @@ public sealed class H264FrameDecoder
                     ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0);
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);
             }
 
             addr++;
@@ -474,8 +474,8 @@ public sealed class H264FrameDecoder
         bool wForB = pps.WeightedBipredIdc == 1 && sliceType == SliceType.B;
         if (wForP || wForB)
         {
-            SliceHeader.SkipPredWeightTable(ref r, effectiveNumRefL0, hasChroma: true);
-            if (wForB) SliceHeader.SkipPredWeightTable(ref r, effectiveNumRefL1, hasChroma: true);
+            SkipPredWeightTable(ref r, effectiveNumRefL0);
+            if (wForB) SkipPredWeightTable(ref r, effectiveNumRefL1);
         }
 
         if (nal.NalRefIdc != 0)
@@ -554,6 +554,25 @@ public sealed class H264FrameDecoder
 
         // pic_order_cnt_type == 2: decode-order = display-order. Use frame_num*2 as POC.
         return (int)header.FrameNum * 2;
+    }
+
+    /// <summary>Walk past a pred_weight_table to keep subsequent slice-header fields aligned
+    /// without storing the values (used by SkipSliceHeader's discarded pass).</summary>
+    private static void SkipPredWeightTable(ref Bitstream.BitReader r, uint numRefIdxActiveMinus1)
+    {
+        _ = ExpGolomb.ReadUe(ref r); // luma_log2_weight_denom
+        _ = ExpGolomb.ReadUe(ref r); // chroma_log2_weight_denom (4:2:0)
+        for (uint i = 0; i <= numRefIdxActiveMinus1; i++)
+        {
+            bool lumaFlag = r.ReadBit() == 1;
+            if (lumaFlag) { _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r); }
+            bool chromaFlag = r.ReadBit() == 1;
+            if (chromaFlag)
+            {
+                _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r);
+                _ = ExpGolomb.ReadSe(ref r); _ = ExpGolomb.ReadSe(ref r);
+            }
+        }
     }
 
     /// <summary>B-slice reference list construction per spec §8.2.4.2.3. Short-term only;
