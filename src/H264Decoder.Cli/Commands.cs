@@ -19,12 +19,15 @@ public static class Commands
         {
             return Info(args[1], stdout, stderr);
         }
-        // <in> <out> [--at <seconds>]
-        if (args.Length == 4 && (args[2] == "--at" || args[3] == "--at"))
+        // <in> <out> --at <seconds>
+        if (args.Length == 4 && args[2] == "--at")
         {
-            string ts = args[2] == "--at" ? args[3] : args[2];
-            string inP = args[0], outP = args[1];
-            return ThumbnailAt(inP, outP, ts, stderr);
+            return ThumbnailAt(args[0], args[1], args[3], stderr);
+        }
+        // <in> <out> --at-pct <0..1>
+        if (args.Length == 4 && args[2] == "--at-pct")
+        {
+            return ThumbnailAtPercent(args[0], args[1], args[3], stderr);
         }
         if (args.Length == 2)
         {
@@ -33,6 +36,7 @@ public static class Commands
         stderr.WriteLine("Usage:");
         stderr.WriteLine("  H264Decoder.Cli <in.h264|in.mp4> <out.yuv|out.png>");
         stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out.png> --at <seconds>");
+        stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out.png> --at-pct <0..1>");
         stderr.WriteLine("  H264Decoder.Cli --info <in.mp4>");
         return 1;
     }
@@ -53,12 +57,48 @@ public static class Commands
     /// <summary>Thumbnail at a specific composition timestamp. Requires MP4 (needs timing info).</summary>
     public static int ThumbnailAt(string inPath, string outPath, string timestamp, TextWriter stderr)
     {
-        if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
         if (!TryParseTimestamp(timestamp, out double t))
         {
             stderr.WriteLine($"invalid --at value: '{timestamp}' (expected seconds or mm:ss[.ms])");
             return 4;
         }
+        return ThumbnailAtSeconds(inPath, outPath, t, stderr);
+    }
+
+    /// <summary>Thumbnail at a percentage of the video duration. <paramref name="percent"/>
+    /// is in [0, 1]; e.g. "0.44" maps to 44% of the way through. Requires MP4.</summary>
+    public static int ThumbnailAtPercent(string inPath, string outPath, string percent, TextWriter stderr)
+    {
+        if (!double.TryParse(percent, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out double pct)
+            || pct < 0 || pct > 1)
+        {
+            stderr.WriteLine($"invalid --at-pct value: '{percent}' (expected a number in [0, 1])");
+            return 4;
+        }
+        if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
+        byte[] bytes = File.ReadAllBytes(inPath);
+        if (!LooksLikeMp4(bytes))
+        {
+            stderr.WriteLine("--at-pct requires an MP4 container (Annex-B has no timestamps)");
+            return 5;
+        }
+        Mp4SampleStream stream;
+        try { stream = Mp4Reader.ExtractH264WithTiming(bytes); }
+        catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
+        if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
+
+        // Prefer mvhd duration; fall back to the last sample's composition time.
+        double duration = stream.DurationSeconds > 0
+            ? stream.DurationSeconds
+            : stream.Samples[^1].CompositionTimeSeconds;
+        double t = duration * pct;
+        return ThumbnailAtTimeForStream(stream, outPath, t, stderr);
+    }
+
+    private static int ThumbnailAtSeconds(string inPath, string outPath, double t, TextWriter stderr)
+    {
+        if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
         byte[] bytes = File.ReadAllBytes(inPath);
         if (!LooksLikeMp4(bytes))
         {
@@ -68,9 +108,12 @@ public static class Commands
         Mp4SampleStream stream;
         try { stream = Mp4Reader.ExtractH264WithTiming(bytes); }
         catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
-
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
+        return ThumbnailAtTimeForStream(stream, outPath, t, stderr);
+    }
 
+    private static int ThumbnailAtTimeForStream(Mp4SampleStream stream, string outPath, double t, TextWriter stderr)
+    {
         // Pick the sample whose composition time is closest to the target.
         int target = 0;
         double best = double.MaxValue;
@@ -80,11 +123,9 @@ public static class Commands
             if (d < best) { best = d; target = i; }
         }
 
-        // Walk back to the most recent sync sample so the decoder has full context.
         int idr = target;
         while (idr > 0 && !stream.Samples[idr].IsSyncSample) idr--;
 
-        // Build NAL stream: avcC config + every NAL from idr..target inclusive.
         var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
         for (int i = idr; i <= target; i++) nals.AddRange(stream.Samples[i].NalUnits);
 
@@ -93,9 +134,6 @@ public static class Commands
         try { frames = decoder.DecodeAllFrames(nals); }
         catch (Exception ex) { stderr.WriteLine($"decode failed: {ex.Message}"); return 3; }
 
-        // DecodeAllFrames sorts by POC (display order). The target sample's composition
-        // time corresponds to the (target - idr)-th frame in display order within this GOP.
-        // For closed-GOP without B-frame reorder past the target, this matches the request.
         int displayIdx = Math.Min(target - idr, frames.Count - 1);
         var pic = frames[displayIdx];
         WritePicture(pic, outPath, stderr);

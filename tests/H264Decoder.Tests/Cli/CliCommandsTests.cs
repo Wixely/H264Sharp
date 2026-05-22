@@ -61,6 +61,58 @@ public class CliCommandsTests
         }
     }
 
+    [Theory]
+    [InlineData("0.0")]
+    [InlineData("0.5")]
+    [InlineData("1.0")]
+    public void ThumbnailAtPercent_FromMp4_WritesPng(string pct)
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        string outPng = Path.Combine(Path.GetTempPath(), $"thumb_pct_{Guid.NewGuid():N}.png");
+        try
+        {
+            var stderr = new StringWriter();
+            int rc = Commands.ThumbnailAtPercent(sample.H264Path, outPng, pct, stderr);
+            Assert.Equal(0, rc);
+            Assert.True(File.Exists(outPng));
+            byte[] png = File.ReadAllBytes(outPng);
+            Assert.True(png.Length > 8);
+            Assert.Equal(0x89, png[0]);
+        }
+        finally
+        {
+            if (File.Exists(outPng)) File.Delete(outPng);
+        }
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("abc")]
+    [InlineData("-0.1")]
+    [InlineData("1.1")]
+    [InlineData("2")]
+    public void ThumbnailAtPercent_RejectsBadInput(string pct)
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        string outPng = Path.Combine(Path.GetTempPath(), $"thumb_pct_bad_{Guid.NewGuid():N}.png");
+        var stderr = new StringWriter();
+        int rc = Commands.ThumbnailAtPercent(sample.H264Path, outPng, pct, stderr);
+        Assert.NotEqual(0, rc);
+        Assert.False(File.Exists(outPng));
+    }
+
+    [Fact]
+    public void ThumbnailAtPercent_OnAnnexB_FailsWithMessage()
+    {
+        var sample = FfmpegFixture.SingleRed16x16();
+        string outPng = Path.Combine(Path.GetTempPath(), $"thumb_pct_annexb_{Guid.NewGuid():N}.png");
+        var stderr = new StringWriter();
+        int rc = Commands.ThumbnailAtPercent(sample.H264Path, outPng, "0.5", stderr);
+        Assert.NotEqual(0, rc);
+        Assert.Contains("MP4", stderr.ToString());
+        Assert.False(File.Exists(outPng));
+    }
+
     [Fact]
     public void ThumbnailAt_OnAnnexB_FailsWithMessage()
     {
