@@ -354,6 +354,25 @@ public static class FfmpegFixture
         return new Sample(h264, yuv, W, H);
     }
 
+    /// <summary>High-profile CABAC B-frames with 8x8dct=1 (PPS transform_8x8_mode_flag=1).
+    /// Regression: B_Direct_16x16 macroblocks with non-zero CbpLuma must decode a
+    /// transform_size_8x8_flag bin per spec §7.3.5.1 (matches OpenH264 IS_DIRECT
+    /// branch in decode_slice.cpp:1194). Apple VideoToolbox encoder commonly emits
+    /// B_Direct_16x16 + 8x8 transform; this fixture exercises that combo.</summary>
+    public static Sample ThreeFramesBFrames64x48CabacHigh8x8()
+    {
+        const int W = 64, H = 48;
+        string h264 = Path.Combine(SamplesDirectory, "three_frames_bframes_64x48_cabac_high_8x8.h264");
+        string yuv = Path.Combine(SamplesDirectory, "three_frames_bframes_64x48_cabac_high_8x8.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=size={W}x{H}:r=2:d=1.5,format=yuv420p\" -frames:v 3 " +
+            "-c:v libx264 -profile:v high -bf 1 -keyint_min 99 -g 99 -coder 1 -an " +
+            "-x264-params \"no-deblock=1:8x8dct=1\" " +
+            $"-f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 3 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Same as ThreeFramesBFrames64x48Cavlc but with deblocking ENABLED — exercises
     /// the deblocking filter for P and B slices end-to-end (luma byte-exact check).</summary>
     public static Sample ThreeFramesBFrames64x48CavlcDeblock()

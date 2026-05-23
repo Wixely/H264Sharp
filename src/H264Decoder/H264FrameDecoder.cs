@@ -462,7 +462,8 @@ public sealed class H264FrameDecoder
                 Macroblock? colMbB = GetColocatedMb(refPicListL1, addr);
                 Macroblock mb = CabacSliceB.ParseMb(cabac, header,
                     leftMb, topMb, topRightMb, topLeftMb, addr,
-                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag, colMbB, tdCtx);
+                    ref qpY, ref prevMbQpDeltaState, pps.Transform8x8ModeFlag, colMbB, tdCtx,
+                    sps.Direct8x8InferenceFlag);
                 mbs[addr] = mb;
                 MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
                     pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,

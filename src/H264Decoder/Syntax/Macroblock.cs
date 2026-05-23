@@ -131,6 +131,12 @@ public sealed class Macroblock
     /// <summary>B-slice motion partitions with both L0 and L1 fields.</summary>
     public List<BMvPartition> BInterPartitions { get; set; } = new();
 
+    /// <summary>noSubMbPartSizeLessThan8x8Flag (spec §7.4.5.2). True for any B-inter MB
+    /// except B_8x8 with at least one sub_mb_type whose partitions are smaller than 8x8
+    /// (or a B_Direct_8x8 sub_mb_type combined with direct_8x8_inference_flag==0). Gates
+    /// transform_size_8x8_flag parsing for B-inter MBs (§7.3.5.1).</summary>
+    public bool NoSubMbPartSizeLessThan8x8Flag { get; set; } = true;
+
     /// <summary>Per-4x4 L1 MV X (quarter-pel) and refIdx-per-quadrant (parallel to L0 arrays).</summary>
     public int[] MvL1XBlock { get; } = new int[16];
     public int[] MvL1YBlock { get; } = new int[16];

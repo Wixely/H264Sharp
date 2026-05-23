@@ -58,7 +58,7 @@ public static class MacroblockParser
             {
                 return ParseBInterMb(ref reader, mb_initType: (int)mbTypeCode,
                     pps, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, mbAddress, ref qpYRunning, startBit,
-                    colocatedMb, tdCtx);
+                    colocatedMb, tdCtx, sps.Direct8x8InferenceFlag);
             }
             // Intra branch: mb_type - 23 is the I-slice code.
             type = IntraMbType.FromISliceCodeword(mbTypeCode - 23);
@@ -219,18 +219,11 @@ public static class MacroblockParser
 
     private static bool BInterEligibleFor8x8Transform(int mb_initType, Macroblock mb)
     {
-        // B_Direct_16x16 (mb_initType==0): not eligible (no partitions / sub-mb syntax).
-        if (mb_initType == 0) return false;
-        // B_8x8 (mb_initType==22): eligible only if all sub-mb sizes are 8x8.
-        if (mb_initType == 22)
-        {
-            if (mb.BInterPartitions.Count != 4) return false;
-            foreach (var p in mb.BInterPartitions)
-                if (p.Width != 8 || p.Height != 8) return false;
-            return true;
-        }
-        // mb_type 1..21: 16x16 / 16x8 / 8x16 — eligible (noSubMbPartSizeLessThan8x8 trivially true).
-        return mb_initType >= 1 && mb_initType <= 21;
+        // Spec §7.3.5.1: B_Direct_16x16 IS eligible (matches OpenH264 IS_DIRECT branch
+        // in decode_slice.cpp:1194). mb_type 0..21 always eligible; mb_type 22 (B_8x8)
+        // requires noSubMbPartSizeLessThan8x8Flag (set during sub_mb_type decoding).
+        if (mb_initType == 22) return mb.NoSubMbPartSizeLessThan8x8Flag;
+        return mb_initType >= 0 && mb_initType <= 21;
     }
 
     private static int Mod52(int v)
@@ -816,7 +809,8 @@ public static class MacroblockParser
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         int mbAddress, ref int qpYRunning, int startBit,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8InferenceFlag = true)
     {
         var info = BMbType.Info(mb_initType);
         var mb = new Macroblock
@@ -828,7 +822,7 @@ public static class MacroblockParser
         };
 
         BParseMbPredAndMvs(ref reader, mb, info, sliceHeader,
-            leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+            leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
 
         // CBP for B-inter MBs.
         uint cbpCode = ExpGolomb.ReadUe(ref reader);
@@ -870,7 +864,8 @@ public static class MacroblockParser
         ref BitReader reader, Macroblock mb, BMbTypeInfo info, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8InferenceFlag = true)
     {
         int rawMb = info.RawMbType;
         if (rawMb == 0)
@@ -889,6 +884,20 @@ public static class MacroblockParser
                 if (code > 12) throw new InvalidDataException($"B sub_mb_type {code} out of range");
                 subTypes[i] = (BSubMbType)code;
             }
+            // noSubMbPartSizeLessThan8x8Flag (spec §7.4.5.2): AND over the 4 subs.
+            bool noLessThan = true;
+            for (int i = 0; i < 4; i++)
+            {
+                if (subTypes[i] == BSubMbType.Direct_8x8)
+                {
+                    if (!direct8x8InferenceFlag) { noLessThan = false; break; }
+                }
+                else if (BSubMbTypeOps.NumSubMbPart(subTypes[i]) > 1)
+                {
+                    noLessThan = false; break;
+                }
+            }
+            mb.NoSubMbPartSizeLessThan8x8Flag = noLessThan;
             BParseB8x8RefAndMv(ref reader, mb, subTypes, sliceHeader,
                 leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
             return;

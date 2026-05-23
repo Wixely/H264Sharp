@@ -132,6 +132,28 @@ public sealed class BFrameDecodeTests
     }
 
     [Fact]
+    public void DecodeThreeFramesBFrames64x48CabacHigh8x8_NoThrow()
+    {
+        // Regression for Apple VideoToolbox iPhone screen recordings: B_Direct_16x16
+        // MBs with non-zero CbpLuma must decode transform_size_8x8_flag (spec §7.3.5.1
+        // — IS_DIRECT branch of OpenH264 decode_slice.cpp:1194). Previously we
+        // excluded mbTypeCode==0 from the eligibility check, causing a CABAC desync
+        // on Apple-encoded High-profile content with 8x8dct=1.
+        var sample = FfmpegFixture.ThreeFramesBFrames64x48CabacHigh8x8();
+        byte[] stream = File.ReadAllBytes(sample.H264Path);
+
+        var decoder = new H264Decoder.H264FrameDecoder();
+        var frames = decoder.DecodeAllFrames(stream);
+
+        Assert.Equal(3, frames.Count);
+        foreach (var f in frames)
+        {
+            Assert.Equal(sample.Width, f.Width);
+            Assert.Equal(sample.Height, f.Height);
+        }
+    }
+
+    [Fact]
     public void DecodeThreeFramesBFrames64x48CavlcDeblock_ByteExact()
     {
         // Same as the CAVLC B-frame test but with the deblocking filter ENABLED in the

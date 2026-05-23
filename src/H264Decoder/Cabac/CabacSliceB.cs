@@ -21,7 +21,8 @@ internal static class CabacSliceB
         ref int prevMbQpDeltaState,
         bool transform8x8ModeFlag = false,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8InferenceFlag = true)
     {
         int mbTypeCode = DecodeMbTypeB(cabac, leftMb, topMb);
 
@@ -48,7 +49,7 @@ internal static class CabacSliceB
         };
 
         // ---- mb_pred / sub_mb_pred ----
-        ParseBInterMbPred(cabac, mb, info, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+        ParseBInterMbPred(cabac, mb, info, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
 
         // ---- coded_block_pattern (separate luma/chroma CABAC binarizations, same as P) ----
         int cbpLuma = CabacSliceP.DecodeCbpLuma(cabac, mb, leftMb, topMb);
@@ -57,11 +58,13 @@ internal static class CabacSliceB
         mb.CbpChroma = cbpChroma;
 
         // transform_size_8x8_flag for B-inter (spec §7.3.5.1).
-        // Eligible when not B_Direct_16x16 (mbTypeCode 0) and (not B_8x8 OR all sub-mbs are 8x8).
+        // Eligible when (16x16 / 16x8 / 8x16 / B_Direct_16x16 partition shape) OR
+        // (B_8x8 with noSubMbPartSizeLessThan8x8Flag==true). B_Direct_16x16 (mbTypeCode 0)
+        // is explicitly included — OpenH264 IS_DIRECT branch, ref decode_slice.cpp:1194.
         if (transform8x8ModeFlag && cbpLuma > 0)
         {
-            bool eligible = (mbTypeCode >= 1 && mbTypeCode <= 21)
-                            || (mbTypeCode == 22 && AllSubMbsAre8x8(mb));
+            bool eligible = (mbTypeCode >= 0 && mbTypeCode <= 21)
+                            || (mbTypeCode == 22 && mb.NoSubMbPartSizeLessThan8x8Flag);
             if (eligible)
             {
                 int ctxA = (leftMb != null && leftMb.TransformSize8x8) ? 1 : 0;
@@ -85,16 +88,6 @@ internal static class CabacSliceB
             prevMbQpDeltaState = 0;
         }
         return mb;
-    }
-
-    private static bool AllSubMbsAre8x8(Macroblock mb)
-    {
-        if (mb.BInterPartitions.Count != 4) return false;
-        foreach (var p in mb.BInterPartitions)
-        {
-            if (p.Width != 8 || p.Height != 8) return false;
-        }
-        return true;
     }
 
     // ---------------------------------------------------------------------
@@ -329,7 +322,8 @@ internal static class CabacSliceB
         CabacDecoder cabac, Macroblock mb, BMbTypeInfo info, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8InferenceFlag = true)
     {
         int rawMb = info.RawMbType;
         if (rawMb == 0)
@@ -347,6 +341,21 @@ internal static class CabacSliceB
             {
                 subTypes[i] = DecodeSubMbTypeB(cabac);
             }
+            // noSubMbPartSizeLessThan8x8Flag (spec §7.4.5.2): for B_8x8, AND over the 4 subs.
+            // Each sub contributes (sub == B_Direct_8x8 ? direct_8x8_inference_flag : NumSubMbPart==1).
+            bool noLessThan = true;
+            for (int i = 0; i < 4; i++)
+            {
+                if (subTypes[i] == BSubMbType.Direct_8x8)
+                {
+                    if (!direct8x8InferenceFlag) { noLessThan = false; break; }
+                }
+                else if (BSubMbTypeOps.NumSubMbPart(subTypes[i]) > 1)
+                {
+                    noLessThan = false; break;
+                }
+            }
+            mb.NoSubMbPartSizeLessThan8x8Flag = noLessThan;
             ParseB8x8RefAndMv(cabac, mb, subTypes, sliceHeader,
                 leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
             return;
