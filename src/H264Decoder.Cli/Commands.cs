@@ -121,49 +121,93 @@ public static class Commands
         catch (Exception ex) { PrintException("MP4 parse failed", ex, stderr); return 3; }
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
 
-        // Parse spec first so we know how many samples we actually need to decode.
-        // For "all" we have to decode everything; for finite specs we stop early.
         if (!TryParseFrameSpec(spec, stream.Samples.Count, out var indices, out string? err))
         {
             stderr.WriteLine($"invalid --frames value: {err}");
             return 4;
         }
-
-        // Sample count to decode. For B-pyramid the display-order index N may correspond
-        // to decode-order index N+k for some k (typically <= 4 for -bf 2..4). Pad by 8 to be safe.
-        int highestRequested = indices[^1];
-        int sampleLimit = Math.Min(stream.Samples.Count, highestRequested + 8 + 1);
-        // "all" → decode everything.
         bool isAll = spec.Trim().Equals("all", StringComparison.OrdinalIgnoreCase);
-        if (isAll) sampleLimit = stream.Samples.Count;
 
-        var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
-        for (int i = 0; i < sampleLimit; i++) nals.AddRange(stream.ResolveNalUnits(i));
+        // Group requested indices by the GOP they belong to. Each GOP starts at a sync sample (IDR)
+        // and is decode-independent — parallelizable across GOPs. Within a GOP, frames depend on each
+        // other (P/B reference earlier frames) so decode is sequential there.
+        var syncSamples = new List<int>();
+        for (int i = 0; i < stream.Samples.Count; i++)
+            if (stream.Samples[i].IsSyncSample) syncSamples.Add(i);
+        if (syncSamples.Count == 0) syncSamples.Add(0); // tolerate streams with no stss
 
-        if (isAll && sampleLimit > 200)
-        {
-            stderr.WriteLine($"decoding {sampleLimit} samples...");
-        }
-
-        var decoder = new H264FrameDecoder();
-        List<DecodedPicture> frames;
-        try { frames = decoder.DecodeAllFrames(nals); }
-        catch (Exception ex) { PrintException("decode failed", ex, stderr); return 3; }
-
-        Directory.CreateDirectory(outDir);
-        int written = 0;
+        // Closed-GOP assumption: display index N maps to GOP K where syncSamples[K] <= N < syncSamples[K+1].
+        // True for typical content; open-GOP streams could mis-bucket boundary B-frames but won't crash.
+        var byGop = new Dictionary<int, List<int>>();
         foreach (int idx in indices)
         {
-            if (idx >= frames.Count) break; // ran out of decoded frames; tolerate gracefully
-            var pic = frames[idx];
-            string outPath = Path.Combine(outDir, $"frame_{idx:D5}.png");
-            byte[] rgb = YuvToRgb.Convert(pic, pic.Vui);
-            byte[] png = PngEncoder.EncodeRgb(pic.Width, pic.Height, rgb);
-            File.WriteAllBytes(outPath, png);
-            written++;
+            int gopIdr = syncSamples[0];
+            for (int k = 0; k < syncSamples.Count; k++)
+            {
+                if (syncSamples[k] <= idx) gopIdr = syncSamples[k];
+                else break;
+            }
+            if (!byGop.TryGetValue(gopIdr, out var list)) byGop[gopIdr] = list = new List<int>();
+            list.Add(idx);
         }
-        stderr.WriteLine($"wrote {written}/{indices.Count} frame(s) to {outDir}");
-        return 0;
+
+        Directory.CreateDirectory(outDir);
+        int totalSamples = isAll ? stream.Samples.Count : Math.Min(stream.Samples.Count, indices[^1] + 9);
+        if (totalSamples > 200) stderr.WriteLine($"decoding {totalSamples} samples across {byGop.Count} GOP(s)...");
+
+        // One task per GOP. Each task re-opens the MP4 (parallel-safe), decodes its slice, writes PNGs.
+        // Within a GOP, PNG encoding is also done in parallel since YuvToRgb + PngEncoder are pure.
+        int totalWritten = 0;
+        int failedGops = 0;
+        System.Threading.Tasks.Parallel.ForEach(byGop, gop =>
+        {
+            int idrSample = gop.Key;
+            var requested = gop.Value;
+            int highest = 0;
+            foreach (int r in requested) if (r > highest) highest = r;
+            int gopEnd = Math.Min(stream.Samples.Count, highest + 9);
+
+            using var gopFs = File.OpenRead(inPath);
+            Mp4SampleStream localStream;
+            try { localStream = Mp4Reader.ExtractH264WithTiming(gopFs); }
+            catch (Exception ex)
+            {
+                System.Threading.Interlocked.Increment(ref failedGops);
+                lock (stderr) PrintException($"MP4 parse failed (GOP starting at {idrSample})", ex, stderr);
+                return;
+            }
+
+            var nals = new List<NalUnit>(localStream.AvcCConfigNalUnits);
+            for (int i = idrSample; i < gopEnd; i++) nals.AddRange(localStream.ResolveNalUnits(i));
+
+            var decoder = new H264FrameDecoder();
+            List<DecodedPicture> frames;
+            try { frames = decoder.DecodeAllFrames(nals); }
+            catch (Exception ex)
+            {
+                System.Threading.Interlocked.Increment(ref failedGops);
+                lock (stderr) PrintException($"decode failed (GOP starting at {idrSample})", ex, stderr);
+                return;
+            }
+
+            // Within a GOP, encode + write PNGs in parallel.
+            int wrote = 0;
+            System.Threading.Tasks.Parallel.ForEach(requested, idx =>
+            {
+                int local = idx - idrSample;
+                if (local < 0 || local >= frames.Count) return;
+                var pic = frames[local];
+                string outPath = Path.Combine(outDir, $"frame_{idx:D5}.png");
+                byte[] rgb = YuvToRgb.Convert(pic, pic.Vui);
+                byte[] png = PngEncoder.EncodeRgb(pic.Width, pic.Height, rgb);
+                File.WriteAllBytes(outPath, png);
+                System.Threading.Interlocked.Increment(ref wrote);
+            });
+            System.Threading.Interlocked.Add(ref totalWritten, wrote);
+        });
+
+        stderr.WriteLine($"wrote {totalWritten}/{indices.Count} frame(s) to {outDir} ({byGop.Count} GOP(s), {Environment.ProcessorCount} cores)");
+        return failedGops == 0 ? 0 : 3;
     }
 
     /// <summary>Parse a frame-selection spec into a sorted, deduplicated set of display-order indices.</summary>
