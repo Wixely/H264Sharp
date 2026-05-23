@@ -121,31 +121,48 @@ public static class Commands
         catch (Exception ex) { PrintException("MP4 parse failed", ex, stderr); return 3; }
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
 
-        // Decode the whole file. For typical use cases (extract every Nth frame or a small range),
-        // decoding everything once is simpler than tracking GOP boundaries per requested frame.
+        // Parse spec first so we know how many samples we actually need to decode.
+        // For "all" we have to decode everything; for finite specs we stop early.
+        if (!TryParseFrameSpec(spec, stream.Samples.Count, out var indices, out string? err))
+        {
+            stderr.WriteLine($"invalid --frames value: {err}");
+            return 4;
+        }
+
+        // Sample count to decode. For B-pyramid the display-order index N may correspond
+        // to decode-order index N+k for some k (typically <= 4 for -bf 2..4). Pad by 8 to be safe.
+        int highestRequested = indices[^1];
+        int sampleLimit = Math.Min(stream.Samples.Count, highestRequested + 8 + 1);
+        // "all" → decode everything.
+        bool isAll = spec.Trim().Equals("all", StringComparison.OrdinalIgnoreCase);
+        if (isAll) sampleLimit = stream.Samples.Count;
+
         var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
-        for (int i = 0; i < stream.Samples.Count; i++) nals.AddRange(stream.ResolveNalUnits(i));
+        for (int i = 0; i < sampleLimit; i++) nals.AddRange(stream.ResolveNalUnits(i));
+
+        if (isAll && sampleLimit > 200)
+        {
+            stderr.WriteLine($"decoding {sampleLimit} samples...");
+        }
+
         var decoder = new H264FrameDecoder();
         List<DecodedPicture> frames;
         try { frames = decoder.DecodeAllFrames(nals); }
         catch (Exception ex) { PrintException("decode failed", ex, stderr); return 3; }
 
-        // frames is sorted by POC (display order). Build the index set from spec.
-        if (!TryParseFrameSpec(spec, frames.Count, out var indices, out string? err))
-        {
-            stderr.WriteLine($"invalid --frames value: {err}");
-            return 4;
-        }
         Directory.CreateDirectory(outDir);
+        int written = 0;
         foreach (int idx in indices)
         {
+            if (idx >= frames.Count) break; // ran out of decoded frames; tolerate gracefully
             var pic = frames[idx];
             string outPath = Path.Combine(outDir, $"frame_{idx:D5}.png");
             byte[] rgb = YuvToRgb.Convert(pic, pic.Vui);
             byte[] png = PngEncoder.EncodeRgb(pic.Width, pic.Height, rgb);
             File.WriteAllBytes(outPath, png);
+            written++;
         }
-        stderr.WriteLine($"wrote {indices.Count} frame(s) to {outDir}");
+        stderr.WriteLine($"wrote {written}/{indices.Count} frame(s) to {outDir}");
         return 0;
     }
 
