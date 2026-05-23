@@ -1,0 +1,57 @@
+using H264Decoder.Encoder.Bitstream;
+using H264Decoder.Syntax;
+
+namespace H264Decoder.Encoder.Syntax;
+
+/// <summary>Serialize an I-slice IDR slice header (spec §7.3.3). I-slice only; no P/B.</summary>
+public static class SliceHeaderWriter
+{
+    /// <summary>Encode the slice header for an IDR I-slice into the supplied BitWriter.
+    /// The slice header is the leading portion of the slice NAL RBSP; macroblock_layer()
+    /// data and rbsp_trailing_bits follow in the same RBSP.</summary>
+    public static void Write(
+        BitWriter w,
+        SequenceParameterSet sps,
+        PictureParameterSet pps,
+        uint frameNum,
+        uint idrPicId,
+        int sliceQpDelta,
+        uint disableDeblockingFilterIdc)
+    {
+        ExpGolombWriter.WriteUe(w, 0); // first_mb_in_slice
+        // slice_type = 7 (all-I, "all slices in this picture are I"); spec §7.4.3.
+        ExpGolombWriter.WriteUe(w, 7);
+        ExpGolombWriter.WriteUe(w, pps.PicParameterSetId);
+        int frameNumBits = (int)sps.Log2MaxFrameNumMinus4 + 4;
+        w.WriteBits(frameNum, frameNumBits);
+        // frame_mbs_only=1: no field_pic_flag / bottom_field_flag.
+        // IDR: idr_pic_id
+        ExpGolombWriter.WriteUe(w, idrPicId);
+        if (sps.PicOrderCntType == 0)
+        {
+            int lsbBits = (int)sps.Log2MaxPicOrderCntLsbMinus4 + 4;
+            w.WriteBits(0, lsbBits); // pic_order_cnt_lsb = 0 for IDR
+            // No bottom_field_pic_order_in_frame_present_flag in our PPS.
+        }
+        // pic_order_cnt_type==2 has no extra fields.
+        if (pps.RedundantPicCntPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, 0);
+        }
+        // IDR: dec_ref_pic_marking carries no_output_of_prior_pics_flag + long_term_reference_flag.
+        // (NalRefIdc != 0 for IDR.)
+        w.WriteBit(0); // no_output_of_prior_pics_flag
+        w.WriteBit(0); // long_term_reference_flag
+        // CABAC: not present for I-slices regardless.
+        ExpGolombWriter.WriteSe(w, sliceQpDelta);
+        if (pps.DeblockingFilterControlPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, disableDeblockingFilterIdc);
+            if (disableDeblockingFilterIdc != 1)
+            {
+                ExpGolombWriter.WriteSe(w, 0); // slice_alpha_c0_offset_div2
+                ExpGolombWriter.WriteSe(w, 0); // slice_beta_offset_div2
+            }
+        }
+    }
+}

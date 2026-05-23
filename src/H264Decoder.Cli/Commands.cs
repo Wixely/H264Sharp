@@ -14,6 +14,11 @@ public static class Commands
     /// <summary>Parse argv and dispatch. Returns a process exit code.</summary>
     public static int Run(string[] args, TextWriter stdout, TextWriter stderr)
     {
+        // encode <in.yuv> <out.h264|out.mp4> --size <W>x<H> [--frames N] [--qp 18]
+        if (args.Length >= 5 && args[0] == "encode")
+        {
+            return EncodeYuv(args, stderr);
+        }
         // --info <in.mp4>
         if (args.Length == 2 && args[0] == "--info")
         {
@@ -39,6 +44,7 @@ public static class Commands
             return DecodeFirstIFrameToFile(args[0], args[1], stderr);
         }
         stderr.WriteLine("Usage:");
+        stderr.WriteLine("  H264Decoder.Cli encode <in.yuv> <out.h264> --size <W>x<H> [--frames N] [--qp 18]");
         stderr.WriteLine("  H264Decoder.Cli <in.h264|in.mp4> <out.yuv|out.png>");
         stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out.png> --at <seconds>");
         stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out.png> --at-pct <0..1>");
@@ -46,6 +52,77 @@ public static class Commands
         stderr.WriteLine("    spec: 'all', '<N>', '<N>-<M>', or comma-separated mix (e.g. '5,10-15,20')");
         stderr.WriteLine("  H264Decoder.Cli --info <in.mp4>");
         return 1;
+    }
+
+    /// <summary>Encode raw YUV 4:2:0 (planar Y/U/V) into Annex-B H.264. Args layout:
+    /// encode &lt;in.yuv&gt; &lt;out.h264&gt; --size WxH [--frames N] [--qp Q]</summary>
+    public static int EncodeYuv(string[] args, TextWriter stderr)
+    {
+        // args[0]="encode", args[1]=in, args[2]=out, then --size WxH, optional --frames N, optional --qp Q.
+        string inPath = args[1];
+        string outPath = args[2];
+        int width = 0, height = 0, frames = 1, qp = 18;
+        for (int i = 3; i + 1 < args.Length; i += 2)
+        {
+            string k = args[i], v = args[i + 1];
+            if (k == "--size")
+            {
+                int sep = v.IndexOf('x');
+                if (sep <= 0
+                    || !int.TryParse(v.AsSpan(0, sep), System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture, out width)
+                    || !int.TryParse(v.AsSpan(sep + 1), System.Globalization.NumberStyles.Integer,
+                            System.Globalization.CultureInfo.InvariantCulture, out height))
+                {
+                    stderr.WriteLine($"invalid --size '{v}' (expected WxH)");
+                    return 4;
+                }
+            }
+            else if (k == "--frames")
+            {
+                if (!int.TryParse(v, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out frames) || frames <= 0)
+                {
+                    stderr.WriteLine($"invalid --frames '{v}'");
+                    return 4;
+                }
+            }
+            else if (k == "--qp")
+            {
+                if (!int.TryParse(v, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out qp) || qp < 0 || qp > 51)
+                {
+                    stderr.WriteLine($"invalid --qp '{v}'");
+                    return 4;
+                }
+            }
+            else
+            {
+                stderr.WriteLine($"unknown option '{k}'");
+                return 4;
+            }
+        }
+        if (width <= 0 || height <= 0)
+        {
+            stderr.WriteLine("--size WxH required");
+            return 4;
+        }
+        if (!File.Exists(inPath))
+        {
+            stderr.WriteLine($"input not found: {inPath}");
+            return 2;
+        }
+        byte[] yuv = File.ReadAllBytes(inPath);
+        int frameBytes = width * height + 2 * (width / 2) * (height / 2);
+        if (yuv.Length < frameBytes * frames)
+        {
+            stderr.WriteLine($"YUV file too small: expected {frameBytes * frames}, got {yuv.Length}");
+            return 3;
+        }
+        byte[] annexB = H264Decoder.Encoder.H264FrameEncoder.EncodeAnnexB(yuv, width, height, qp, frames);
+        File.WriteAllBytes(outPath, annexB);
+        stderr.WriteLine($"encoded {width}x{height} x{frames} @ qp={qp} -> {outPath} ({annexB.Length} bytes)");
+        return 0;
     }
 
     /// <summary>Legacy default — decode the first I-frame.</summary>

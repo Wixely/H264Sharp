@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\H264Decoder\H264Decoder.csproj" />
+    <ProjectReference Include="..\..\src\H264Decoder.Encoder\H264Decoder.Encoder.csproj" />
     <ProjectReference Include="..\..\src\H264Decoder.Cli\H264Decoder.Cli.csproj" />
   </ItemGroup>
 
