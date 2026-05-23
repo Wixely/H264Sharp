@@ -195,11 +195,11 @@ internal static class CabacSliceB
     //   4  B_L0_8x4     : 1 1 0 0 1
     //   5  B_L0_4x8     : 1 1 0 1 0
     //   6  B_L1_8x4     : 1 1 0 1 1
-    //   7  B_L1_4x8     : 1 1 1 1 0
-    //   8  B_Bi_8x4     : 1 1 1 0 0 0
-    //   9  B_Bi_4x8     : 1 1 1 0 0 1
-    //   10 B_L0_4x4     : 1 1 1 0 1 0
-    //   11 B_L1_4x4     : 1 1 1 0 1 1
+    //   7  B_L1_4x8     : 1 1 1 0 0 0
+    //   8  B_Bi_8x4     : 1 1 1 0 0 1
+    //   9  B_Bi_4x8     : 1 1 1 0 1 0
+    //   10 B_L0_4x4     : 1 1 1 0 1 1
+    //   11 B_L1_4x4     : 1 1 1 1 0
     //   12 B_Bi_4x4     : 1 1 1 1 1
     // ctxIdxInc per binIdx: 0→0 (ctx 36), 1→1 (ctx 37),
     //   2→ bin1==1 ? 2 : 3 (ctx 38 or 39), 3+→3 (ctx 39).
@@ -233,20 +233,20 @@ internal static class CabacSliceB
         // Prefix "1 1 1 b3 ..."
         if (b3 == 1)
         {
-            // "1 1 1 1 b4"
+            // "1 1 1 1 b4" -> codes 11..12.
             int b4 = cabac.DecodeBin(39);
-            return b4 == 0 ? BSubMbType.L1_4x8 : BSubMbType.Bi_4x4;
+            return b4 == 0 ? BSubMbType.L1_4x4 : BSubMbType.Bi_4x4;
         }
-        // Prefix "1 1 1 0 b4 b5" -> codes 8..11.
+        // Prefix "1 1 1 0 b4 b5" -> codes 7..10.
         int b4n = cabac.DecodeBin(39);
         int b5 = cabac.DecodeBin(39);
         int idx2 = (b4n << 1) | b5;
         return idx2 switch
         {
-            0 => BSubMbType.Bi_8x4,
-            1 => BSubMbType.Bi_4x8,
-            2 => BSubMbType.L0_4x4,
-            _ => BSubMbType.L1_4x4,
+            0 => BSubMbType.L1_4x8,
+            1 => BSubMbType.Bi_8x4,
+            2 => BSubMbType.Bi_4x8,
+            _ => BSubMbType.L0_4x4,
         };
     }
 
