@@ -742,7 +742,7 @@ internal static class MacroblockReconstructor
                 int n = cw * ch;
                 Span<byte> partOut = partPred[..n];
                 MotionCompensation.ChromaPredict(
-                    refPlane, refPic.ChromaWidth, refPic.ChromaHeight,
+                    refPlane, refPic.ChromaBufferWidth, refPic.ChromaBufferHeight,
                     mbX * 8 + cx, mbY * 8 + cy,
                     part.MvL0X, part.MvL0Y,
                     cw, ch, partOut);
