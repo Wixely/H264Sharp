@@ -191,9 +191,15 @@ public sealed class H264FrameDecoder
             ApplyRefPicListModification(refPicListL1, header.RefPicListModificationL1,
                 dpb, curFrameNum, maxFrameNum, numActiveL1);
         }
-        int width = (int)sps.CroppedWidth;
-        int height = (int)sps.CroppedHeight;
-        var picture = new DecodedPicture(width, height)
+        int croppedWidth = (int)sps.CroppedWidth;
+        int croppedHeight = (int)sps.CroppedHeight;
+        int bufferWidth = (int)sps.PicWidthInSamplesL;
+        int bufferHeight = (int)sps.PicHeightInSamplesL;
+        int cropLeft = (int)(sps.FrameCroppingFlag ? sps.SubWidthC * sps.FrameCropLeftOffset : 0);
+        int cropTop = (int)(sps.FrameCroppingFlag
+            ? sps.SubHeightC * (sps.FrameMbsOnlyFlag ? 1u : 2u) * sps.FrameCropTopOffset
+            : 0);
+        var picture = new DecodedPicture(croppedWidth, croppedHeight, bufferWidth, bufferHeight, cropLeft, cropTop)
         {
             FrameNum = (int)header.FrameNum,
             PicOrderCnt = picOrderCnt,

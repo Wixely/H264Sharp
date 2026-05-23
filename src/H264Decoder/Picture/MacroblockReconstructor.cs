@@ -101,9 +101,9 @@ internal static class MacroblockReconstructor
         int px0 = mbX * 16, py0 = mbY * 16;
         for (int y = 0; y < 16; y++)
             for (int x = 0; x < 16; x++)
-                picture.Y[(py0 + y) * picture.Width + (px0 + x)] = mb.PcmLuma[y * 16 + x];
+                picture.Y[(py0 + y) * picture.BufferWidth + (px0 + x)] = mb.PcmLuma[y * 16 + x];
         int cx0 = mbX * 8, cy0 = mbY * 8;
-        int cStride = picture.ChromaWidth;
+        int cStride = picture.ChromaBufferWidth;
         for (int y = 0; y < 8; y++)
             for (int x = 0; x < 8; x++)
             {
@@ -127,17 +127,17 @@ internal static class MacroblockReconstructor
         {
             int srcY = mbY * 16 - 1;
             int srcX0 = mbX * 16;
-            for (int i = 0; i < 16; i++) top[i] = picture.Y[srcY * picture.Width + srcX0 + i];
+            for (int i = 0; i < 16; i++) top[i] = picture.Y[srcY * picture.BufferWidth + srcX0 + i];
         }
         if (leftAvail)
         {
             int srcX = mbX * 16 - 1;
             int srcY0 = mbY * 16;
-            for (int i = 0; i < 16; i++) left[i] = picture.Y[(srcY0 + i) * picture.Width + srcX];
+            for (int i = 0; i < 16; i++) left[i] = picture.Y[(srcY0 + i) * picture.BufferWidth + srcX];
         }
         if (topLeftAvail)
         {
-            topLeft = picture.Y[(mbY * 16 - 1) * picture.Width + (mbX * 16 - 1)];
+            topLeft = picture.Y[(mbY * 16 - 1) * picture.BufferWidth + (mbX * 16 - 1)];
         }
 
         Span<byte> predBlock = stackalloc byte[256];
@@ -201,7 +201,7 @@ internal static class MacroblockReconstructor
                 {
                     int pred = predBlock[(blkY * 4 + yy) * 16 + (blkX * 4 + xx)];
                     int v = pred + coeffsRaster[yy * 4 + xx];
-                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    picture.Y[(py0 + yy) * picture.BufferWidth + (px0 + xx)] = ClipByte(v);
                 }
         }
     }
@@ -236,15 +236,15 @@ internal static class MacroblockReconstructor
             bool leftAvail = px0 > 0;
             bool topLeftAvail = topAvail && leftAvail;
             bool topRightAvail = ComputeTopRightAvail(i, bx, by, mbX, mbY,
-                picture.Width, leftMb, topMb, topRightMb);
+                picture.BufferWidth, leftMb, topMb, topRightMb);
 
             if (topAvail)
             {
                 int srcY = py0 - 1;
-                for (int k = 0; k < 4; k++) top[k] = picture.Y[srcY * picture.Width + px0 + k];
+                for (int k = 0; k < 4; k++) top[k] = picture.Y[srcY * picture.BufferWidth + px0 + k];
                 if (topRightAvail)
                 {
-                    for (int k = 0; k < 4; k++) top[4 + k] = picture.Y[srcY * picture.Width + px0 + 4 + k];
+                    for (int k = 0; k < 4; k++) top[4 + k] = picture.Y[srcY * picture.BufferWidth + px0 + 4 + k];
                 }
                 else
                 {
@@ -255,10 +255,10 @@ internal static class MacroblockReconstructor
             if (leftAvail)
             {
                 int srcX = px0 - 1;
-                for (int k = 0; k < 4; k++) left[k] = picture.Y[(py0 + k) * picture.Width + srcX];
+                for (int k = 0; k < 4; k++) left[k] = picture.Y[(py0 + k) * picture.BufferWidth + srcX];
             }
             byte topLeft = topLeftAvail
-                ? picture.Y[(py0 - 1) * picture.Width + (px0 - 1)]
+                ? picture.Y[(py0 - 1) * picture.BufferWidth + (px0 - 1)]
                 : (byte)0;
 
             // Predict
@@ -288,7 +288,7 @@ internal static class MacroblockReconstructor
                 for (int xx = 0; xx < 4; xx++)
                 {
                     int v = predBlock[yy * 4 + xx] + coeffsRaster[yy * 4 + xx];
-                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    picture.Y[(py0 + yy) * picture.BufferWidth + (px0 + xx)] = ClipByte(v);
                 }
         }
     }
@@ -323,7 +323,7 @@ internal static class MacroblockReconstructor
             //   i8 == 3 (BR): TR samples are in the right-neighbor MB, not yet decoded.
             bool topRightAvail;
             if (i8 == 0) topRightAvail = topMb != null;
-            else if (i8 == 1) topRightAvail = topRightMb != null && mbX * 16 + 16 < picture.Width;
+            else if (i8 == 1) topRightAvail = topRightMb != null && mbX * 16 + 16 < picture.BufferWidth;
             else if (i8 == 2) topRightAvail = true;
             else topRightAvail = false;
 
@@ -331,10 +331,10 @@ internal static class MacroblockReconstructor
             if (topAvail)
             {
                 int srcY = py0 - 1;
-                for (int k = 0; k < 8; k++) top[k] = picture.Y[srcY * picture.Width + px0 + k];
+                for (int k = 0; k < 8; k++) top[k] = picture.Y[srcY * picture.BufferWidth + px0 + k];
                 if (topRightAvail)
                 {
-                    for (int k = 0; k < 8; k++) top[8 + k] = picture.Y[srcY * picture.Width + px0 + 8 + k];
+                    for (int k = 0; k < 8; k++) top[8 + k] = picture.Y[srcY * picture.BufferWidth + px0 + 8 + k];
                 }
                 else
                 {
@@ -345,9 +345,9 @@ internal static class MacroblockReconstructor
             if (leftAvail)
             {
                 int srcX = px0 - 1;
-                for (int k = 0; k < 8; k++) left[k] = picture.Y[(py0 + k) * picture.Width + srcX];
+                for (int k = 0; k < 8; k++) left[k] = picture.Y[(py0 + k) * picture.BufferWidth + srcX];
             }
-            byte topLeft = topLeftAvail ? picture.Y[(py0 - 1) * picture.Width + (px0 - 1)] : (byte)0;
+            byte topLeft = topLeftAvail ? picture.Y[(py0 - 1) * picture.BufferWidth + (px0 - 1)] : (byte)0;
 
             // Mandatory [1,2,1]/4 filter on neighbor samples.
             IntraPrediction.Intra8x8PredFilter(
@@ -385,7 +385,7 @@ internal static class MacroblockReconstructor
                 for (int xx = 0; xx < 8; xx++)
                 {
                     int v = predBlock[yy * 8 + xx] + coeffsRaster[yy * 8 + xx];
-                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    picture.Y[(py0 + yy) * picture.BufferWidth + (px0 + xx)] = ClipByte(v);
                 }
         }
     }
@@ -541,7 +541,7 @@ internal static class MacroblockReconstructor
             int refIdx = part.RefIdxL0 < refPicListL0.Count ? part.RefIdxL0 : 0;
             var refPic = refPicListL0[refIdx];
             MotionCompensation.LumaPredict(
-                refPic.Y, refPic.Width, refPic.Height,
+                refPic.Y, refPic.BufferWidth, refPic.BufferHeight,
                 mbX * 16 + part.X, mbY * 16 + part.Y,
                 part.MvL0X, part.MvL0Y,
                 part.Width, part.Height, partOut);
@@ -592,7 +592,7 @@ internal static class MacroblockReconstructor
                     {
                         int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
                         int v = pred + coeffsRaster[yy * 4 + xx];
-                        picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                        picture.Y[(py0 + yy) * picture.BufferWidth + (px0 + xx)] = ClipByte(v);
                     }
             }
         }
@@ -626,7 +626,7 @@ internal static class MacroblockReconstructor
                 {
                     int pred = predBlock[(by * 8 + yy) * 16 + (bx * 8 + xx)];
                     int v = pred + coeffsRaster[yy * 8 + xx];
-                    picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                    picture.Y[(py0 + yy) * picture.BufferWidth + (px0 + xx)] = ClipByte(v);
                 }
         }
     }
@@ -711,7 +711,7 @@ internal static class MacroblockReconstructor
         for (int comp = 0; comp < 2; comp++)
         {
             byte[] plane = comp == 0 ? picture.U : picture.V;
-            int stride = picture.ChromaWidth;
+            int stride = picture.ChromaBufferWidth;
             // For each motion partition, do chroma MC on the corresponding 8x8 region scaled to half size.
             foreach (var part in mb.InterPartitions)
             {
@@ -817,7 +817,7 @@ internal static class MacroblockReconstructor
         for (int comp = 0; comp < 2; comp++)
         {
             byte[] plane = comp == 0 ? picture.U : picture.V;
-            int stride = picture.ChromaWidth;
+            int stride = picture.ChromaBufferWidth;
             if (topAvail)
             {
                 int srcY = mbY * 8 - 1;
@@ -933,7 +933,7 @@ internal static class MacroblockReconstructor
             {
                 int ri = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
                 var rp = refL0[ri];
-                MotionCompensation.LumaPredict(rp.Y, rp.Width, rp.Height,
+                MotionCompensation.LumaPredict(rp.Y, rp.BufferWidth, rp.BufferHeight,
                     mbX * 16 + part.X, mbY * 16 + part.Y,
                     part.MvL0X, part.MvL0Y, part.Width, part.Height, p0[..n]);
             }
@@ -943,7 +943,7 @@ internal static class MacroblockReconstructor
                     throw new InvalidOperationException("B-inter L1 reconstruction needs non-empty L1 list");
                 int ri = part.RefIdxL1 < 0 ? 0 : (part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
                 var rp = refL1[ri];
-                MotionCompensation.LumaPredict(rp.Y, rp.Width, rp.Height,
+                MotionCompensation.LumaPredict(rp.Y, rp.BufferWidth, rp.BufferHeight,
                     mbX * 16 + part.X, mbY * 16 + part.Y,
                     part.MvL1X, part.MvL1Y, part.Width, part.Height, p1[..n]);
             }
@@ -1021,7 +1021,7 @@ internal static class MacroblockReconstructor
                     {
                         int pred = predBlock[(by * 4 + yy) * 16 + (bx * 4 + xx)];
                         int v = pred + coeffsRaster[yy * 4 + xx];
-                        picture.Y[(py0 + yy) * picture.Width + (px0 + xx)] = ClipByte(v);
+                        picture.Y[(py0 + yy) * picture.BufferWidth + (px0 + xx)] = ClipByte(v);
                     }
             }
         }
@@ -1043,7 +1043,7 @@ internal static class MacroblockReconstructor
         for (int comp = 0; comp < 2; comp++)
         {
             byte[] plane = comp == 0 ? picture.U : picture.V;
-            int stride = picture.ChromaWidth;
+            int stride = picture.ChromaBufferWidth;
             foreach (var part in mb.BInterPartitions)
             {
                 int cx = part.X / 2, cy = part.Y / 2, cw = part.Width / 2, ch = part.Height / 2;
@@ -1056,7 +1056,7 @@ internal static class MacroblockReconstructor
                     int ri = part.RefIdxL0 < 0 ? 0 : (part.RefIdxL0 < refL0.Count ? part.RefIdxL0 : 0);
                     var rp = refL0[ri];
                     byte[] refPlane = comp == 0 ? rp.U : rp.V;
-                    MotionCompensation.ChromaPredict(refPlane, rp.ChromaWidth, rp.ChromaHeight,
+                    MotionCompensation.ChromaPredict(refPlane, rp.ChromaBufferWidth, rp.ChromaBufferHeight,
                         mbX * 8 + cx, mbY * 8 + cy, part.MvL0X, part.MvL0Y, cw, ch, p0[..n]);
                 }
                 if (useL1)
@@ -1065,7 +1065,7 @@ internal static class MacroblockReconstructor
                     int ri = part.RefIdxL1 < 0 ? 0 : (part.RefIdxL1 < refL1.Count ? part.RefIdxL1 : 0);
                     var rp = refL1[ri];
                     byte[] refPlane = comp == 0 ? rp.U : rp.V;
-                    MotionCompensation.ChromaPredict(refPlane, rp.ChromaWidth, rp.ChromaHeight,
+                    MotionCompensation.ChromaPredict(refPlane, rp.ChromaBufferWidth, rp.ChromaBufferHeight,
                         mbX * 8 + cx, mbY * 8 + cy, part.MvL1X, part.MvL1Y, cw, ch, p1[..n]);
                 }
                 if (useL0 && useL1)

@@ -101,7 +101,7 @@ public static class DeblockingFilter
             for (int comp = 0; comp < 2; comp++)
             {
                 byte[] plane = comp == 0 ? pic.U : pic.V;
-                int stride = pic.ChromaWidth;
+                int stride = pic.ChromaBufferWidth;
                 for (int x = 0; x < 8; x += 4)
                 {
                     bool isMbEdge = x == 0;
@@ -153,7 +153,7 @@ public static class DeblockingFilter
             for (int row = 0; row < 4; row++)
             {
                 int y = mbY0 + seg * 4 + row;
-                int b = y * pic.Width + mbX0Pixels + x;
+                int b = y * pic.BufferWidth + mbX0Pixels + x;
                 FilterEdge1D(pic.Y, p3: b - 4, p2: b - 3, p1: b - 2, p0: b - 1,
                                     q0: b, q1: b + 1, q2: b + 2, q3: b + 3,
                                     alpha, beta, indexA, bS, isChroma: false);
@@ -166,7 +166,7 @@ public static class DeblockingFilter
     {
         (int alpha, int beta, int indexA) = GetAlphaBeta(qP, aOff, bOff);
         if (alpha == 0 && beta == 0) return;
-        int s = pic.Width;
+        int s = pic.BufferWidth;
         for (int seg = 0; seg < 4; seg++)
         {
             int qBlkY = y / 4;

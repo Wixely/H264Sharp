@@ -6,10 +6,25 @@ namespace H264Decoder.Picture;
 /// </summary>
 public sealed class DecodedPicture
 {
+    /// <summary>Displayable (cropped) luma width — what consumers should treat as the image size.</summary>
     public int Width { get; }
+    /// <summary>Displayable (cropped) luma height.</summary>
     public int Height { get; }
     public int ChromaWidth => Width / 2;
     public int ChromaHeight => Height / 2;
+
+    /// <summary>Buffer-allocated luma width (MB-aligned encoded width). Equals Width when no crop is needed.
+    /// Y plane is stored at this stride; arithmetic that walks rows must use BufferWidth, not Width.</summary>
+    public int BufferWidth { get; }
+    /// <summary>Buffer-allocated luma height (MB-aligned encoded height).</summary>
+    public int BufferHeight { get; }
+    public int ChromaBufferWidth => BufferWidth / 2;
+    public int ChromaBufferHeight => BufferHeight / 2;
+
+    /// <summary>Top-left luma offset of the visible region within the encoded buffer (cropping offsets).</summary>
+    public int CropLeft { get; }
+    public int CropTop { get; }
+
     public byte[] Y { get; }
     public byte[] U { get; }
     public byte[] V { get; }
@@ -46,13 +61,24 @@ public sealed class DecodedPicture
     public int LongTermPicNum { get; set; }
 
     public DecodedPicture(int width, int height)
+        : this(width, height, width, height, 0, 0) { }
+
+    public DecodedPicture(int croppedWidth, int croppedHeight, int bufferWidth, int bufferHeight, int cropLeft, int cropTop)
     {
-        if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0)
+        if (croppedWidth <= 0 || croppedHeight <= 0 || (croppedWidth & 1) != 0 || (croppedHeight & 1) != 0)
             throw new ArgumentException("width and height must be positive and even");
-        Width = width;
-        Height = height;
-        Y = new byte[width * height];
-        U = new byte[ChromaWidth * ChromaHeight];
-        V = new byte[ChromaWidth * ChromaHeight];
+        if (bufferWidth < croppedWidth || bufferHeight < croppedHeight)
+            throw new ArgumentException("buffer dimensions must be >= cropped dimensions");
+        if ((bufferWidth & 1) != 0 || (bufferHeight & 1) != 0)
+            throw new ArgumentException("buffer dimensions must be even (4:2:0 requires even)");
+        Width = croppedWidth;
+        Height = croppedHeight;
+        BufferWidth = bufferWidth;
+        BufferHeight = bufferHeight;
+        CropLeft = cropLeft;
+        CropTop = cropTop;
+        Y = new byte[bufferWidth * bufferHeight];
+        U = new byte[(bufferWidth / 2) * (bufferHeight / 2)];
+        V = new byte[(bufferWidth / 2) * (bufferHeight / 2)];
     }
 }

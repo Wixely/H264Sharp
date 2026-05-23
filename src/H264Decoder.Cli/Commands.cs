@@ -49,7 +49,7 @@ public static class Commands
         var decoder = new H264FrameDecoder();
         DecodedPicture pic;
         try { pic = decoder.DecodeFirstIFrame(stream); }
-        catch (Exception ex) { stderr.WriteLine($"decode failed: {ex.Message}"); return 3; }
+        catch (Exception ex) { PrintException("decode failed", ex, stderr); return 3; }
         WritePicture(pic, outPath, stderr);
         return 0;
     }
@@ -85,7 +85,7 @@ public static class Commands
         using var fs = File.OpenRead(inPath);
         Mp4SampleStream stream;
         try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
-        catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
+        catch (Exception ex) { PrintException("MP4 parse failed", ex, stderr); return 3; }
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
 
         // Prefer mvhd duration; fall back to the last sample's composition time.
@@ -107,7 +107,7 @@ public static class Commands
         using var fs = File.OpenRead(inPath);
         Mp4SampleStream stream;
         try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
-        catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
+        catch (Exception ex) { PrintException("MP4 parse failed", ex, stderr); return 3; }
         if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
         return ThumbnailAtTimeForStream(stream, outPath, t, stderr);
     }
@@ -132,7 +132,7 @@ public static class Commands
         var decoder = new H264FrameDecoder();
         List<DecodedPicture> frames;
         try { frames = decoder.DecodeAllFrames(nals); }
-        catch (Exception ex) { stderr.WriteLine($"decode failed: {ex.Message}"); return 3; }
+        catch (Exception ex) { PrintException("decode failed", ex, stderr); return 3; }
 
         // frames is sorted by POC (display order); the MP4 sample table indexes decode order.
         // Look up by DecodeOrderIndex so B-pyramid clips don't pick the wrong frame.
@@ -156,7 +156,7 @@ public static class Commands
         using var fs = File.OpenRead(inPath);
         Mp4SampleStream stream;
         try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
-        catch (Exception ex) { stderr.WriteLine($"MP4 parse failed: {ex.Message}"); return 3; }
+        catch (Exception ex) { PrintException("MP4 parse failed", ex, stderr); return 3; }
 
         int frames = stream.Samples.Count;
         double dur = stream.DurationSeconds;
@@ -190,7 +190,7 @@ public static class Commands
                 ? AnnexBReader.SplitNalUnits(bytes)
                 : AvccReader.SplitNalUnits(bytes);
         }
-        catch (Exception ex) { stderr.WriteLine($"parse failed: {ex.Message}"); return 3; }
+        catch (Exception ex) { PrintException("parse failed", ex, stderr); return 3; }
 
         SequenceParameterSet? sps = null;
         int slices = 0;
@@ -280,6 +280,25 @@ public static class Commands
             read += n;
         }
         return read >= 8 && LooksLikeMp4(head);
+    }
+
+    /// <summary>Print exception with type + first stack frame; full stack trace when H264_VERBOSE is set.</summary>
+    private static void PrintException(string label, Exception ex, TextWriter stderr)
+    {
+        string typeName = ex.GetType().Name;
+        stderr.WriteLine($"{label}: [{typeName}] {ex.Message}");
+        bool verbose = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("H264_VERBOSE"));
+        if (verbose)
+        {
+            stderr.WriteLine(ex.ToString());
+        }
+        else if (ex.StackTrace is { } trace)
+        {
+            // First frame only — usually points to the throw site.
+            string? firstFrame = trace.Split('\n').FirstOrDefault()?.Trim();
+            if (firstFrame is not null) stderr.WriteLine($"  {firstFrame}");
+            stderr.WriteLine("  (set H264_VERBOSE=1 for full stack trace)");
+        }
     }
 
     private static bool LooksLikeMp4(ReadOnlySpan<byte> bytes)

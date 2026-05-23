@@ -56,16 +56,21 @@ public static class YuvToRgb
         }
 
         int W = pic.Width, H = pic.Height;
-        int cW = pic.ChromaWidth;
+        int bw = pic.BufferWidth;
+        int cbw = pic.ChromaBufferWidth;
+        int cropL = pic.CropLeft, cropT = pic.CropTop;
+        int cCropL = cropL / 2, cCropT = cropT / 2;
         for (int y = 0; y < H; y++)
         {
-            int cy = y >> 1;
+            int srcY = cropT + y;
+            int cy = (cCropT + (y >> 1));
             for (int x = 0; x < W; x++)
             {
-                int cx = x >> 1;
-                int yv = pic.Y[y * W + x] - 16;
-                int cb = pic.U[cy * cW + cx] - 128;
-                int cr = pic.V[cy * cW + cx] - 128;
+                int srcX = cropL + x;
+                int cx = cCropL + (x >> 1);
+                int yv = pic.Y[srcY * bw + srcX] - 16;
+                int cb = pic.U[cy * cbw + cx] - 128;
+                int cr = pic.V[cy * cbw + cx] - 128;
                 int r = (kY * yv + kRCr * cr + 128) >> 8;
                 int g = (kY * yv + kGCb * cb + kGCr * cr + 128) >> 8;
                 int b = (kY * yv + kBCb * cb + 128) >> 8;
