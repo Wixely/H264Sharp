@@ -509,6 +509,24 @@ public static class FfmpegFixture
         return new Sample(mp4, yuv, W, H);
     }
 
+    /// <summary>Two-frame 128x96 testsrc clip encoded with x264 -x264-params "slices=2" so each
+    /// coded picture is split into 2 slices (first_mb_in_slice == 0 for slice 0, > 0 for slice 1).
+    /// CAVLC, baseline, no B-frames, deblocking disabled — minimum-complexity multi-slice
+    /// regression. Apple VideoToolbox produces similar multi-slice outputs (the iPhone-thumbnail
+    /// artifact case); this fixture exercises the access-unit boundary detection logic.</summary>
+    public static Sample TwoFramesMultiSlice128x96Cavlc()
+    {
+        const int W = 128, H = 96;
+        string h264 = Path.Combine(SamplesDirectory, "two_frames_multislice_128x96_cavlc.h264");
+        string yuv = Path.Combine(SamplesDirectory, "two_frames_multislice_128x96_cavlc.yuv");
+        EnsureGenerated(h264, yuv,
+            $"-y -f lavfi -i \"testsrc=s={W}x{H}:r=2:d=1,format=yuv420p\" -frames:v 2 " +
+            "-c:v libx264 -profile:v baseline -bf 0 -coder 0 -keyint_min 99 -g 99 -an " +
+            $"-x264-params \"slices=2:no-deblock=1\" -f h264 \"{h264}\"",
+            $"-y -i \"{h264}\" -frames:v 2 -vsync passthrough -f rawvideo -pix_fmt yuv420p \"{yuv}\"");
+        return new Sample(h264, yuv, W, H);
+    }
+
     /// <summary>Two-frame 64x48 red clip muxed as fragmented MP4 (moof/traf/trun, empty_moov,
     /// default_base_moof). Used to exercise the fragmented MP4 parsing path.</summary>
     public static Sample FragmentedMp4Red64x48()

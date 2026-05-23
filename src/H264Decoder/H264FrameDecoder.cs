@@ -57,6 +57,23 @@ public sealed class H264FrameDecoder
     public DecodedPicture DecodeFirstIFrame(List<NalUnit> nals) =>
         DecodeAllFrames(nals).First();
 
+    /// <summary>Picture-scope state shared across all slices of a single coded frame
+    /// (access unit). Built by <see cref="BeginPicture"/> on the slice whose
+    /// first_mb_in_slice == 0 and reused by every continuation slice of the same
+    /// frame. Per spec §7.4.1.2: an access unit (coded frame) can contain multiple
+    /// slices; picture-level params (POC, ref lists) are constant within an AU.</summary>
+    private sealed class PictureContext
+    {
+        public required DecodedPicture Picture { get; init; }
+        public required Macroblock[] Mbs { get; init; }
+        public required SliceHeader FirstSliceHeader { get; init; }
+        public required List<DecodedPicture> RefPicListL0 { get; init; }
+        public required List<DecodedPicture> RefPicListL1 { get; init; }
+        public required int MbsPerRow { get; init; }
+        public required int TotalMbs { get; init; }
+        public required bool IsReference { get; init; }
+    }
+
     public List<DecodedPicture> DecodeAllFrames(List<NalUnit> nals)
     {
         SequenceParameterSet? sps = null;
@@ -75,6 +92,10 @@ public sealed class H264FrameDecoder
         // Monotonic counter assigned to each decoded picture; used by callers to map
         // an MP4-sample-table index back into the POC-sorted output list.
         int decodeOrderCounter = 0;
+        // The picture currently being built up. Multiple slices may write into it
+        // before it is finalized; finalize on the next first_mb_in_slice==0 slice
+        // or after the final NAL.
+        PictureContext? currentPicture = null;
 
         foreach (var n in nals)
         {
@@ -92,26 +113,48 @@ public sealed class H264FrameDecoder
                     {
                         throw new InvalidDataException("slice encountered before SPS/PPS");
                     }
-                    if (n.NalUnitType == NalUnitType.SliceIdr)
+                    // Parse the full slice header. Cheap and re-used for both AU
+                    // boundary detection (first_mb_in_slice) and the actual MB decode.
+                    SliceHeader header = SliceHeader.Parse(n.Rbsp.Span, n, sps, pps);
+                    // Access-unit boundary rule (spec §7.4.1.2, simplified): a slice
+                    // with first_mb_in_slice == 0 starts a new coded picture; any
+                    // other slice is a continuation of the current picture.
+                    if (header.FirstMbInSlice == 0)
                     {
-                        // IDR clears the DPB (per spec §8.2.5.1) and resets POC state.
-                        dpb.Clear();
-                        prevPicOrderCntMsb = 0;
-                        prevPicOrderCntLsb = 0;
-                        maxLongTermFrameIdx = -1;
+                        if (currentPicture is not null)
+                        {
+                            FinalizePicture(currentPicture, pps, dpb, sps,
+                                ref maxLongTermFrameIdx, outputs, ref decodeOrderCounter);
+                        }
+                        if (n.NalUnitType == NalUnitType.SliceIdr)
+                        {
+                            // IDR clears the DPB (per spec §8.2.5.1) and resets POC state.
+                            dpb.Clear();
+                            prevPicOrderCntMsb = 0;
+                            prevPicOrderCntLsb = 0;
+                            maxLongTermFrameIdx = -1;
+                        }
+                        currentPicture = BeginPicture(n, header, sps, pps, dpb,
+                            ref prevPicOrderCntMsb, ref prevPicOrderCntLsb);
                     }
-                    SliceHeader hdr;
-                    DecodedPicture pic = DecodeSlice(n, sps, pps, dpb,
-                        ref prevPicOrderCntMsb, ref prevPicOrderCntLsb, out hdr);
-                    pic.DecodeOrderIndex = decodeOrderCounter++;
-                    outputs.Add(pic);
-                    if (n.NalRefIdc != 0)
+                    else
                     {
-                        ApplyDecRefPicMarking(pic, hdr, dpb, sps,
-                            ref maxLongTermFrameIdx);
+                        if (currentPicture is null)
+                        {
+                            throw new InvalidDataException(
+                                "continuation slice (first_mb_in_slice > 0) without a current picture");
+                        }
                     }
+                    DecodeSliceMacroblocks(n, sps, pps, header, currentPicture);
                     break;
             }
+        }
+
+        // Finalize the trailing picture so its slices are emitted.
+        if (currentPicture is not null)
+        {
+            FinalizePicture(currentPicture, pps!, dpb, sps!,
+                ref maxLongTermFrameIdx, outputs, ref decodeOrderCounter);
         }
 
         if (outputs.Count == 0) throw new InvalidDataException("no slices in bitstream");
@@ -121,14 +164,15 @@ public sealed class H264FrameDecoder
         return outputs;
     }
 
-    private DecodedPicture DecodeSlice(
-        NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps,
+    /// <summary>Allocate the picture, compute its POC, and build the reference picture lists.
+    /// Called once per access unit (coded frame) — on the slice with first_mb_in_slice == 0.
+    /// Continuation slices reuse the returned <see cref="PictureContext"/>.</summary>
+    private static PictureContext BeginPicture(
+        NalUnit nal, SliceHeader header,
+        SequenceParameterSet sps, PictureParameterSet pps,
         List<DecodedPicture> dpb,
-        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb,
-        out SliceHeader header)
+        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb)
     {
-        header = SliceHeader.Parse(nal.Rbsp.Span, nal, sps, pps);
-
         bool isPSlice = header.SliceType == SliceType.P;
         bool isBSlice = header.SliceType == SliceType.B;
         if (isPSlice && dpb.Count == 0)
@@ -140,13 +184,13 @@ public sealed class H264FrameDecoder
             throw new InvalidDataException("B-slice with empty DPB");
         }
 
-        // Compute POC (spec §8.2.1) for this picture. We update prev* state below
-        // after computing so reference-list construction can use this picture's POC.
+        // Compute POC (spec §8.2.1) for this picture. Only the first slice in an AU
+        // computes POC; continuation slices inherit it from the picture context.
         int picOrderCnt = ComputePicOrderCnt(header, sps,
             ref prevPicOrderCntMsb, ref prevPicOrderCntLsb, nal.NalRefIdc != 0);
 
         // Update PicNum / LongTermPicNum on each DPB entry relative to the current frame_num
-        // (spec §8.2.4.1). Short-term: PicNum = FrameNum if no wrap, else FrameNum - MaxFrameNum.
+        // (spec §8.2.4.1).
         int maxFrameNum = 1 << ((int)sps.Log2MaxFrameNumMinus4 + 4);
         int curFrameNum = (int)header.FrameNum;
         foreach (var refPic in dpb)
@@ -199,20 +243,81 @@ public sealed class H264FrameDecoder
         int cropTop = (int)(sps.FrameCroppingFlag
             ? sps.SubHeightC * (sps.FrameMbsOnlyFlag ? 1u : 2u) * sps.FrameCropTopOffset
             : 0);
+        int mbsPerRow = (int)sps.PicWidthInMbs;
+        int totalMbs = mbsPerRow * (int)sps.PicHeightInMbs;
         var picture = new DecodedPicture(croppedWidth, croppedHeight, bufferWidth, bufferHeight, cropLeft, cropTop)
         {
             FrameNum = (int)header.FrameNum,
             PicOrderCnt = picOrderCnt,
-            MbsPerRow = (int)sps.PicWidthInMbs,
+            MbsPerRow = mbsPerRow,
         };
+        return new PictureContext
+        {
+            Picture = picture,
+            Mbs = new Macroblock[totalMbs],
+            FirstSliceHeader = header,
+            RefPicListL0 = refPicListL0,
+            RefPicListL1 = refPicListL1,
+            MbsPerRow = mbsPerRow,
+            TotalMbs = totalMbs,
+            IsReference = nal.NalRefIdc != 0,
+        };
+    }
+
+    /// <summary>Finalize a picture once all its slices have been decoded: apply the
+    /// in-loop deblocking filter across the full MB grid (spec §8.7 — runs once per
+    /// picture, not per slice), assign decode-order index, output the picture, and
+    /// push it into the DPB if it is a reference. Deblocking parameters come from
+    /// the first slice's header — multi-slice frames in our subset share these.</summary>
+    private void FinalizePicture(
+        PictureContext ctx, PictureParameterSet pps,
+        List<DecodedPicture> dpb, SequenceParameterSet sps,
+        ref int maxLongTermFrameIdx,
+        List<DecodedPicture> outputs, ref int decodeOrderCounter)
+    {
+        SliceHeader header = ctx.FirstSliceHeader;
+        if (header.DisableDeblockingFilterIdc != 1)
+        {
+            bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
+            DeblockingFilter.Apply(ctx.Picture, ctx.Mbs, ctx.MbsPerRow,
+                pps.ChromaQpIndexOffset,
+                header.SliceAlphaC0OffsetDiv2 * 2,
+                header.SliceBetaOffsetDiv2 * 2,
+                filterMbEdges);
+        }
+        LastMacroblocks = ctx.Mbs;
+        ctx.Picture.Macroblocks = ctx.Mbs;
+        ctx.Picture.DecodeOrderIndex = decodeOrderCounter++;
+        outputs.Add(ctx.Picture);
+        if (ctx.IsReference)
+        {
+            ApplyDecRefPicMarking(ctx.Picture, header, dpb, sps, ref maxLongTermFrameIdx);
+        }
+    }
+
+    /// <summary>Decode the MBs carried by a single slice into the picture being built.
+    /// The slice's own header drives entropy mode, QP, per-MB parsing path (I/P/B,
+    /// CAVLC/CABAC), and end-of-slice termination. MBs are written into the picture's
+    /// shared <c>mbs[]</c> starting at <c>first_mb_in_slice</c>.</summary>
+    private void DecodeSliceMacroblocks(
+        NalUnit nal, SequenceParameterSet sps, PictureParameterSet pps,
+        SliceHeader header, PictureContext ctx)
+    {
+        bool isPSlice = header.SliceType == SliceType.P;
+        bool isBSlice = header.SliceType == SliceType.B;
 
         var reader = new BitReader(nal.Rbsp.Span);
         SkipSliceHeader(ref reader, nal, sps, pps);
 
-        int mbsPerRow = (int)sps.PicWidthInMbs;
-        int totalMbs = mbsPerRow * (int)sps.PicHeightInMbs;
+        DecodedPicture picture = ctx.Picture;
+        Macroblock[] mbs = ctx.Mbs;
+        List<DecodedPicture> refPicListL0 = ctx.RefPicListL0;
+        List<DecodedPicture> refPicListL1 = ctx.RefPicListL1;
+        int mbsPerRow = ctx.MbsPerRow;
+        int totalMbs = ctx.TotalMbs;
+        // QPY is initialized per spec §7.4.5.1 from the slice's own slice_qp_delta;
+        // mb_qp_delta deltas chain only within a slice, not across slices.
         int qpY = header.SliceQpY(pps);
-        Macroblock[] mbs = new Macroblock[totalMbs];
         bool implicitBipred = isBSlice && pps.WeightedBipredIdc == 2;
         bool explicitBipred = isBSlice && pps.WeightedBipredIdc == 1;
         // Temporal direct mode context — built once per B-slice. Only valid for direct_spatial=0.
@@ -223,7 +328,7 @@ public sealed class H264FrameDecoder
             for (int i = 0; i < refPicListL0.Count; i++) l0Pocs[i] = refPicListL0[i].PicOrderCnt;
             tdCtx = new TemporalDirectContext
             {
-                CurrentPoc = picOrderCnt,
+                CurrentPoc = picture.PicOrderCnt,
                 Pic1Poc = refPicListL1[0].PicOrderCnt,
                 L0Pocs = l0Pocs,
             };
@@ -236,99 +341,97 @@ public sealed class H264FrameDecoder
         {
             DecodeSliceCabac(nal, sps, pps, header, ref reader, mbs, picture, refPicListL0, refPicListL1,
                 mbsPerRow, totalMbs, ref qpY, addr, implicitBipred, explicitBipred, tdCtx);
-            if (header.DisableDeblockingFilterIdc != 1)
-            {
-                bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
-                DeblockingFilter.Apply(picture, mbs, mbsPerRow,
-                    pps.ChromaQpIndexOffset,
-                    header.SliceAlphaC0OffsetDiv2 * 2,
-                    header.SliceBetaOffsetDiv2 * 2,
-                    filterMbEdges);
-            }
-            LastMacroblocks = mbs;
-            picture.Macroblocks = mbs;
-            return picture;
+            return;
         }
 
-        int mbSkipRun = 0;
-        if (isPSlice || isBSlice)
-        {
-            mbSkipRun = (int)ExpGolomb.ReadUe(ref reader);
-        }
-
+        // CAVLC slice_data loop (spec §7.3.4). End-of-slice is signalled by
+        // more_rbsp_data() returning false — only the rbsp_trailing_bits remain —
+        // NOT by reaching totalMbs. That distinction matters for multi-slice frames
+        // where one slice covers only a subset of the picture's macroblocks. For
+        // P/B slices, an mb_skip_run is read before each potential coded MB; the
+        // optional coded MB is parsed only when more_rbsp_data() is still true.
+        int firstMbInSlice = (int)header.FirstMbInSlice;
         while (addr < totalMbs)
         {
-            int mbX = addr % mbsPerRow;
-            int mbY = addr / mbsPerRow;
-
-            Macroblock? leftMb = mbX > 0 ? mbs[addr - 1] : null;
-            Macroblock? topMb = mbY > 0 ? mbs[addr - mbsPerRow] : null;
-            Macroblock? topRightMb = (mbY > 0 && mbX + 1 < mbsPerRow)
-                ? mbs[addr - mbsPerRow + 1]
-                : null;
-            Macroblock? topLeftMb = (mbY > 0 && mbX > 0)
-                ? mbs[addr - mbsPerRow - 1]
-                : null;
-
-            if (isPSlice && mbSkipRun > 0)
-            {
-                // P_Skip: derive MV per spec §8.4.1.1 from neighbors, then treat as
-                // P_L0_16x16 with refIdx=0 + that MV + zero residual.
-                (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
-                Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
-                mbs[addr] = skipMb;
-                MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);
-                mbSkipRun--;
-                addr++;
-                continue;
-            }
-
-            if (isBSlice && mbSkipRun > 0)
-            {
-                Macroblock? colMb = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
-                Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx);
-                mbs[addr] = skipMb;
-                MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
-                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
-                    implicitBipred, explicitBipred);
-                mbSkipRun--;
-                addr++;
-                continue;
-            }
-
-            Macroblock? colMbInter = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
-            Macroblock mb = MacroblockParser.Parse(
-                ref reader, sps, pps, header,
-                leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY, colMbInter, tdCtx);
-            mbs[addr] = mb;
-
-            MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
-                pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
-                implicitBipred, explicitBipred);
-
-            addr++;
-
-            // In CAVLC P-slices, after each non-skipped MB we read another mb_skip_run.
-            if ((isPSlice || isBSlice) && addr < totalMbs)
+            int mbSkipRun = 0;
+            if (isPSlice || isBSlice)
             {
                 mbSkipRun = (int)ExpGolomb.ReadUe(ref reader);
             }
-        }
+            // Process the skip-run portion of this iteration.
+            for (int s = 0; s < mbSkipRun && addr < totalMbs; s++)
+            {
+                int mbX = addr % mbsPerRow;
+                int mbY = addr / mbsPerRow;
+                Macroblock? leftMb = GetNeighborInSlice(mbs, mbX > 0 ? addr - 1 : -1, firstMbInSlice);
+                Macroblock? topMb = GetNeighborInSlice(mbs, mbY > 0 ? addr - mbsPerRow : -1, firstMbInSlice);
+                Macroblock? topRightMb = GetNeighborInSlice(mbs,
+                    (mbY > 0 && mbX + 1 < mbsPerRow) ? addr - mbsPerRow + 1 : -1, firstMbInSlice);
+                Macroblock? topLeftMb = GetNeighborInSlice(mbs,
+                    (mbY > 0 && mbX > 0) ? addr - mbsPerRow - 1 : -1, firstMbInSlice);
+                if (isPSlice)
+                {
+                    // P_Skip: derive MV per spec §8.4.1.1 from neighbors, then treat as
+                    // P_L0_16x16 with refIdx=0 + that MV + zero residual.
+                    (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
+                    Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
+                    mbs[addr] = skipMb;
+                    MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);
+                }
+                else
+                {
+                    Macroblock? colMb = GetColocatedMb(refPicListL1, addr);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx);
+                    mbs[addr] = skipMb;
+                    MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
+                        pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
+                        implicitBipred, explicitBipred);
+                }
+                addr++;
+            }
+            if (addr >= totalMbs) break;
+            // Spec §7.3.4: a coded macroblock_layer() follows the skip-run only when
+            // more_rbsp_data() is true. False here means the slice ended right after the
+            // skip-run (common at slice tail).
+            if ((isPSlice || isBSlice) && !reader.MoreRbspData()) break;
 
-        if (header.DisableDeblockingFilterIdc != 1)
-        {
-            bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
-            DeblockingFilter.Apply(picture, mbs, mbsPerRow,
-                pps.ChromaQpIndexOffset,
-                header.SliceAlphaC0OffsetDiv2 * 2,
-                header.SliceBetaOffsetDiv2 * 2,
-                filterMbEdges);
+            // Parse one coded MB.
+            {
+                int mbX = addr % mbsPerRow;
+                int mbY = addr / mbsPerRow;
+                Macroblock? leftMb = GetNeighborInSlice(mbs, mbX > 0 ? addr - 1 : -1, firstMbInSlice);
+                Macroblock? topMb = GetNeighborInSlice(mbs, mbY > 0 ? addr - mbsPerRow : -1, firstMbInSlice);
+                Macroblock? topRightMb = GetNeighborInSlice(mbs,
+                    (mbY > 0 && mbX + 1 < mbsPerRow) ? addr - mbsPerRow + 1 : -1, firstMbInSlice);
+                Macroblock? topLeftMb = GetNeighborInSlice(mbs,
+                    (mbY > 0 && mbX > 0) ? addr - mbsPerRow - 1 : -1, firstMbInSlice);
+                Macroblock? colMbInter = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
+                Macroblock mb = MacroblockParser.Parse(
+                    ref reader, sps, pps, header,
+                    leftMb, topMb, topRightMb, topLeftMb, addr, ref qpY, colMbInter, tdCtx);
+                mbs[addr] = mb;
+                MacroblockReconstructor.Reconstruct(mb, picture, mbX, mbY,
+                    pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
+                    implicitBipred, explicitBipred);
+                addr++;
+            }
+            if (addr >= totalMbs) break;
+            // I-slice end-of-slice check (no mb_skip_run on next iter): if no more
+            // rbsp_data, the slice ends here. P/B slices re-check at top via the next
+            // mb_skip_run + more_rbsp_data check, so this guard suffices for I as well.
+            if (!isPSlice && !isBSlice && !reader.MoreRbspData()) break;
         }
+    }
 
-        LastMacroblocks = mbs;
-        picture.Macroblocks = mbs;
-        return picture;
+    /// <summary>Return the neighbor macroblock at <paramref name="addr"/>, or null when the
+    /// neighbor lies in a different slice (spec §6.4.11.1 — neighbouring MB N is unavailable
+    /// when N does not belong to the same slice as the current MB). Slices are contiguous in
+    /// raster MB order in our subset, so "different slice" means <c>addr &lt; firstMbInSlice</c>.</summary>
+    private static Macroblock? GetNeighborInSlice(Macroblock[] mbs, int addr, int firstMbInSlice)
+    {
+        if (addr < 0 || addr < firstMbInSlice) return null;
+        return mbs[addr];
     }
 
     /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.</summary>
@@ -381,7 +484,9 @@ public sealed class H264FrameDecoder
         // CABAC alignment: consume one-bits up to byte boundary (spec §7.3.4 — cabac_alignment_one_bit).
         while ((reader.BitPosition & 7) != 0) reader.ReadBit();
 
-        // Initialize contexts.
+        // Initialize contexts. Per spec §9.3.1.1 each slice re-initializes the CABAC
+        // engine from scratch — even within a multi-slice picture, neither contexts
+        // nor codIRange/codIOffset carry across slices.
         var contexts = new CabacContexts(CabacInitTable.ContextCount);
         int model = header.SliceType == SliceType.I ? 0 : 1 + (int)header.CabacInitIdc;
         int sliceQp = header.SliceQpY(pps);
@@ -403,16 +508,20 @@ public sealed class H264FrameDecoder
         }
 
         int prevMbQpDeltaState = 0; // CABAC state for mb_qp_delta binIdx 0 ctxIdxInc
+        int firstMbInSlice = addr;
 
         while (addr < totalMbs)
         {
             int mbX = addr % mbsPerRow;
             int mbY = addr / mbsPerRow;
             if (CabacTrace.Enabled) CabacTrace.Mark($"MB {addr} ({mbX},{mbY}) bins-so-far={CabacTrace.BinCount}");
-            Macroblock? leftMb = mbX > 0 ? mbs[addr - 1] : null;
-            Macroblock? topMb = mbY > 0 ? mbs[addr - mbsPerRow] : null;
-            Macroblock? topRightMb = (mbY > 0 && mbX + 1 < mbsPerRow) ? mbs[addr - mbsPerRow + 1] : null;
-            Macroblock? topLeftMb = (mbY > 0 && mbX > 0) ? mbs[addr - mbsPerRow - 1] : null;
+            // Spec §6.4.11.1: neighbouring MBs that lie in an earlier slice are unavailable.
+            Macroblock? leftMb = GetNeighborInSlice(mbs, mbX > 0 ? addr - 1 : -1, firstMbInSlice);
+            Macroblock? topMb = GetNeighborInSlice(mbs, mbY > 0 ? addr - mbsPerRow : -1, firstMbInSlice);
+            Macroblock? topRightMb = GetNeighborInSlice(mbs,
+                (mbY > 0 && mbX + 1 < mbsPerRow) ? addr - mbsPerRow + 1 : -1, firstMbInSlice);
+            Macroblock? topLeftMb = GetNeighborInSlice(mbs,
+                (mbY > 0 && mbX > 0) ? addr - mbsPerRow - 1 : -1, firstMbInSlice);
 
             int mbSkipFlag = 0;
             if (isPSlice || isBSlice)

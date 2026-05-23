@@ -58,7 +58,7 @@ internal static class MacroblockReconstructor
         }
         if (mb.Type.PredMode == MbPartPredMode.Intra16x16)
         {
-            ReconstructLumaIntra16x16(mb, picture, mbX, mbY);
+            ReconstructLumaIntra16x16(mb, picture, mbX, mbY, leftMb, topMb);
         }
         else if (mb.Type.PredMode == MbPartPredMode.Intra4x4)
         {
@@ -91,7 +91,7 @@ internal static class MacroblockReconstructor
         }
         else
         {
-            ReconstructChroma(mb, picture, mbX, mbY, qPc);
+            ReconstructChroma(mb, picture, mbX, mbY, qPc, leftMb, topMb);
         }
     }
 
@@ -114,13 +114,17 @@ internal static class MacroblockReconstructor
 
     // ---------------- Luma (Intra_16x16) ----------------
     private static void ReconstructLumaIntra16x16(
-        Macroblock mb, DecodedPicture picture, int mbX, int mbY)
+        Macroblock mb, DecodedPicture picture, int mbX, int mbY,
+        Macroblock? leftMb, Macroblock? topMb)
     {
-        // Gather luma neighbor samples from the already-decoded picture.
+        // Gather luma neighbor samples from the already-decoded picture. Per spec
+        // §6.4.11.1, a neighbor MB in a different slice is unavailable — we receive
+        // null for cross-slice neighbors here, so use the MB pointers rather than
+        // raw mbX/mbY > 0 checks.
         Span<byte> top = stackalloc byte[16];
         Span<byte> left = stackalloc byte[16];
-        bool topAvail = mbY > 0;
-        bool leftAvail = mbX > 0;
+        bool topAvail = topMb != null;
+        bool leftAvail = leftMb != null;
         bool topLeftAvail = topAvail && leftAvail;
         byte topLeft = 0;
         if (topAvail)
@@ -231,10 +235,17 @@ internal static class MacroblockReconstructor
                 : (raw < predicted ? raw : raw + 1);
             mb.Intra4x4Mode[i] = actual;
 
-            // Gather neighbor samples (top, top-right, left, top-left).
-            bool topAvail = py0 > 0;
-            bool leftAvail = px0 > 0;
-            bool topLeftAvail = topAvail && leftAvail;
+            // Gather neighbor samples (top, top-right, left, top-left). At MB-internal
+            // 4x4 boundaries the neighbor is always in the current MB; at MB edges it
+            // must come from the matching neighbor MB, which is null for cross-slice
+            // (spec §6.4.11.1) and thus unavailable.
+            bool topAvail = by > 0 || topMb != null;
+            bool leftAvail = bx > 0 || leftMb != null;
+            bool topLeftAvail;
+            if (by > 0 && bx > 0) topLeftAvail = true;
+            else if (by == 0 && bx == 0) topLeftAvail = leftMb != null && topMb != null;
+            else if (by == 0) topLeftAvail = topMb != null; // top-left sample is in topMb's bottom row
+            else topLeftAvail = leftMb != null; // top-left sample is in leftMb's right column
             bool topRightAvail = ComputeTopRightAvail(i, bx, by, mbX, mbY,
                 picture.BufferWidth, leftMb, topMb, topRightMb);
 
@@ -313,9 +324,15 @@ internal static class MacroblockReconstructor
             int px0 = mbX * 16 + bx * 8;
             int py0 = mbY * 16 + by * 8;
 
-            bool topAvail = py0 > 0;
-            bool leftAvail = px0 > 0;
-            bool topLeftAvail = topAvail && leftAvail;
+            // Per spec §6.4.11.1: a neighbor MB in a different slice is unavailable.
+            // For inner 8x8 blocks (by>0 or bx>0) the neighbor is in the current MB.
+            bool topAvail = by > 0 || topMb != null;
+            bool leftAvail = bx > 0 || leftMb != null;
+            bool topLeftAvail;
+            if (by > 0 && bx > 0) topLeftAvail = true;
+            else if (by == 0 && bx == 0) topLeftAvail = leftMb != null && topMb != null;
+            else if (by == 0) topLeftAvail = topMb != null;
+            else topLeftAvail = leftMb != null;
             // Top-right availability for 8x8 blocks within an MB:
             //   i8 == 0 (TL): TR samples are in top MB (row above), available iff topMb exists.
             //   i8 == 1 (TR): TR samples are in top-right MB, available iff topRightMb exists.
@@ -801,7 +818,8 @@ internal static class MacroblockReconstructor
 
     // ---------------- Chroma ----------------
     private static void ReconstructChroma(
-        Macroblock mb, DecodedPicture picture, int mbX, int mbY, int qPc)
+        Macroblock mb, DecodedPicture picture, int mbX, int mbY, int qPc,
+        Macroblock? leftMb, Macroblock? topMb)
     {
         Span<byte> predBlock = stackalloc byte[64];
         Span<int> dc = stackalloc int[4];
@@ -810,8 +828,10 @@ internal static class MacroblockReconstructor
 
         Span<byte> top8 = stackalloc byte[8];
         Span<byte> left8 = stackalloc byte[8];
-        bool topAvail = mbY > 0;
-        bool leftAvail = mbX > 0;
+        // Cross-slice neighbors are passed as null (spec §6.4.11.1) — use the MB
+        // pointers rather than raw mbX/mbY > 0.
+        bool topAvail = topMb != null;
+        bool leftAvail = leftMb != null;
         bool topLeftAvail = topAvail && leftAvail;
 
         for (int comp = 0; comp < 2; comp++)
