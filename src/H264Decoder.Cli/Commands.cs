@@ -165,7 +165,14 @@ public static class Commands
             var requested = gop.Value;
             int highest = 0;
             foreach (int r in requested) if (r > highest) highest = r;
-            int gopEnd = Math.Min(stream.Samples.Count, highest + 9);
+            // Cap decode at the next sync sample so we don't spill into the next GOP's IDR,
+            // which would reset POC and mix two GOPs' frames in the POC-sorted output.
+            int nextIdr = stream.Samples.Count;
+            for (int i = idrSample + 1; i < stream.Samples.Count; i++)
+            {
+                if (stream.Samples[i].IsSyncSample) { nextIdr = i; break; }
+            }
+            int gopEnd = Math.Min(nextIdr, highest + 9);
 
             using var gopFs = File.OpenRead(inPath);
             Mp4SampleStream localStream;
