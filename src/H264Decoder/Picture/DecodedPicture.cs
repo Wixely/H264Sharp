@@ -60,6 +60,11 @@ public sealed class DecodedPicture
     /// pictures, LongTermPicNum == LongTermFrameIdx.</summary>
     public int LongTermPicNum { get; set; }
 
+    /// <summary>VUI parameters from the active SPS, if present. Needed by YuvToRgb to honour
+    /// video_full_range_flag (yuvj420p / Apple-encoded content uses Y in [0,255])
+    /// and matrix_coefficients.</summary>
+    public Syntax.VuiParameters? Vui { get; set; }
+
     public DecodedPicture(int width, int height)
         : this(width, height, width, height, 0, 0) { }
 

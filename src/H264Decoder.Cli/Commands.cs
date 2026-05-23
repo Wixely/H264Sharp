@@ -252,7 +252,7 @@ public static class Commands
     {
         if (outPath.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
         {
-            byte[] rgb = YuvToRgb.Convert(pic);
+            byte[] rgb = YuvToRgb.Convert(pic, pic.Vui);
             byte[] png = PngEncoder.EncodeRgb(pic.Width, pic.Height, rgb);
             File.WriteAllBytes(outPath, png);
             stderr.WriteLine($"decoded {pic.Width}x{pic.Height} -> {outPath} ({png.Length} bytes PNG)");

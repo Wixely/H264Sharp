@@ -17,8 +17,12 @@ public static class YuvToRgb
     public static byte[] Convert(DecodedPicture pic, VuiParameters? vui = null)
     {
         Matrix matrix = PickMatrix(pic.Height, vui);
+        // Apple / yuvj420p sources signal full range via video_full_range_flag=1
+        // and use Y in [0,255] instead of the limited [16,235] range. Without this,
+        // dark areas crush to black and bright areas wash out.
+        bool fullRange = vui is not null && vui.VideoSignalTypePresentFlag && vui.VideoFullRangeFlag;
         byte[] rgb = new byte[pic.Width * pic.Height * 3];
-        ConvertCore(pic, matrix, rgb);
+        ConvertCore(pic, matrix, fullRange, rgb);
         return rgb;
     }
 
@@ -37,22 +41,45 @@ public static class YuvToRgb
         return height >= 720 ? Matrix.Bt709 : Matrix.Bt601;
     }
 
-    private static void ConvertCore(DecodedPicture pic, Matrix matrix, byte[] dst)
+    private static void ConvertCore(DecodedPicture pic, Matrix matrix, bool fullRange, byte[] dst)
     {
-        // Integer-fixed-point coefficients (limited range).
-        // BT.601: Y range [16, 235], Cb/Cr range [16, 240], offset 128 for chroma.
-        // R = (298*(Y-16) + 409*(Cr-128) + 128) >> 8
-        // G = (298*(Y-16) - 100*(Cb-128) - 208*(Cr-128) + 128) >> 8
-        // B = (298*(Y-16) + 516*(Cb-128) + 128) >> 8
-        // BT.709 uses different coefficients.
+        // Integer-fixed-point coefficients (256-scale, +128 round, >>8 final shift).
+        // Limited range (default, ITU spec): Y in [16,235], chroma in [16,240], offset Y by 16.
+        //   BT.601: R = (298*(Y-16) + 409*(Cr-128)) >> 8
+        //           G = (298*(Y-16) - 100*(Cb-128) - 208*(Cr-128)) >> 8
+        //           B = (298*(Y-16) + 516*(Cb-128)) >> 8
+        // Full range (JPEG / yuvj420p / video_full_range_flag=1): Y in [0,255], no Y offset.
+        //   BT.601 full:  R = Y + 1.402*(Cr-128)  -> kRCr=359/256
+        //                 G = Y - 0.344136*(Cb-128) - 0.714136*(Cr-128) -> kGCb=-88, kGCr=-183
+        //                 B = Y + 1.772*(Cb-128) -> kBCb=454
+        //   BT.709 full:  R = Y + 1.5748*(Cr-128) -> kRCr=403
+        //                 G = Y - 0.187324*(Cb-128) - 0.468124*(Cr-128) -> kGCb=-48, kGCr=-120
+        //                 B = Y + 1.8556*(Cb-128) -> kBCb=475
         int kY, kRCr, kGCb, kGCr, kBCb;
-        if (matrix == Matrix.Bt601)
+        int yOffset;
+        if (fullRange)
         {
-            kY = 298; kRCr = 409; kGCb = -100; kGCr = -208; kBCb = 516;
+            yOffset = 0;
+            if (matrix == Matrix.Bt601)
+            {
+                kY = 256; kRCr = 359; kGCb = -88; kGCr = -183; kBCb = 454;
+            }
+            else // BT.709
+            {
+                kY = 256; kRCr = 403; kGCb = -48; kGCr = -120; kBCb = 475;
+            }
         }
-        else // BT.709
+        else
         {
-            kY = 298; kRCr = 459; kGCb = -55; kGCr = -136; kBCb = 541;
+            yOffset = 16;
+            if (matrix == Matrix.Bt601)
+            {
+                kY = 298; kRCr = 409; kGCb = -100; kGCr = -208; kBCb = 516;
+            }
+            else // BT.709
+            {
+                kY = 298; kRCr = 459; kGCb = -55; kGCr = -136; kBCb = 541;
+            }
         }
 
         int W = pic.Width, H = pic.Height;
@@ -68,7 +95,7 @@ public static class YuvToRgb
             {
                 int srcX = cropL + x;
                 int cx = cCropL + (x >> 1);
-                int yv = pic.Y[srcY * bw + srcX] - 16;
+                int yv = pic.Y[srcY * bw + srcX] - yOffset;
                 int cb = pic.U[cy * cbw + cx] - 128;
                 int cr = pic.V[cy * cbw + cx] - 128;
                 int r = (kY * yv + kRCr * cr + 128) >> 8;

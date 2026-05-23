@@ -250,6 +250,7 @@ public sealed class H264FrameDecoder
             FrameNum = (int)header.FrameNum,
             PicOrderCnt = picOrderCnt,
             MbsPerRow = mbsPerRow,
+            Vui = sps.Vui,
         };
         return new PictureContext
         {
@@ -590,11 +591,12 @@ public sealed class H264FrameDecoder
             }
 
             addr++;
-            if (addr < totalMbs)
-            {
-                int endOfSlice = cabac.DecodeTerminate();
-                if (endOfSlice == 1) break;
-            }
+            // Spec §7.3.4: end_of_slice_flag is decoded AFTER every macroblock, including
+            // the last one of the slice. We still gate "continue to next MB" on having
+            // capacity; reading the terminate even at end-of-stream keeps bin-level traces
+            // aligned with OpenH264/FFmpeg.
+            int endOfSlice = cabac.DecodeTerminate();
+            if (endOfSlice == 1 || addr >= totalMbs) break;
         }
     }
 
