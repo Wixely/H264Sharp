@@ -23,17 +23,19 @@ public sealed class SingleFrameDecodeTests
     }
 
     [Fact]
-    public void DecodeHigh8x8DctClip_ParsesIsolated8x8Blocks_DesyncsAtMixedBoundary()
+    public void DecodeHigh8x8DctClip_ParsesMixed8x8And4x4Blocks()
     {
-        // Stage 5: CABAC ctxBlockCat=5 8x8 luma residual decode is implemented. Isolated
-        // I_NxN+t8x8 MBs parse correctly, but the parser desyncs when the stream mixes
-        // I_8x8 MBs with subsequent I_4x4 MBs (root cause under investigation). Until that
-        // is resolved we capture the partial-decode behavior here — the failure surfaces
-        // as a downstream prediction error rather than a clean CABAC abort.
+        // High-profile clip mixing I_8x8 + I_4x4 MBs. Was a known desync until the
+        // ctxBlockCat=5 last_significant_coeff_flag map (spec Table 9-43) was
+        // corrected — see CabacResidual.LastMap5Frame. Now decodes cleanly.
         var sample = FfmpegFixture.Mandelbrot128x96High8x8Dct();
         byte[] stream = File.ReadAllBytes(sample.H264Path);
         var decoder = new H264FrameDecoder();
-        Assert.Throws<InvalidDataException>(() => decoder.DecodeFirstIFrame(stream));
+        DecodedPicture pic = decoder.DecodeFirstIFrame(stream);
+
+        Assert.Equal(sample.Width, pic.Width);
+        Assert.Equal(sample.Height, pic.Height);
+        Assert.Equal(sample.Width * sample.Height, pic.Y.Length);
     }
 
     [Fact]
@@ -453,9 +455,7 @@ public sealed class SingleFrameDecodeTests
         Assert.True(maxV <= 2, $"v max abs error = {maxV}");
     }
 
-    [Fact(Skip = "Stage 5 CABAC ctxBlockCat=5 8x8 luma decode still desyncs in I-slice Intra_8x8 path " +
-                 "(distinct from the inter CBP-luma fix; this is intra). Suspect resides in CabacSliceI " +
-                 "intra_8x8 / 8x8 residual reading. Tests pass for inter; intra 8x8 mandelbrot still fails.")]
+    [Fact]
     public void DecodeMandelbrot128x96HighCabac8x8_Intra8x8()
     {
         // High-profile CABAC clip with 8x8 transform + Intra_8x8 prediction. Exercises Stage 5.

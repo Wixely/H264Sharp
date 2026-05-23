@@ -262,6 +262,11 @@ internal static class CabacSliceP
             {
                 partRefIdx[p] = ReadRefIdxIfNeeded(cabac, maxRef, mb, p, rawMbType, isSubPart: false, subPartIdx: -1,
                                                    leftMb, topMb, topRightMb, topLeftMb);
+                // Replicate the just-decoded ref_idx across the partition's quadrants
+                // so a subsequent partition's spatial neighbor lookup inside this MB
+                // sees the correct value (spec §9.3.3.1.1.6).
+                MacroblockParser.ReplicateRefIdxAcross16x16PartitionsPublic(rawMbType, partRefIdx, refIdxPerQuadrant);
+                for (int qq = 0; qq < 4; qq++) mb.RefIdxL08x8[qq] = refIdxPerQuadrant[qq];
             }
             MacroblockParser.ReplicateRefIdxAcross16x16PartitionsPublic(rawMbType, partRefIdx, refIdxPerQuadrant);
         }
@@ -271,6 +276,12 @@ internal static class CabacSliceP
             {
                 refIdxPerQuadrant[q] = ReadRefIdxIfNeeded(cabac, maxRef, mb, q, rawMbType, isSubPart: true, subPartIdx: q,
                                                           leftMb, topMb, topRightMb, topLeftMb);
+                // Write the just-decoded ref_idx into the MB's per-quadrant slot before
+                // the next iteration: later quadrants' condTermFlag may read this slot
+                // when their spatial neighbor is an earlier quadrant of the SAME MB
+                // (spec §9.3.3.1.1.6: condTermFlagN looks at the partition the neighbor
+                // 4x4 block belongs to, which is in-MB for P_8x8 quadrants 1/2/3).
+                mb.RefIdxL08x8[q] = refIdxPerQuadrant[q];
             }
         }
         for (int q = 0; q < 4; q++) mb.RefIdxL08x8[q] = refIdxPerQuadrant[q];

@@ -138,7 +138,9 @@ internal static class CabacSliceB
         if (b0 == 0) return 0; // B_Direct_16x16
 
         int b1 = cabac.DecodeBin(30);
-        int b2 = cabac.DecodeBin(31 + b1);
+        // ctxIdxInc for binIdx 2 depends on b1 (spec §9.3.3.1.1 Table 9-39, B-slice mb_type):
+        //   b1 == 0 -> ctxIdxInc = 5 (ctx 32); b1 == 1 -> ctxIdxInc = 4 (ctx 31).
+        int b2 = cabac.DecodeBin(b1 == 0 ? 32 : 31);
         if (b1 == 0)
         {
             // Prefix "1 0 b2" -> B_L0_16x16 (1) or B_L1_16x16 (2).
@@ -379,6 +381,11 @@ internal static class CabacSliceB
         }
 
         // Read ref_idx_l0 per partition (only if direction uses L0).
+        // Replicate (and pre-fill PredFlagL0Block for the partition's 4x4 blocks)
+        // after each decode so subsequent partitions' condTermFlag reads
+        // (spec §9.3.3.1.1.6) see the just-set value when the spatial neighbor is
+        // an earlier partition of the SAME MB. GetMvNeighborList uses PredFlag to
+        // decide whether to read refIdx, so the flag must be set in-loop too.
         int[] refL0 = new int[numPart];
         int[] refL1 = new int[numPart];
         for (int p = 0; p < numPart; p++)
@@ -387,6 +394,12 @@ internal static class CabacSliceB
             bool useL0 = dir == BPredDir.L0 || dir == BPredDir.Bi;
             refL0[p] = useL0 ? ReadRefIdxIfNeeded(cabac, maxRefL0,
                 mb, partRects[p], leftMb, topMb, topRightMb, topLeftMb, listX: 0) : -1;
+            ReplicateBRefAcross16(info, refL0, mb.RefIdxL08x8);
+            if (useL0)
+            {
+                MacroblockParser.SetPredFlag(mb.PredFlagL0Block,
+                    partRects[p].X / 4, partRects[p].Y / 4, partRects[p].W / 4, partRects[p].H / 4, 1);
+            }
         }
         for (int p = 0; p < numPart; p++)
         {
@@ -394,13 +407,22 @@ internal static class CabacSliceB
             bool useL1 = dir == BPredDir.L1 || dir == BPredDir.Bi;
             refL1[p] = useL1 ? ReadRefIdxIfNeeded(cabac, maxRefL1,
                 mb, partRects[p], leftMb, topMb, topRightMb, topLeftMb, listX: 1) : -1;
+            ReplicateBRefAcross16(info, refL1, mb.RefIdxL18x8);
+            if (useL1)
+            {
+                MacroblockParser.SetPredFlag(mb.PredFlagL1Block,
+                    partRects[p].X / 4, partRects[p].Y / 4, partRects[p].W / 4, partRects[p].H / 4, 1);
+            }
         }
 
-        // Replicate per-quadrant.
+        // Replicate per-quadrant (final, idempotent — values already in place from the loops).
         ReplicateBRefAcross16(info, refL0, mb.RefIdxL08x8);
         ReplicateBRefAcross16(info, refL1, mb.RefIdxL18x8);
 
-        // mvds: L0 first then L1.
+        // mvds: L0 first then L1. Fill MvdL{0,1}{X,Y}Block per partition immediately
+        // after decoding so subsequent partitions' neighbor-absMvdSum lookups
+        // (spec §9.3.3.1.1.7) see the just-decoded value when the spatial neighbor
+        // lies in an earlier partition of THIS MB.
         var mvdL0 = new (int X, int Y)[numPart];
         var mvdL1 = new (int X, int Y)[numPart];
         for (int p = 0; p < numPart; p++)
@@ -411,10 +433,12 @@ internal static class CabacSliceB
             {
                 var rect = partRects[p];
                 int bx = rect.X / 4, by = rect.Y / 4;
+                int bw = rect.W / 4, bh = rect.H / 4;
                 int sumX = NeighborAbsMvdSum(mb, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 0, x: true);
                 int sumY = NeighborAbsMvdSum(mb, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 0, x: false);
                 mvdL0[p].X = DecodeMvd(cabac, sumX, ctxBase: 40);
                 mvdL0[p].Y = DecodeMvd(cabac, sumY, ctxBase: 47);
+                MacroblockParser.FillBlockMvdsL0(mb, bx, by, bw, bh, mvdL0[p].X, mvdL0[p].Y);
             }
         }
         for (int p = 0; p < numPart; p++)
@@ -425,10 +449,12 @@ internal static class CabacSliceB
             {
                 var rect = partRects[p];
                 int bx = rect.X / 4, by = rect.Y / 4;
+                int bw = rect.W / 4, bh = rect.H / 4;
                 int sumX = NeighborAbsMvdSum(mb, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 1, x: true);
                 int sumY = NeighborAbsMvdSum(mb, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 1, x: false);
                 mvdL1[p].X = DecodeMvd(cabac, sumX, ctxBase: 40);
                 mvdL1[p].Y = DecodeMvd(cabac, sumY, ctxBase: 47);
+                MacroblockParser.FillBlockMvdsL1(mb, bx, by, bw, bh, mvdL1[p].X, mvdL1[p].Y);
             }
         }
 
@@ -481,12 +507,22 @@ internal static class CabacSliceB
 
         int[] refL0 = new int[4];
         int[] refL1 = new int[4];
+        // Decode each ref_idx and immediately write into mb.RefIdxL{0,1}8x8[q] AND
+        // mark the corresponding 4x4 blocks in PredFlagL{0,1}Block so later
+        // quadrants' condTermFlag reads (spec §9.3.3.1.1.6) see the just-set value
+        // when the spatial neighbor lies in an earlier quadrant of THIS MB.
         for (int q = 0; q < 4; q++)
         {
             var dir = BSubMbTypeOps.Dir(subTypes[q]);
             bool useL0 = dir == BPredDir.L0 || dir == BPredDir.Bi;
             refL0[q] = useL0 ? ReadRefIdxIfNeededQ(cabac, maxRefL0, mb, q,
                 leftMb, topMb, topRightMb, topLeftMb, listX: 0) : -1;
+            mb.RefIdxL08x8[q] = refL0[q] < 0 ? 0 : refL0[q];
+            if (useL0)
+            {
+                int qx = (q & 1) * 2, qy = (q >> 1) * 2;
+                MacroblockParser.SetPredFlag(mb.PredFlagL0Block, qx, qy, 2, 2, 1);
+            }
         }
         for (int q = 0; q < 4; q++)
         {
@@ -494,11 +530,12 @@ internal static class CabacSliceB
             bool useL1 = dir == BPredDir.L1 || dir == BPredDir.Bi;
             refL1[q] = useL1 ? ReadRefIdxIfNeededQ(cabac, maxRefL1, mb, q,
                 leftMb, topMb, topRightMb, topLeftMb, listX: 1) : -1;
-        }
-        for (int q = 0; q < 4; q++)
-        {
-            mb.RefIdxL08x8[q] = refL0[q] < 0 ? 0 : refL0[q];
             mb.RefIdxL18x8[q] = refL1[q] < 0 ? 0 : refL1[q];
+            if (useL1)
+            {
+                int qx = (q & 1) * 2, qy = (q >> 1) * 2;
+                MacroblockParser.SetPredFlag(mb.PredFlagL1Block, qx, qy, 2, 2, 1);
+            }
         }
 
         // mvd_l0 per sub-partition.

@@ -159,16 +159,19 @@ internal static class CabacResidual
         14, 10, 12,
     };
 
-    // Note: per openh264 g_kuiCabacLastSignificantCoeffFlagMap8x8, last cat=5 uses 9 ctxs (0..8).
+    // Spec Table 9-43 ctxBlockCat=5 (last_significant_coeff_flag, 8x8 frame-coded).
+    // 63 entries for scan positions 0..62 (position 63 is implicit-last and not coded).
+    // Uses 9 ctxs (0..8). Matches openh264 g_kuiIdx2CtxLastSignificantCoeffFlag8x8.
     private static readonly byte[] LastMap5Frame = new byte[]
     {
-        0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 2, 2, 2, 2, 2, 2,
-        2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
-        4, 4, 4, 4, 4, 4, 4, 4, 5, 5,
-        5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8,
+        0, 1, 1, 1, 1, 1, 1, 1,   // pos 0..7
+        1, 1, 1, 1, 1, 1, 1, 1,   // pos 8..15
+        2, 2, 2, 2, 2, 2, 2, 2,   // pos 16..23
+        2, 2, 2, 2, 2, 2, 2, 2,   // pos 24..31
+        3, 3, 3, 3, 3, 3, 3, 3,   // pos 32..39
+        4, 4, 4, 4, 4, 4, 4, 4,   // pos 40..47
+        5, 5, 5, 5, 6, 6, 6, 6,   // pos 48..55
+        7, 7, 7, 7, 8, 8, 8,      // pos 56..62
     };
 
     // Spec Table 9-42 ctxIdx bases for ctxBlockCat=5 (Luma8x8, frame-coded).
