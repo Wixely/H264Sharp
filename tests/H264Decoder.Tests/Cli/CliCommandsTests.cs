@@ -7,6 +7,97 @@ namespace H264Decoder.Tests.Cli;
 
 public class CliCommandsTests
 {
+    [Theory]
+    [InlineData("all", new[] { 0, 1 })]
+    [InlineData("0", new[] { 0 })]
+    [InlineData("1", new[] { 1 })]
+    [InlineData("0-1", new[] { 0, 1 })]
+    [InlineData("1-0", new[] { 0, 1 })] // swapped range; auto-corrected
+    [InlineData("0,1", new[] { 0, 1 })]
+    [InlineData("0,0,1,1", new[] { 0, 1 })] // dedupes
+    public void TryParseFrameSpec_AcceptsValidSpecs(string spec, int[] expected)
+    {
+        Assert.True(Commands.TryParseFrameSpec(spec, totalFrames: 2, out var indices, out _));
+        Assert.Equal(expected, indices.ToArray());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("abc")]
+    [InlineData("-1")]
+    [InlineData("2")]    // out of range when totalFrames=2
+    [InlineData("0-5")]   // upper bound out of range
+    [InlineData("1-abc")]
+    public void TryParseFrameSpec_RejectsInvalid(string spec)
+    {
+        Assert.False(Commands.TryParseFrameSpec(spec, totalFrames: 2, out _, out _));
+    }
+
+    [Fact]
+    public void ExtractFrames_WritesAllFrames()
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        string outDir = Path.Combine(Path.GetTempPath(), $"frames_{Guid.NewGuid():N}");
+        try
+        {
+            var stderr = new StringWriter();
+            int rc = Commands.ExtractFrames(sample.H264Path, outDir, "all", stderr);
+            Assert.Equal(0, rc);
+            var pngs = Directory.GetFiles(outDir, "frame_*.png");
+            Assert.Equal(2, pngs.Length);
+            // PNG magic check on each
+            foreach (string png in pngs)
+            {
+                byte[] bytes = File.ReadAllBytes(png);
+                Assert.True(bytes.Length > 8);
+                Assert.Equal(0x89, bytes[0]);
+                Assert.Equal((byte)'P', bytes[1]);
+            }
+            // Files should be sortable lexically — names use 5-digit zero-padding.
+            Assert.Contains(pngs, p => Path.GetFileName(p) == "frame_00000.png");
+            Assert.Contains(pngs, p => Path.GetFileName(p) == "frame_00001.png");
+        }
+        finally
+        {
+            if (Directory.Exists(outDir)) Directory.Delete(outDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ExtractFrames_RangeAndSingle()
+    {
+        var sample = FfmpegFixture.TwoFramesAllPartitionsMp4();
+        string outDir = Path.Combine(Path.GetTempPath(), $"frames_range_{Guid.NewGuid():N}");
+        try
+        {
+            var stderr = new StringWriter();
+            int rc = Commands.ExtractFrames(sample.H264Path, outDir, "0-1", stderr);
+            Assert.Equal(0, rc);
+            Assert.Equal(2, Directory.GetFiles(outDir, "frame_*.png").Length);
+            // Single-frame extraction overwrites cleanly into the same dir.
+            rc = Commands.ExtractFrames(sample.H264Path, outDir, "1", stderr);
+            Assert.Equal(0, rc);
+            Assert.True(File.Exists(Path.Combine(outDir, "frame_00001.png")));
+        }
+        finally
+        {
+            if (Directory.Exists(outDir)) Directory.Delete(outDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void ExtractFrames_OnAnnexB_FailsWithMessage()
+    {
+        var sample = FfmpegFixture.SingleRed16x16();
+        string outDir = Path.Combine(Path.GetTempPath(), $"frames_annexb_{Guid.NewGuid():N}");
+        var stderr = new StringWriter();
+        int rc = Commands.ExtractFrames(sample.H264Path, outDir, "0", stderr);
+        Assert.NotEqual(0, rc);
+        Assert.Contains("MP4", stderr.ToString());
+        if (Directory.Exists(outDir)) Directory.Delete(outDir, recursive: true);
+    }
+
     [Fact]
     public void Mp4Reader_BPyramid_AppliesEditListSoFirstCompositionTimeIsZero()
     {

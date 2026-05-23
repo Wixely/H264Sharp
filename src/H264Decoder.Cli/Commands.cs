@@ -29,6 +29,11 @@ public static class Commands
         {
             return ThumbnailAtPercent(args[0], args[1], args[3], stderr);
         }
+        // <in> <out_dir> --frames <spec>
+        if (args.Length == 4 && args[2] == "--frames")
+        {
+            return ExtractFrames(args[0], args[1], args[3], stderr);
+        }
         if (args.Length == 2)
         {
             return DecodeFirstIFrameToFile(args[0], args[1], stderr);
@@ -37,6 +42,8 @@ public static class Commands
         stderr.WriteLine("  H264Decoder.Cli <in.h264|in.mp4> <out.yuv|out.png>");
         stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out.png> --at <seconds>");
         stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out.png> --at-pct <0..1>");
+        stderr.WriteLine("  H264Decoder.Cli <in.mp4> <out_dir> --frames <spec>");
+        stderr.WriteLine("    spec: 'all', '<N>', '<N>-<M>', or comma-separated mix (e.g. '5,10-15,20')");
         stderr.WriteLine("  H264Decoder.Cli --info <in.mp4>");
         return 1;
     }
@@ -94,6 +101,107 @@ public static class Commands
             : stream.Samples[^1].CompositionTimeSeconds;
         double t = duration * pct;
         return ThumbnailAtTimeForStream(stream, outPath, t, stderr);
+    }
+
+    /// <summary>Extract one or more frames in display order. <paramref name="spec"/> accepts:
+    /// "all", a single index "89", a range "12-39", or a comma-separated mix like "5,10-15,20".
+    /// Frame N is written to <paramref name="outDir"/>/frame_NNNNN.png (5-digit zero-padded).
+    /// MP4 input only (Annex-B has no usable frame ordering).</summary>
+    public static int ExtractFrames(string inPath, string outDir, string spec, TextWriter stderr)
+    {
+        if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
+        if (!FileLooksLikeMp4(inPath))
+        {
+            stderr.WriteLine("--frames requires an MP4 container");
+            return 5;
+        }
+        using var fs = File.OpenRead(inPath);
+        Mp4SampleStream stream;
+        try { stream = Mp4Reader.ExtractH264WithTiming(fs); }
+        catch (Exception ex) { PrintException("MP4 parse failed", ex, stderr); return 3; }
+        if (stream.Samples.Count == 0) { stderr.WriteLine("MP4 has no video samples"); return 3; }
+
+        // Decode the whole file. For typical use cases (extract every Nth frame or a small range),
+        // decoding everything once is simpler than tracking GOP boundaries per requested frame.
+        var nals = new List<NalUnit>(stream.AvcCConfigNalUnits);
+        for (int i = 0; i < stream.Samples.Count; i++) nals.AddRange(stream.ResolveNalUnits(i));
+        var decoder = new H264FrameDecoder();
+        List<DecodedPicture> frames;
+        try { frames = decoder.DecodeAllFrames(nals); }
+        catch (Exception ex) { PrintException("decode failed", ex, stderr); return 3; }
+
+        // frames is sorted by POC (display order). Build the index set from spec.
+        if (!TryParseFrameSpec(spec, frames.Count, out var indices, out string? err))
+        {
+            stderr.WriteLine($"invalid --frames value: {err}");
+            return 4;
+        }
+        Directory.CreateDirectory(outDir);
+        foreach (int idx in indices)
+        {
+            var pic = frames[idx];
+            string outPath = Path.Combine(outDir, $"frame_{idx:D5}.png");
+            byte[] rgb = YuvToRgb.Convert(pic, pic.Vui);
+            byte[] png = PngEncoder.EncodeRgb(pic.Width, pic.Height, rgb);
+            File.WriteAllBytes(outPath, png);
+        }
+        stderr.WriteLine($"wrote {indices.Count} frame(s) to {outDir}");
+        return 0;
+    }
+
+    /// <summary>Parse a frame-selection spec into a sorted, deduplicated set of display-order indices.</summary>
+    public static bool TryParseFrameSpec(string spec, int totalFrames, out List<int> indices, out string? error)
+    {
+        indices = new List<int>();
+        error = null;
+        if (string.IsNullOrWhiteSpace(spec)) { error = "empty spec"; return false; }
+        var set = new SortedSet<int>();
+        if (spec.Equals("all", StringComparison.OrdinalIgnoreCase))
+        {
+            for (int i = 0; i < totalFrames; i++) set.Add(i);
+            indices = set.ToList();
+            return true;
+        }
+        foreach (string raw in spec.Split(','))
+        {
+            string part = raw.Trim();
+            if (part.Length == 0) continue;
+            int dash = part.IndexOf('-');
+            if (dash < 0)
+            {
+                if (!int.TryParse(part, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out int n))
+                {
+                    error = $"'{part}' is not a number"; return false;
+                }
+                if (n < 0 || n >= totalFrames)
+                {
+                    error = $"frame {n} out of range [0, {totalFrames - 1}]"; return false;
+                }
+                set.Add(n);
+            }
+            else
+            {
+                string lo = part[..dash].Trim();
+                string hi = part[(dash + 1)..].Trim();
+                if (!int.TryParse(lo, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out int a)
+                 || !int.TryParse(hi, System.Globalization.NumberStyles.Integer,
+                        System.Globalization.CultureInfo.InvariantCulture, out int b))
+                {
+                    error = $"invalid range '{part}'"; return false;
+                }
+                if (a > b) (a, b) = (b, a);
+                if (a < 0 || b >= totalFrames)
+                {
+                    error = $"range {a}-{b} out of [0, {totalFrames - 1}]"; return false;
+                }
+                for (int i = a; i <= b; i++) set.Add(i);
+            }
+        }
+        if (set.Count == 0) { error = "no frames selected"; return false; }
+        indices = set.ToList();
+        return true;
     }
 
     private static int ThumbnailAtSeconds(string inPath, string outPath, double t, TextWriter stderr)
