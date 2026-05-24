@@ -59,4 +59,25 @@ internal sealed class MacroblockEncoderState
     public int[] MvdL0YBlock = new int[16];
     /// <summary>Per-8x8-quadrant L0 ref idx (raster: 0=TL, 1=TR, 2=BL, 3=BR).</summary>
     public int[] RefIdxL08x8 = new int[4];
+
+    // ---- B-slice fields ----
+    /// <summary>True if this MB was emitted as any B-slice inter type (B_L0/L1/Bi 16x16 in Phase 5a).</summary>
+    public bool IsBInter = false;
+    /// <summary>For B-slice: prediction direction (0=L0, 1=L1, 2=Bi). Undefined when IsBInter=false.</summary>
+    public byte BPredDir = 0;
+    /// <summary>L1 ref idx (0 — single L1 reference frame).</summary>
+    public int RefIdxL1 = 0;
+    /// <summary>Per-4x4-block L1 MV (raster index 0..15) — neighbor MV source for the next MB.</summary>
+    public int[] MvL1XBlock = new int[16];
+    public int[] MvL1YBlock = new int[16];
+    /// <summary>Per-4x4-block L1 MVD (raster) — neighbor source for CABAC absMvdSum context.</summary>
+    public int[] MvdL1XBlock = new int[16];
+    public int[] MvdL1YBlock = new int[16];
+    /// <summary>Per-8x8-quadrant L1 ref idx. -1 means "this partition does not use L1" (L0-only direction).</summary>
+    public int[] RefIdxL18x8 = FilledNeg1_4();
+    private static int[] FilledNeg1_4() { var a = new int[4]; for (int i = 0; i < 4; i++) a[i] = -1; return a; }
+    /// <summary>Per-4x4-block pred-flag for L0 (1 = uses L0). Used by B-slice MV prediction.</summary>
+    public byte[] PredFlagL0Block = new byte[16];
+    /// <summary>Per-4x4-block pred-flag for L1.</summary>
+    public byte[] PredFlagL1Block = new byte[16];
 }

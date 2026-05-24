@@ -44,6 +44,11 @@ public static class H264FrameEncoder
         /// P_L0_L0_8x16, P_8x8 with sub_mb_type 0..3). Intra_4x4 in P-slices and inter MB
         /// transform_8x8 are not yet supported under CABAC.</summary>
         public bool EnableCabac { get; init; } = false;
+        /// <summary>Phase 5a: when true, the encoder uses an IPBP GOP (one B-frame between every
+        /// two reference frames). Switches to Main profile + pic_order_cnt_type=0 + num_ref_frames=2.
+        /// CAVLC-only; CABAC B-slice not yet supported. B-MBs use only B_L0_16x16 / B_L1_16x16 /
+        /// B_Bi_16x16 (no direct, no skip, no sub-MB partitions, no intra-in-B).</summary>
+        public bool EnableBFrames { get; init; } = false;
     }
 
     /// <summary>Encode a sequence of raw YUV 4:2:0 frames into an Annex-B H.264 byte stream.</summary>
@@ -57,6 +62,13 @@ public static class H264FrameEncoder
         if (qp < 0 || qp > 51) throw new ArgumentException("qp must be in [0, 51]");
         if (frames <= 0) throw new ArgumentException("frames must be > 0");
         ArgumentNullException.ThrowIfNull(options);
+
+        if (options.EnableBFrames)
+        {
+            if (options.EnableCabac)
+                throw new NotSupportedException("CABAC + B-frames (Phase 5b) not yet implemented; use EnableCabac=false");
+            return EncodeAnnexBWithBFrames(yuv, width, height, qp, frames, options);
+        }
 
         var sps = SpsWriter.BuildBaseline(width, height);
         var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: options.EnableCabac);
@@ -117,13 +129,157 @@ public static class H264FrameEncoder
         return output.ToArray();
     }
 
+    /// <summary>Phase 5a: IPBP encoder. One B-frame between every two reference frames. Uses Main
+    /// SPS, pic_order_cnt_type=0, num_ref_frames=2. CAVLC only.</summary>
+    private static byte[] EncodeAnnexBWithBFrames(
+        ReadOnlySpan<byte> yuv, int width, int height, int qp, int frames, Options options)
+    {
+        var sps = SpsWriter.BuildMain(width, height);
+        var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: false);
+        byte[] spsRbsp = SpsWriter.Serialize(sps);
+        byte[] ppsRbsp = PpsWriter.Serialize(pps);
+
+        var output = new MemoryStream();
+        byte[] spsNal = AnnexBWriter.BuildNalUnit(NalUnitType.Sps, nalRefIdc: 3, spsRbsp);
+        byte[] ppsNal = AnnexBWriter.BuildNalUnit(NalUnitType.Pps, nalRefIdc: 3, ppsRbsp);
+        AnnexBWriter.WriteAnnexB(output, new[] { spsNal, ppsNal });
+
+        int picWidthInMbs = (int)(sps.PicWidthInMbsMinus1 + 1);
+        int picHeightInMbs = (int)(sps.PicHeightInMapUnitsMinus1 + 1);
+        int bufferWidth = picWidthInMbs * 16;
+        int bufferHeight = picHeightInMbs * 16;
+        int bufferChromaWidth = bufferWidth / 2;
+        int bufferChromaHeight = bufferHeight / 2;
+
+        int frameBytes = width * height + 2 * (width / 2) * (height / 2);
+        if (yuv.Length < frameBytes * frames)
+            throw new ArgumentException(
+                $"yuv buffer too small: expected {frameBytes * frames}, got {yuv.Length}");
+
+        // Allocate per-display-frame reconstruction buffers (only the ones used as references stay
+        // alive long enough to matter — but storing all simplifies the scheduler).
+        var reconY = new byte[frames][];
+        var reconU = new byte[frames][];
+        var reconV = new byte[frames][];
+
+        // GOP: I, P, B, P, B, P, ...
+        // Display index → encode type: 0=I; even-positive=P; odd=B (unless it's the tail with no future P).
+        var encodeType = new char[frames];
+        encodeType[0] = 'I';
+        for (int i = 1; i < frames; i++)
+        {
+            if ((i & 1) == 1 && i + 1 < frames) encodeType[i] = 'B';
+            else encodeType[i] = 'P';
+        }
+
+        // Coding order: I0, P2, B1, P4, B3, ..., (tail P if odd).
+        var codingOrder = new List<int>(frames);
+        codingOrder.Add(0);
+        int displayIdx = 1;
+        while (displayIdx < frames)
+        {
+            if (encodeType[displayIdx] == 'B')
+            {
+                // B at displayIdx, P at displayIdx+1 — emit P first, then B.
+                codingOrder.Add(displayIdx + 1);
+                codingOrder.Add(displayIdx);
+                displayIdx += 2;
+            }
+            else
+            {
+                codingOrder.Add(displayIdx);
+                displayIdx += 1;
+            }
+        }
+
+        uint nextRefFrameNum = 0; // increments only for ref pictures (I/P).
+        uint lastRefFrameNumForB = 0;
+        for (int codeIdx = 0; codeIdx < codingOrder.Count; codeIdx++)
+        {
+            int disp = codingOrder[codeIdx];
+            char type = encodeType[disp];
+            ReadOnlySpan<byte> frame = yuv.Slice(disp * frameBytes, frameBytes);
+            byte[] rY = new byte[bufferWidth * bufferHeight];
+            byte[] rU = new byte[bufferChromaWidth * bufferChromaHeight];
+            byte[] rV = new byte[bufferChromaWidth * bufferChromaHeight];
+
+            uint picOrderCntLsb = (uint)((disp * 2) & ((1 << ((int)sps.Log2MaxPicOrderCntLsbMinus4 + 4)) - 1));
+            byte[] sliceNal;
+
+            if (type == 'I')
+            {
+                // First frame: IDR with Main-profile SPS.
+                sliceNal = EncodeIFrame(frame, width, height, qp,
+                    picWidthInMbs, picHeightInMbs, bufferWidth, bufferHeight,
+                    bufferChromaWidth, bufferChromaHeight,
+                    frameNum: 0, idrPicId: 0,
+                    rY, rU, rV, options,
+                    spsOverride: sps, ppsOverride: pps);
+                nextRefFrameNum = 1;
+                lastRefFrameNumForB = 0;
+            }
+            else if (type == 'P')
+            {
+                // P-frame references the most recent forward reference (the previous P/I in display order).
+                // For IPBP, that's the P emitted before the last B (or the initial I).
+                int refDisp = FindMostRecentRefBeforeDisplay(encodeType, disp);
+                sliceNal = EncodePFrame(frame, width, height, qp,
+                    picWidthInMbs, picHeightInMbs, bufferWidth, bufferHeight,
+                    bufferChromaWidth, bufferChromaHeight,
+                    frameNum: nextRefFrameNum & 0xF,
+                    rY, rU, rV,
+                    reconY[refDisp]!, reconU[refDisp]!, reconV[refDisp]!,
+                    options,
+                    spsOverride: sps, ppsOverride: pps,
+                    picOrderCntLsb: picOrderCntLsb);
+                lastRefFrameNumForB = nextRefFrameNum & 0xF;
+                nextRefFrameNum++;
+            }
+            else // 'B'
+            {
+                // B-frame: forward ref = most recent ref before disp; backward ref = nearest ref after disp.
+                int refForwardDisp = FindMostRecentRefBeforeDisplay(encodeType, disp);
+                int refBackwardDisp = FindNearestRefAfterDisplay(encodeType, disp, frames);
+                sliceNal = EncodeBFrame(frame, width, height, qp,
+                    picWidthInMbs, picHeightInMbs, bufferWidth, bufferHeight,
+                    bufferChromaWidth, bufferChromaHeight,
+                    frameNum: lastRefFrameNumForB,
+                    picOrderCntLsb,
+                    rY, rU, rV,
+                    reconY[refForwardDisp]!, reconU[refForwardDisp]!, reconV[refForwardDisp]!,
+                    reconY[refBackwardDisp]!, reconU[refBackwardDisp]!, reconV[refBackwardDisp]!,
+                    sps, pps, options);
+                // B is non-reference; does not advance nextRefFrameNum.
+            }
+            AnnexBWriter.WriteAnnexB(output, new[] { sliceNal });
+            reconY[disp] = rY; reconU[disp] = rU; reconV[disp] = rV;
+        }
+        return output.ToArray();
+    }
+
+    private static int FindMostRecentRefBeforeDisplay(char[] types, int disp)
+    {
+        for (int i = disp - 1; i >= 0; i--)
+            if (types[i] == 'I' || types[i] == 'P') return i;
+        throw new InvalidOperationException("no forward reference found");
+    }
+
+    private static int FindNearestRefAfterDisplay(char[] types, int disp, int total)
+    {
+        for (int i = disp + 1; i < total; i++)
+            if (types[i] == 'I' || types[i] == 'P') return i;
+        throw new InvalidOperationException("no backward reference found");
+    }
+
     private static byte[] EncodeIFrame(
         ReadOnlySpan<byte> yuv, int width, int height, int qp,
         int picWidthInMbs, int picHeightInMbs,
         int bufferWidth, int bufferHeight, int bufferChromaWidth, int bufferChromaHeight,
         uint frameNum, uint idrPicId,
         byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
-        Options options)
+        Options options,
+        SequenceParameterSet? spsOverride = null,
+        PictureParameterSet? ppsOverride = null)
     {
         // Allocate MB-aligned planes with edge padding by replicating the last row/column.
         var srcY = new byte[bufferWidth * bufferHeight];
@@ -144,8 +300,8 @@ public static class H264FrameEncoder
         }
 
         var sliceWriter = new BitWriter(4096);
-        var sps = SpsWriter.BuildBaseline(width, height);
-        var pps = PpsWriter.BuildBaseline();
+        var sps = spsOverride ?? SpsWriter.BuildBaseline(width, height);
+        var pps = ppsOverride ?? PpsWriter.BuildBaseline();
         int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
         SliceHeaderWriter.Write(sliceWriter, sps, pps,
             frameNum: frameNum, idrPicId: idrPicId,
@@ -222,7 +378,10 @@ public static class H264FrameEncoder
         uint frameNum,
         byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
         byte[] refY, byte[] refU, byte[] refV,
-        Options options)
+        Options options,
+        SequenceParameterSet? spsOverride = null,
+        PictureParameterSet? ppsOverride = null,
+        uint picOrderCntLsb = 0)
     {
         var srcY = new byte[bufferWidth * bufferHeight];
         var srcU = new byte[bufferChromaWidth * bufferChromaHeight];
@@ -235,13 +394,14 @@ public static class H264FrameEncoder
         CopyPlaneWithEdgePad(yuv.Slice(vOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcV, bufferChromaWidth, bufferChromaHeight);
 
         var sliceWriter = new BitWriter(4096);
-        var sps = SpsWriter.BuildBaseline(width, height);
-        var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: options.EnableCabac);
+        var sps = spsOverride ?? SpsWriter.BuildBaseline(width, height);
+        var pps = ppsOverride ?? PpsWriter.BuildBaseline(entropyCodingModeFlag: options.EnableCabac);
         int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
         SliceHeaderWriter.WritePSlice(sliceWriter, sps, pps,
             frameNum: frameNum,
             sliceQpDelta: sliceQpDelta, disableDeblockingFilterIdc: 1,
-            cabacInitIdc: 0);
+            cabacInitIdc: 0,
+            picOrderCntLsb: picOrderCntLsb);
 
         int totalMbs = picWidthInMbs * picHeightInMbs;
         var mbStates = new MacroblockEncoderState?[totalMbs];
@@ -470,6 +630,96 @@ public static class H264FrameEncoder
         }
         byte[] sliceRbsp = sliceWriter.ToByteArray();
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 2, sliceRbsp);
+    }
+
+    /// <summary>Phase 5a: encode a B-slice with single 16x16 partition per MB. CAVLC only.
+    /// Picks between B_L0_16x16, B_L1_16x16, B_Bi_16x16 per MB. No intra-in-B, no direct, no skip.</summary>
+    private static byte[] EncodeBFrame(
+        ReadOnlySpan<byte> yuv, int width, int height, int qp,
+        int picWidthInMbs, int picHeightInMbs,
+        int bufferWidth, int bufferHeight, int bufferChromaWidth, int bufferChromaHeight,
+        uint frameNum, uint picOrderCntLsb,
+        byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
+        byte[] refL0Y, byte[] refL0U, byte[] refL0V,
+        byte[] refL1Y, byte[] refL1U, byte[] refL1V,
+        SequenceParameterSet sps, PictureParameterSet pps,
+        Options options)
+    {
+        var srcY = new byte[bufferWidth * bufferHeight];
+        var srcU = new byte[bufferChromaWidth * bufferChromaHeight];
+        var srcV = new byte[bufferChromaWidth * bufferChromaHeight];
+        int yOffset = 0;
+        int uOffset = width * height;
+        int vOffset = uOffset + (width / 2) * (height / 2);
+        CopyPlaneWithEdgePad(yuv.Slice(yOffset, width * height), width, height, srcY, bufferWidth, bufferHeight);
+        CopyPlaneWithEdgePad(yuv.Slice(uOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcU, bufferChromaWidth, bufferChromaHeight);
+        CopyPlaneWithEdgePad(yuv.Slice(vOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcV, bufferChromaWidth, bufferChromaHeight);
+
+        var sliceWriter = new BitWriter(4096);
+        int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
+        SliceHeaderWriter.WriteBSlice(sliceWriter, sps, pps,
+            frameNum: frameNum,
+            picOrderCntLsb: picOrderCntLsb,
+            isRefPic: false, // B-frames not used as references in Phase 5a (nal_ref_idc=0).
+            sliceQpDelta: sliceQpDelta,
+            disableDeblockingFilterIdc: 1);
+
+        int totalMbs = picWidthInMbs * picHeightInMbs;
+        var mbStates = new MacroblockEncoderState?[totalMbs];
+
+        for (int addr = 0; addr < totalMbs; addr++)
+        {
+            int mbX = addr % picWidthInMbs;
+            int mbY = addr / picWidthInMbs;
+            int y0 = mbY * 16;
+            int x0 = mbX * 16;
+            ReadOnlySpan<byte> mbSrcY = srcY.AsSpan(y0 * bufferWidth + x0);
+            ReadOnlySpan<byte> mbSrcU = srcU.AsSpan((y0 / 2) * bufferChromaWidth + (x0 / 2));
+            ReadOnlySpan<byte> mbSrcV = srcV.AsSpan((y0 / 2) * bufferChromaWidth + (x0 / 2));
+
+            var leftMb = mbX > 0 ? mbStates[addr - 1] : null;
+            var topMb = mbY > 0 ? mbStates[addr - picWidthInMbs] : null;
+            var topRightMb = (mbY > 0 && mbX + 1 < picWidthInMbs) ? mbStates[addr - picWidthInMbs + 1] : null;
+            var topLeftMb = (mbY > 0 && mbX > 0) ? mbStates[addr - picWidthInMbs - 1] : null;
+
+            // Per-list MV predictors (median over A/B/C neighbors for the same list).
+            (int predL0X, int predL0Y) = BMbEncoder.PredictBSliceMv(leftMb, topMb, topRightMb, topLeftMb, listX: 0);
+            (int predL1X, int predL1Y) = BMbEncoder.PredictBSliceMv(leftMb, topMb, topRightMb, topLeftMb, listX: 1);
+
+            int lambda = options.ModeDecisionLambda >= 0 ? options.ModeDecisionLambda : DefaultLambda(qp);
+            var cand = BMbEncoder.ChooseBestInter(
+                mbSrcY, mbSrcU, mbSrcV, bufferWidth, bufferChromaWidth,
+                refL0Y, refL0U, refL0V, refL1Y, refL1U, refL1V,
+                bufferWidth, bufferHeight, bufferChromaWidth, bufferChromaHeight,
+                mbX, mbY, qp,
+                predL0X, predL0Y, predL1X, predL1Y,
+                options.SearchRangePel, options.MaxSadEvalsPerMb,
+                options.EnableSubpelMe, lambda);
+
+            // mb_skip_run = 0 prefix for every emitted MB (CAVLC P/SP/B slice syntax).
+            ExpGolombWriter.WriteUe(sliceWriter, 0);
+
+            var state = new MacroblockEncoderState
+            {
+                MbAddress = addr,
+                QpY = qp,
+            };
+            BMbEncoder.EmitBMb16x16(sliceWriter, cand, qp,
+                predL0X, predL0Y, predL1X, predL1Y,
+                state, leftMb, topMb);
+
+            // Store reconstructed samples into the picture buffers.
+            MacroblockEncoderInter.StoreReconToPicture(cand.Bundle,
+                reconYOut, reconUOut, reconVOut,
+                bufferWidth, bufferChromaWidth, mbX, mbY);
+
+            mbStates[addr] = state;
+        }
+
+        sliceWriter.WriteRbspTrailingBits();
+        byte[] sliceRbsp = sliceWriter.ToByteArray();
+        // nal_ref_idc=0: B-frame is not used as a reference for later pictures.
+        return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 0, sliceRbsp);
     }
 
     /// <summary>CABAC-mode I-frame encoder. Picks per-MB between Intra_16x16 and Intra_4x4

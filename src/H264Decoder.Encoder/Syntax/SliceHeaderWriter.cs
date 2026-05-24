@@ -58,6 +58,105 @@ public static class SliceHeaderWriter
         }
     }
 
+    /// <summary>Encode the slice header for a non-IDR I-slice (used as a periodic intra refresh in
+    /// an IPBP GOP that contains B-frames). Same syntax as the IDR variant minus idr_pic_id and
+    /// the IDR dec_ref_pic_marking flags; carries pic_order_cnt_lsb when pic_order_cnt_type=0.</summary>
+    public static void WriteNonIdrISlice(
+        BitWriter w,
+        SequenceParameterSet sps,
+        PictureParameterSet pps,
+        uint frameNum,
+        uint picOrderCntLsb,
+        int sliceQpDelta,
+        uint disableDeblockingFilterIdc)
+    {
+        ExpGolombWriter.WriteUe(w, 0); // first_mb_in_slice
+        ExpGolombWriter.WriteUe(w, 7); // slice_type = 7 (all-I)
+        ExpGolombWriter.WriteUe(w, pps.PicParameterSetId);
+        int frameNumBits = (int)sps.Log2MaxFrameNumMinus4 + 4;
+        w.WriteBits(frameNum, frameNumBits);
+        if (sps.PicOrderCntType == 0)
+        {
+            int lsbBits = (int)sps.Log2MaxPicOrderCntLsbMinus4 + 4;
+            w.WriteBits(picOrderCntLsb, lsbBits);
+        }
+        if (pps.RedundantPicCntPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, 0);
+        }
+        // dec_ref_pic_marking for non-IDR ref slice: adaptive_ref_pic_marking_mode_flag = 0.
+        w.WriteBit(0);
+        // cabac_init_idc NOT present for I-slices (spec §7.3.3 gates on slice_type != I/SI).
+        ExpGolombWriter.WriteSe(w, sliceQpDelta);
+        if (pps.DeblockingFilterControlPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, disableDeblockingFilterIdc);
+            if (disableDeblockingFilterIdc != 1)
+            {
+                ExpGolombWriter.WriteSe(w, 0);
+                ExpGolombWriter.WriteSe(w, 0);
+            }
+        }
+    }
+
+    /// <summary>Encode the slice header for a non-IDR B-slice (single L0 ref, single L1 ref).
+    /// slice_type=6 (all-B). Uses spatial direct mode (direct_spatial_mv_pred_flag=1). Default
+    /// ref lists (no modification). Caller supplies nal_ref_idc — usually 0 for B-frames that
+    /// aren't pyramid references.</summary>
+    public static void WriteBSlice(
+        BitWriter w,
+        SequenceParameterSet sps,
+        PictureParameterSet pps,
+        uint frameNum,
+        uint picOrderCntLsb,
+        bool isRefPic,
+        int sliceQpDelta,
+        uint disableDeblockingFilterIdc,
+        uint cabacInitIdc = 0)
+    {
+        ExpGolombWriter.WriteUe(w, 0); // first_mb_in_slice
+        ExpGolombWriter.WriteUe(w, 6); // slice_type = 6 (all-B)
+        ExpGolombWriter.WriteUe(w, pps.PicParameterSetId);
+        int frameNumBits = (int)sps.Log2MaxFrameNumMinus4 + 4;
+        w.WriteBits(frameNum, frameNumBits);
+        if (sps.PicOrderCntType == 0)
+        {
+            int lsbBits = (int)sps.Log2MaxPicOrderCntLsbMinus4 + 4;
+            w.WriteBits(picOrderCntLsb, lsbBits);
+        }
+        if (pps.RedundantPicCntPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, 0);
+        }
+        // B-slice: direct_spatial_mv_pred_flag immediately after redundant_pic_cnt (spec §7.3.3).
+        w.WriteBit(1); // spatial direct mode (simpler than temporal; matches our scope).
+        // num_ref_idx_active_override_flag = 0 (use PPS default, num_ref_idx_l0/l1_default_active_minus1=0 → 1 active).
+        w.WriteBit(0);
+        // ref_pic_list_modification: B-slice reads two flags (L0 and L1). Both 0 → default order.
+        w.WriteBit(0); // ref_pic_list_modification_flag_l0
+        w.WriteBit(0); // ref_pic_list_modification_flag_l1
+        // pred_weight_table absent — PPS WeightedPredFlag=0, WeightedBipredIdc=0.
+        // dec_ref_pic_marking: only when nal_ref_idc != 0.
+        if (isRefPic)
+        {
+            w.WriteBit(0); // adaptive_ref_pic_marking_mode_flag = 0 (sliding window).
+        }
+        if (pps.EntropyCodingModeFlag)
+        {
+            ExpGolombWriter.WriteUe(w, cabacInitIdc);
+        }
+        ExpGolombWriter.WriteSe(w, sliceQpDelta);
+        if (pps.DeblockingFilterControlPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, disableDeblockingFilterIdc);
+            if (disableDeblockingFilterIdc != 1)
+            {
+                ExpGolombWriter.WriteSe(w, 0);
+                ExpGolombWriter.WriteSe(w, 0);
+            }
+        }
+    }
+
     /// <summary>Encode the slice header for a non-IDR P-slice (single L0 reference).
     /// Sets slice_type=5 (all-P), num_ref_idx_active_override_flag=0, no ref list modification,
     /// no pred_weight_table, no adaptive ref-pic marking. Caller supplies nal_ref_idc != 0.
@@ -70,7 +169,8 @@ public static class SliceHeaderWriter
         uint frameNum,
         int sliceQpDelta,
         uint disableDeblockingFilterIdc,
-        uint cabacInitIdc = 0)
+        uint cabacInitIdc = 0,
+        uint picOrderCntLsb = 0)
     {
         ExpGolombWriter.WriteUe(w, 0); // first_mb_in_slice
         // slice_type = 5 (all-P, "all slices in this picture are P"); spec Table 7-6.
@@ -83,7 +183,7 @@ public static class SliceHeaderWriter
         if (sps.PicOrderCntType == 0)
         {
             int lsbBits = (int)sps.Log2MaxPicOrderCntLsbMinus4 + 4;
-            w.WriteBits(0, lsbBits);
+            w.WriteBits(picOrderCntLsb, lsbBits);
         }
         // pic_order_cnt_type==2: no extra fields.
         if (pps.RedundantPicCntPresentFlag)
