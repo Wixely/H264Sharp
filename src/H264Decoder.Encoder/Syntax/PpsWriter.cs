@@ -6,13 +6,13 @@ namespace H264Decoder.Encoder.Syntax;
 /// <summary>Serialize a Baseline-profile PPS to RBSP bytes (spec §7.3.2.2).</summary>
 public static class PpsWriter
 {
-    public static PictureParameterSet BuildBaseline()
+    public static PictureParameterSet BuildBaseline(bool entropyCodingModeFlag = false)
     {
         return new PictureParameterSet
         {
             PicParameterSetId = 0,
             SeqParameterSetId = 0,
-            EntropyCodingModeFlag = false,
+            EntropyCodingModeFlag = entropyCodingModeFlag,
             BottomFieldPicOrderInFramePresentFlag = false,
             NumSliceGroupsMinus1 = 0,
             NumRefIdxL0DefaultActiveMinus1 = 0,

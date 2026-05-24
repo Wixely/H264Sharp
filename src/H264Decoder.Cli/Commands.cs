@@ -58,13 +58,23 @@ public static class Commands
     /// encode &lt;in.yuv&gt; &lt;out.h264&gt; --size WxH [--frames N] [--qp Q]</summary>
     public static int EncodeYuv(string[] args, TextWriter stderr)
     {
-        // args[0]="encode", args[1]=in, args[2]=out, then --size WxH, optional --frames N, optional --qp Q.
+        // args[0]="encode", args[1]=in, args[2]=out, then options.
         string inPath = args[1];
         string outPath = args[2];
         int width = 0, height = 0, frames = 1, qp = 18;
-        for (int i = 3; i + 1 < args.Length; i += 2)
+        bool enableIntra4x4 = true;
+        bool enableCabac = false;
+        int i = 3;
+        while (i < args.Length)
         {
-            string k = args[i], v = args[i + 1];
+            string k = args[i];
+            // Boolean flags (no value).
+            if (k == "--no-intra4x4") { enableIntra4x4 = false; i++; continue; }
+            if (k == "--intra4x4") { enableIntra4x4 = true; i++; continue; }
+            if (k == "--cabac") { enableCabac = true; i++; continue; }
+            // Key/value flags.
+            if (i + 1 >= args.Length) { stderr.WriteLine($"option '{k}' requires a value"); return 4; }
+            string v = args[i + 1];
             if (k == "--size")
             {
                 int sep = v.IndexOf('x');
@@ -101,6 +111,7 @@ public static class Commands
                 stderr.WriteLine($"unknown option '{k}'");
                 return 4;
             }
+            i += 2;
         }
         if (width <= 0 || height <= 0)
         {
@@ -119,9 +130,15 @@ public static class Commands
             stderr.WriteLine($"YUV file too small: expected {frameBytes * frames}, got {yuv.Length}");
             return 3;
         }
-        byte[] annexB = H264Decoder.Encoder.H264FrameEncoder.EncodeAnnexB(yuv, width, height, qp, frames);
+        var opts = new H264Decoder.Encoder.H264FrameEncoder.Options
+        {
+            EnableIntra4x4 = enableIntra4x4,
+            EnableCabac = enableCabac,
+        };
+        byte[] annexB = H264Decoder.Encoder.H264FrameEncoder.EncodeAnnexB(yuv, width, height, qp, frames, opts);
         File.WriteAllBytes(outPath, annexB);
-        stderr.WriteLine($"encoded {width}x{height} x{frames} @ qp={qp} -> {outPath} ({annexB.Length} bytes)");
+        string entropy = enableCabac ? "CABAC" : "CAVLC";
+        stderr.WriteLine($"encoded {width}x{height} x{frames} @ qp={qp} {entropy} -> {outPath} ({annexB.Length} bytes)");
         return 0;
     }
 

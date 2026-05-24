@@ -110,8 +110,10 @@ public class EncoderRoundTripTests
         for (int j = 0; j < H; j++)
             for (int i = 0; i < W; i++)
                 maxErr = Math.Max(maxErr, Math.Abs(yuv[j * W + i] - pic.Y[j * pic.BufferWidth + i]));
-        // Low-frequency content with Intra_16x16 should round-trip nearly losslessly at qp=18.
-        Assert.InRange(maxErr, 0, 2);
+        // Low-frequency content should round-trip nearly losslessly at qp=18 regardless of whether
+        // the encoder chose Intra_16x16 or Intra_4x4 (4x4 has slightly higher per-pixel error due to
+        // per-block quant lacking the 16x16 DC Hadamard chain).
+        Assert.InRange(maxErr, 0, 4);
     }
 
     [Fact]

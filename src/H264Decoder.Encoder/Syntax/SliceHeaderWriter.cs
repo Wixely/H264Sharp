@@ -42,7 +42,10 @@ public static class SliceHeaderWriter
         // (NalRefIdc != 0 for IDR.)
         w.WriteBit(0); // no_output_of_prior_pics_flag
         w.WriteBit(0); // long_term_reference_flag
-        // CABAC: not present for I-slices regardless.
+        // CABAC entropy mode: when PPS flag is set, cabac_init_idc is signalled here for I-slices too
+        // per spec §7.3.3 (cabac_init_idc presence is gated by entropy_coding_mode_flag && slice_type != I/SI).
+        // Wait — actually for I/SI slices the cabac_init_idc is NOT present per spec; only for P/B/SP.
+        // So we omit it here even when CABAC is on for I-slice.
         ExpGolombWriter.WriteSe(w, sliceQpDelta);
         if (pps.DeblockingFilterControlPresentFlag)
         {

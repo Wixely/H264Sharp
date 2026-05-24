@@ -1,3 +1,5 @@
+using H264Decoder.Syntax;
+
 namespace H264Decoder.Encoder.Mode;
 
 /// <summary>Per-macroblock state retained across encoding so left/top neighbors can be queried
@@ -6,11 +8,27 @@ internal sealed class MacroblockEncoderState
 {
     public int MbAddress;
     public bool IsIntra16x16;
+    /// <summary>True if this MB was emitted as I_NxN (Intra_4x4).</summary>
+    public bool IsIntra4x4;
     public int CbpLuma;       // 0..15
     public int CbpChroma;     // 0..2
     public int QpY;           // current QP
     public int[] NonZeroCountLuma = new int[16];        // per 4x4 block raster
     public int[,] NonZeroCountChromaAc = new int[2, 4]; // per component, per 4x4 block
+    /// <summary>Per-4x4-block actual intra prediction mode (0..8) for Intra_4x4 MBs.
+    /// Default -1 for non-Intra_4x4 blocks. Used as neighbor source for predicted-mode in subsequent MBs.</summary>
+    public int[] Intra4x4Mode = FilledNeg1_16();
+    private static int[] FilledNeg1_16() { var a = new int[16]; for (int i = 0; i < 16; i++) a[i] = -1; return a; }
+    /// <summary>Intra chroma prediction mode (used by CABAC neighbor lookups).</summary>
+    public IntraChromaPredMode ChromaPredMode;
+    /// <summary>Per-4x4-block AC coded_block_flag (used by CABAC residual condTerm derivation in subsequent MBs).</summary>
+    public bool[] LumaAcCbf = new bool[16];
+    /// <summary>Luma Intra_16x16 DC coded_block_flag.</summary>
+    public bool LumaDcCbf;
+    /// <summary>Per-component chroma DC coded_block_flag (used by CABAC).</summary>
+    public bool[] ChromaDcCbf = new bool[2];
+    /// <summary>Per-component, per-4x4-block chroma AC coded_block_flag.</summary>
+    public bool[,] ChromaAcCbf = new bool[2, 4];
 
     /// <summary>Reconstructed Y plane for this MB (16x16, raster). Used by future neighbors for intra
     /// prediction. The encoder must match the decoder's reconstruction byte-for-byte so the predicted

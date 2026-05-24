@@ -265,6 +265,63 @@ internal static class MacroblockEncoder
         mbStates[mbAddress] = state;
     }
 
+    /// <summary>Compute the best-Intra_16x16-mode SAD of the source MB against neighbors in the
+    /// running picture buffer. Used by H264FrameEncoder to compare against Intra_4x4 cost.
+    /// Does not modify the picture.</summary>
+    public static int EstimateBestIntra16x16Sad(
+        ReadOnlySpan<byte> srcY, int srcStrideY,
+        byte[] picY, int picStrideY,
+        int mbX, int mbY, int mbsPerRow,
+        MacroblockEncoderState?[] mbStates, int mbAddress)
+    {
+        var leftMb = mbX > 0 ? mbStates[mbAddress - 1] : null;
+        var topMb = mbY > 0 ? mbStates[mbAddress - mbsPerRow] : null;
+
+        Span<byte> top = stackalloc byte[16];
+        Span<byte> left = stackalloc byte[16];
+        bool topAvail = topMb != null;
+        bool leftAvail = leftMb != null;
+        bool topLeftAvail = topAvail && leftAvail;
+        byte topLeft = 0;
+        if (topAvail)
+        {
+            int srcRow = mbY * 16 - 1;
+            int srcCol0 = mbX * 16;
+            for (int i = 0; i < 16; i++) top[i] = picY[srcRow * picStrideY + srcCol0 + i];
+        }
+        if (leftAvail)
+        {
+            int srcCol = mbX * 16 - 1;
+            int srcRow0 = mbY * 16;
+            for (int i = 0; i < 16; i++) left[i] = picY[(srcRow0 + i) * picStrideY + srcCol];
+        }
+        if (topLeftAvail)
+        {
+            topLeft = picY[(mbY * 16 - 1) * picStrideY + (mbX * 16 - 1)];
+        }
+
+        Span<byte> srcLuma = stackalloc byte[256];
+        for (int y = 0; y < 16; y++)
+            for (int x = 0; x < 16; x++)
+                srcLuma[y * 16 + x] = srcY[y * srcStrideY + x];
+
+        Span<byte> predTry = stackalloc byte[256];
+        int bestSad = int.MaxValue;
+        bool[] modeOk = { topAvail, leftAvail, true, topAvail && leftAvail && topLeftAvail };
+        for (int m = 0; m < 4; m++)
+        {
+            if (!modeOk[m]) continue;
+            IntraPrediction.PredictIntra16x16(
+                (Intra16x16PredMode)m,
+                top, topAvail, left, leftAvail, topLeft, topLeftAvail,
+                predTry);
+            int sad = 0;
+            for (int i = 0; i < 256; i++) sad += Math.Abs(srcLuma[i] - predTry[i]);
+            if (sad < bestSad) bestSad = sad;
+        }
+        return bestSad;
+    }
+
     private static int ComputeNcLumaBlock0(MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
     {
         int nA = leftMb is null ? -1 : leftMb.NonZeroCountLuma[MacroblockParser.SpatialToRaster(3, 0)];
@@ -365,6 +422,29 @@ internal static class MacroblockEncoder
         public int[,,] ChromaAc = new int[2, 4, 15];// per component, per 4x4 block, AC coeffs
         public byte[] ReconU = new byte[64];
         public byte[] ReconV = new byte[64];
+    }
+
+    /// <summary>Cross-file bridge so <see cref="IntraEncoder4x4"/> can reuse the chroma encoding path.</summary>
+    internal static IntraEncoder4x4.EncodeChromaResult EncodeChromaPublic(
+        ReadOnlySpan<byte> srcCb, ReadOnlySpan<byte> srcCr,
+        byte[] picU, byte[] picV, int picStrideC,
+        int mbX, int mbY, int qpY,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
+    {
+        var local = EncodeChroma(srcCb, srcCr, picU, picV, picStrideC, mbX, mbY, qpY, leftMb, topMb);
+        var r = new IntraEncoder4x4.EncodeChromaResult
+        {
+            ChromaMode = local.ChromaMode,
+            CbpChroma = local.CbpChroma,
+        };
+        for (int c = 0; c < 2; c++)
+            for (int k = 0; k < 4; k++) r.ChromaDc[c, k] = local.ChromaDc[c, k];
+        for (int c = 0; c < 2; c++)
+            for (int b = 0; b < 4; b++)
+                for (int k = 0; k < 15; k++) r.ChromaAc[c, b, k] = local.ChromaAc[c, b, k];
+        local.ReconU.CopyTo(r.ReconU, 0);
+        local.ReconV.CopyTo(r.ReconV, 0);
+        return r;
     }
 
     private static ChromaEncodeResult EncodeChroma(
