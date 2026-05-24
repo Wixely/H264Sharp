@@ -12,10 +12,34 @@ internal static class CabacMbEncoderB
 {
     private static readonly int[] ZigZag4x4 = { 0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15 };
 
+    /// <summary>Emit B_Skip via CABAC: mb_skip_flag = 1, no further syntax. Updates state so
+    /// later neighbor lookups (mb_skip_flag condTerm, mvd absMvdSum) see this MB as a skip.</summary>
+    public static void EncodeBSkip(
+        CabacEncoder cabac,
+        BMbEncoder.BCandidate cand,
+        MacroblockEncoderState state,
+        int mbAddress, int qpY,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
+    {
+        CabacEncSliceB.EncodeMbSkipFlagB(cabac, isSkip: true, leftMb, topMb);
+        BMbEncoder.PopulateBMbState(cand, state, mbAddress, qpY, 0, 0, 0, 0);
+        // For Skip we don't emit CBP/residual; CBF arrays stay zero.
+        for (int i = 0; i < 16; i++) { state.LumaAcCbf[i] = false; state.NonZeroCountLuma[i] = 0; }
+        state.LumaDcCbf = false;
+        for (int c = 0; c < 2; c++)
+        {
+            state.ChromaDcCbf[c] = false;
+            for (int i = 0; i < 4; i++) { state.ChromaAcCbf[c, i] = false; state.NonZeroCountChromaAc[c, i] = 0; }
+        }
+        cand.Bundle.ReconY.CopyTo(state.ReconY, 0);
+        cand.Bundle.ReconU.CopyTo(state.ReconU, 0);
+        cand.Bundle.ReconV.CopyTo(state.ReconV, 0);
+    }
+
     /// <summary>Emit a non-skip B-MB. mb_skip_flag is emitted as 0 by the caller, then this method
-    /// emits mb_type, mvd_l0 / mvd_l1, CBP luma+chroma, mb_qp_delta (when CBP != 0), residual.
-    /// Updates <paramref name="state"/> with all per-block bookkeeping (per-list MV/MVD, RefIdx,
-    /// PredFlag, NZC, CBF) so subsequent neighbor lookups see the right values.</summary>
+    /// emits mb_type, mvd_l0 / mvd_l1 (only for L0/L1/Bi — Direct has none), CBP luma+chroma,
+    /// mb_qp_delta (when CBP != 0), residual. Updates <paramref name="state"/> with all per-block
+    /// bookkeeping (per-list MV/MVD, RefIdx, PredFlag, NZC, CBF).</summary>
     public static void EncodeNonSkip(
         CabacEncoder cabac,
         BMbEncoder.BCandidate cand,
@@ -31,6 +55,7 @@ internal static class CabacMbEncoderB
         // mb_type.
         int mbType = cand.Direction switch
         {
+            BMbEncoder.Dir.Direct => 0,
             BMbEncoder.Dir.L0 => 1,
             BMbEncoder.Dir.L1 => 2,
             BMbEncoder.Dir.Bi => 3,
@@ -38,71 +63,42 @@ internal static class CabacMbEncoderB
         };
         CabacEncSliceB.EncodeMbTypeB16x16(cabac, mbType, leftMb, topMb);
 
-        // ---- Update state up-front (before MVD emission) so in-MB neighbor lookups work for
-        // the residual phase. The mvd values are zeroed here and filled below as we emit. ----
-        bool useL0 = cand.Direction != BMbEncoder.Dir.L1;
-        bool useL1 = cand.Direction != BMbEncoder.Dir.L0;
-        state.MbAddress = mbAddress;
-        state.IsBInter = true;
-        state.IsInter = true;
-        state.IsInterP16x16 = false;
-        state.IsIntra16x16 = false;
-        state.IsIntra4x4 = false;
-        state.IsSkipped = false;
-        state.BPredDir = (byte)cand.Direction;
-        state.RawMbType = mbType;
-        state.QpY = qpY;
-        for (int i = 0; i < 16; i++)
-        {
-            state.PredFlagL0Block[i] = useL0 ? (byte)1 : (byte)0;
-            state.PredFlagL1Block[i] = useL1 ? (byte)1 : (byte)0;
-            state.MvL0XBlock[i] = useL0 ? cand.MvL0X : 0;
-            state.MvL0YBlock[i] = useL0 ? cand.MvL0Y : 0;
-            state.MvL1XBlock[i] = useL1 ? cand.MvL1X : 0;
-            state.MvL1YBlock[i] = useL1 ? cand.MvL1Y : 0;
-            state.MvdL0XBlock[i] = 0;
-            state.MvdL0YBlock[i] = 0;
-            state.MvdL1XBlock[i] = 0;
-            state.MvdL1YBlock[i] = 0;
-        }
-        for (int q = 0; q < 4; q++)
-        {
-            state.RefIdxL08x8[q] = useL0 ? 0 : -1;
-            state.RefIdxL18x8[q] = useL1 ? 0 : -1;
-        }
+        // ---- Populate state for in-MB neighbor lookups during residual phase. ----
+        BMbEncoder.PopulateBMbState(cand, state, mbAddress, qpY, 0, 0, 0, 0);
 
-        // ---- mvd_l0 then mvd_l1 (per decoder iteration order). ----
+        // ---- mvd_l0 then mvd_l1 (per decoder iteration order). Direct emits none. ----
         int mvdL0X = 0, mvdL0Y = 0, mvdL1X = 0, mvdL1Y = 0;
-        if (useL0)
+        if (cand.Direction != BMbEncoder.Dir.Direct)
         {
-            mvdL0X = cand.MvL0X - predL0X;
-            mvdL0Y = cand.MvL0Y - predL0Y;
-            int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: true);
-            int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: false);
-            CabacEncSliceP.EncodeMvd(cabac, mvdL0X, sumX, ctxBase: 40);
-            CabacEncSliceP.EncodeMvd(cabac, mvdL0Y, sumY, ctxBase: 47);
+            bool useL0 = cand.Direction != BMbEncoder.Dir.L1;
+            bool useL1 = cand.Direction != BMbEncoder.Dir.L0;
+            if (useL0)
+            {
+                mvdL0X = cand.MvL0X - predL0X;
+                mvdL0Y = cand.MvL0Y - predL0Y;
+                int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: true);
+                int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: false);
+                CabacEncSliceP.EncodeMvd(cabac, mvdL0X, sumX, ctxBase: 40);
+                CabacEncSliceP.EncodeMvd(cabac, mvdL0Y, sumY, ctxBase: 47);
+            }
+            if (useL1)
+            {
+                mvdL1X = cand.MvL1X - predL1X;
+                mvdL1Y = cand.MvL1Y - predL1Y;
+                int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: true);
+                int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: false);
+                CabacEncSliceP.EncodeMvd(cabac, mvdL1X, sumX, ctxBase: 40);
+                CabacEncSliceP.EncodeMvd(cabac, mvdL1Y, sumY, ctxBase: 47);
+            }
+            // Re-populate per-block mvds now that we know them (state currently has zeros).
+            for (int i = 0; i < 16; i++)
+            {
+                state.MvdL0XBlock[i] = useL0 ? mvdL0X : 0;
+                state.MvdL0YBlock[i] = useL0 ? mvdL0Y : 0;
+                state.MvdL1XBlock[i] = useL1 ? mvdL1X : 0;
+                state.MvdL1YBlock[i] = useL1 ? mvdL1Y : 0;
+            }
         }
-        if (useL1)
-        {
-            mvdL1X = cand.MvL1X - predL1X;
-            mvdL1Y = cand.MvL1Y - predL1Y;
-            int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: true);
-            int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: false);
-            CabacEncSliceP.EncodeMvd(cabac, mvdL1X, sumX, ctxBase: 40);
-            CabacEncSliceP.EncodeMvd(cabac, mvdL1Y, sumY, ctxBase: 47);
-        }
-        // Populate per-block MVD arrays (used by neighbor lookups in subsequent MBs).
-        for (int i = 0; i < 16; i++)
-        {
-            state.MvdL0XBlock[i] = useL0 ? mvdL0X : 0;
-            state.MvdL0YBlock[i] = useL0 ? mvdL0Y : 0;
-            state.MvdL1XBlock[i] = useL1 ? mvdL1X : 0;
-            state.MvdL1YBlock[i] = useL1 ? mvdL1Y : 0;
-        }
-        state.MvL0X = useL0 ? cand.MvL0X : 0;
-        state.MvL0Y = useL0 ? cand.MvL0Y : 0;
-        state.RefIdxL0 = useL0 ? 0 : -1;
-        state.RefIdxL1 = useL1 ? 0 : -1;
 
         // ---- CBP luma + chroma (shared with P-slice CABAC encoder). ----
         var bundle = cand.Bundle;

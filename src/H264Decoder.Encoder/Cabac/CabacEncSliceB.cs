@@ -22,8 +22,9 @@ internal static class CabacEncSliceB
         cabac.EncodeBin(24 + condA + condB, isSkip ? 1 : 0);
     }
 
-    /// <summary>Encode B mb_type for 16x16 inter codes 1, 2, or 3 (spec Table 9-37, ctxIdxOffset=27).
+    /// <summary>Encode B mb_type for 16x16 codes 0, 1, 2, or 3 (spec Table 9-37, ctxIdxOffset=27).
     /// Bin strings:
+    ///   0 (B_Direct_16x16) : "0"
     ///   1 (B_L0_16x16) : "1 0 0"
     ///   2 (B_L1_16x16) : "1 0 1"
     ///   3 (B_Bi_16x16) : "1 1 0 0 0 0"
@@ -36,11 +37,18 @@ internal static class CabacEncSliceB
     public static void EncodeMbTypeB16x16(CabacEncoder cabac, int mbType,
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
     {
-        if (mbType < 1 || mbType > 3)
-            throw new NotSupportedException($"CABAC encode: B mb_type {mbType} not supported in Phase 5b (only 1/2/3)");
+        if (mbType < 0 || mbType > 3)
+            throw new NotSupportedException($"CABAC encode: B mb_type {mbType} not supported in Phase 5b/5c (only 0/1/2/3)");
 
         int condA = NeighborMbTypeFlagB(leftMb);
         int condB = NeighborMbTypeFlagB(topMb);
+
+        if (mbType == 0)
+        {
+            // B_Direct_16x16: bin0 = 0; no further bins.
+            cabac.EncodeBin(27 + condA + condB, 0);
+            return;
+        }
 
         // bin0 = 1 (not B_Direct_16x16).
         cabac.EncodeBin(27 + condA + condB, 1);

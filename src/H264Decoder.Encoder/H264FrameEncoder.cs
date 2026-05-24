@@ -159,6 +159,10 @@ public static class H264FrameEncoder
         var reconY = new byte[frames][];
         var reconU = new byte[frames][];
         var reconV = new byte[frames][];
+        // Per-display-frame mbStates so the B-frame encoder can read the colocated MB MVs from its
+        // L1[0] (the next P/I in display order) for spatial-direct colZero override (spec §8.4.1.2.2).
+        int totalMbsPerFrame = picWidthInMbs * picHeightInMbs;
+        var pMbStates = new MacroblockEncoderState?[frames][];
 
         // GOP: I, P, B, P, B, P, ...
         // Display index → encode type: 0=I; even-positive=P; odd=B (unless it's the tail with no future P).
@@ -204,6 +208,7 @@ public static class H264FrameEncoder
             uint picOrderCntLsb = (uint)((disp * 2) & ((1 << ((int)sps.Log2MaxPicOrderCntLsbMinus4 + 4)) - 1));
             byte[] sliceNal;
 
+            var frameMbStates = new MacroblockEncoderState?[totalMbsPerFrame];
             if (type == 'I')
             {
                 // First frame: IDR with Main-profile SPS.
@@ -212,7 +217,8 @@ public static class H264FrameEncoder
                     bufferChromaWidth, bufferChromaHeight,
                     frameNum: 0, idrPicId: 0,
                     rY, rU, rV, options,
-                    spsOverride: sps, ppsOverride: pps);
+                    spsOverride: sps, ppsOverride: pps,
+                    mbStatesOut: frameMbStates);
                 nextRefFrameNum = 1;
                 lastRefFrameNumForB = 0;
             }
@@ -229,7 +235,8 @@ public static class H264FrameEncoder
                     reconY[refDisp]!, reconU[refDisp]!, reconV[refDisp]!,
                     options,
                     spsOverride: sps, ppsOverride: pps,
-                    picOrderCntLsb: picOrderCntLsb);
+                    picOrderCntLsb: picOrderCntLsb,
+                    mbStatesOut: frameMbStates);
                 lastRefFrameNumForB = nextRefFrameNum & 0xF;
                 nextRefFrameNum++;
             }
@@ -246,11 +253,13 @@ public static class H264FrameEncoder
                     rY, rU, rV,
                     reconY[refForwardDisp]!, reconU[refForwardDisp]!, reconV[refForwardDisp]!,
                     reconY[refBackwardDisp]!, reconU[refBackwardDisp]!, reconV[refBackwardDisp]!,
-                    sps, pps, options);
+                    sps, pps, options,
+                    colocatedMbStates: pMbStates[refBackwardDisp]);
                 // B is non-reference; does not advance nextRefFrameNum.
             }
             AnnexBWriter.WriteAnnexB(output, new[] { sliceNal });
             reconY[disp] = rY; reconU[disp] = rU; reconV[disp] = rV;
+            pMbStates[disp] = frameMbStates;
         }
         return output.ToArray();
     }
@@ -277,7 +286,8 @@ public static class H264FrameEncoder
         byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
         Options options,
         SequenceParameterSet? spsOverride = null,
-        PictureParameterSet? ppsOverride = null)
+        PictureParameterSet? ppsOverride = null,
+        MacroblockEncoderState?[]? mbStatesOut = null)
     {
         // Allocate MB-aligned planes with edge padding by replicating the last row/column.
         var srcY = new byte[bufferWidth * bufferHeight];
@@ -295,7 +305,7 @@ public static class H264FrameEncoder
             return EncodeIFrameCabac(srcY, srcU, srcV, qp,
                 picWidthInMbs, picHeightInMbs, bufferWidth, bufferChromaWidth,
                 frameNum, idrPicId, reconYOut, reconUOut, reconVOut, width, height, options,
-                spsOverride, ppsOverride);
+                spsOverride, ppsOverride, mbStatesOut);
         }
 
         var sliceWriter = new BitWriter(4096);
@@ -367,6 +377,7 @@ public static class H264FrameEncoder
 
         sliceWriter.WriteRbspTrailingBits();
         byte[] sliceRbsp = sliceWriter.ToByteArray();
+        if (mbStatesOut != null) Array.Copy(mbStates, mbStatesOut, totalMbs);
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceIdr, nalRefIdc: 3, sliceRbsp);
     }
 
@@ -380,7 +391,8 @@ public static class H264FrameEncoder
         Options options,
         SequenceParameterSet? spsOverride = null,
         PictureParameterSet? ppsOverride = null,
-        uint picOrderCntLsb = 0)
+        uint picOrderCntLsb = 0,
+        MacroblockEncoderState?[]? mbStatesOut = null)
     {
         var srcY = new byte[bufferWidth * bufferHeight];
         var srcU = new byte[bufferChromaWidth * bufferChromaHeight];
@@ -628,6 +640,7 @@ public static class H264FrameEncoder
             sliceWriter.WriteRbspTrailingBits();
         }
         byte[] sliceRbsp = sliceWriter.ToByteArray();
+        if (mbStatesOut != null) Array.Copy(mbStates, mbStatesOut, totalMbs);
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 2, sliceRbsp);
     }
 
@@ -642,7 +655,8 @@ public static class H264FrameEncoder
         byte[] refL0Y, byte[] refL0U, byte[] refL0V,
         byte[] refL1Y, byte[] refL1U, byte[] refL1V,
         SequenceParameterSet sps, PictureParameterSet pps,
-        Options options)
+        Options options,
+        MacroblockEncoderState?[]? colocatedMbStates = null)
     {
         var srcY = new byte[bufferWidth * bufferHeight];
         var srcU = new byte[bufferChromaWidth * bufferChromaHeight];
@@ -688,6 +702,9 @@ public static class H264FrameEncoder
             cabac = new H264Decoder.Cabac.CabacEncoder(contexts);
         }
 
+        // mb_skip_run accumulator (CAVLC only): number of skipped MBs since the last emitted MB.
+        int pendingSkipRun = 0;
+
         for (int addr = 0; addr < totalMbs; addr++)
         {
             int mbX = addr % picWidthInMbs;
@@ -708,14 +725,16 @@ public static class H264FrameEncoder
             (int predL1X, int predL1Y) = BMbEncoder.PredictBSliceMv(leftMb, topMb, topRightMb, topLeftMb, listX: 1);
 
             int lambda = options.ModeDecisionLambda >= 0 ? options.ModeDecisionLambda : DefaultLambda(qp);
-            var cand = BMbEncoder.ChooseBestInter(
+            var cand = BMbEncoder.ChooseBestInterWithDirect(
                 mbSrcY, mbSrcU, mbSrcV, bufferWidth, bufferChromaWidth,
                 refL0Y, refL0U, refL0V, refL1Y, refL1U, refL1V,
                 bufferWidth, bufferHeight, bufferChromaWidth, bufferChromaHeight,
                 mbX, mbY, qp,
                 predL0X, predL0Y, predL1X, predL1Y,
                 options.SearchRangePel, options.MaxSadEvalsPerMb,
-                options.EnableSubpelMe, lambda);
+                options.EnableSubpelMe, lambda,
+                leftMb, topMb, topRightMb, topLeftMb,
+                colocatedMbStates, picWidthInMbs, addr);
 
             var state = new MacroblockEncoderState
             {
@@ -725,20 +744,41 @@ public static class H264FrameEncoder
 
             if (options.EnableCabac)
             {
-                CabacMbEncoderB.EncodeNonSkip(
-                    cabac!, cand, state, addr, qp,
-                    predL0X, predL0Y, predL1X, predL1Y,
-                    leftMb, topMb, ref prevMbQpDeltaState);
+                if (cand.IsSkip)
+                {
+                    CabacMbEncoderB.EncodeBSkip(cabac!, cand, state, addr, qp, leftMb, topMb);
+                }
+                else
+                {
+                    CabacMbEncoderB.EncodeNonSkip(
+                        cabac!, cand, state, addr, qp,
+                        predL0X, predL0Y, predL1X, predL1Y,
+                        leftMb, topMb, ref prevMbQpDeltaState);
+                }
                 bool lastMb = addr == totalMbs - 1;
                 CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMb);
             }
             else
             {
-                // CAVLC: mb_skip_run = 0 prefix for every emitted MB (P/SP/B slice syntax).
-                ExpGolombWriter.WriteUe(sliceWriter, 0);
-                BMbEncoder.EmitBMb16x16(sliceWriter, cand, qp,
-                    predL0X, predL0Y, predL1X, predL1Y,
-                    state, leftMb, topMb);
+                if (cand.IsSkip)
+                {
+                    // CAVLC: accumulate into mb_skip_run; emit no syntax for this MB.
+                    pendingSkipRun++;
+                    BMbEncoder.PopulateBMbState(cand, state, addr, qp, 0, 0, 0, 0);
+                    // Skip MB has no CBP and no residual; CBF arrays stay zero.
+                    cand.Bundle.ReconY.CopyTo(state.ReconY, 0);
+                    cand.Bundle.ReconU.CopyTo(state.ReconU, 0);
+                    cand.Bundle.ReconV.CopyTo(state.ReconV, 0);
+                }
+                else
+                {
+                    // CAVLC: flush pending mb_skip_run before each emitted MB.
+                    ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+                    pendingSkipRun = 0;
+                    BMbEncoder.EmitBMb16x16(sliceWriter, cand, qp,
+                        predL0X, predL0Y, predL1X, predL1Y,
+                        state, leftMb, topMb);
+                }
             }
 
             // Store reconstructed samples into the picture buffers.
@@ -756,6 +796,11 @@ public static class H264FrameEncoder
         }
         else
         {
+            // Trailing mb_skip_run for a CAVLC B-slice that ends in a skip run.
+            if (pendingSkipRun > 0)
+            {
+                ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+            }
             sliceWriter.WriteRbspTrailingBits();
         }
         byte[] sliceRbsp = sliceWriter.ToByteArray();
@@ -775,7 +820,8 @@ public static class H264FrameEncoder
         int width, int height,
         Options options,
         SequenceParameterSet? spsOverride = null,
-        PictureParameterSet? ppsOverride = null)
+        PictureParameterSet? ppsOverride = null,
+        MacroblockEncoderState?[]? mbStatesOut = null)
     {
         var sliceWriter = new BitWriter(4096);
         var sps = spsOverride ?? SpsWriter.BuildBaseline(width, height);
@@ -870,6 +916,7 @@ public static class H264FrameEncoder
         // our framing the slice NAL just contains the slice header + CABAC bytes.
 
         byte[] sliceRbsp = sliceWriter.ToByteArray();
+        if (mbStatesOut != null) Array.Copy(mbStates, mbStatesOut, totalMbs);
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceIdr, nalRefIdc: 3, sliceRbsp);
     }
 
