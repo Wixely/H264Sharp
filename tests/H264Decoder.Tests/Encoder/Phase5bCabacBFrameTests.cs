@@ -3,13 +3,13 @@ using Xunit.Abstractions;
 
 namespace H264Decoder.Tests.Encoder;
 
-/// <summary>Phase 5a: encoder emits IPBP GOP with B_L0/L1/Bi_16x16 (CAVLC). Verifies that streams
-/// produced with EnableBFrames=true round-trip through our decoder and decode silently through
-/// ffmpeg, and that B-frames are correctly placed in the bitstream's display order.</summary>
-public class Phase5aBFrameTests
+/// <summary>Phase 5b: CABAC + B-frame combined path. Uses the same per-MB decision as Phase 5a
+/// (B_L0/L1/Bi_16x16) but emits the macroblock layer through CABAC instead of CAVLC.
+/// Verifies round-trip through our decoder and silent ffmpeg cross-decode.</summary>
+public class Phase5bCabacBFrameTests
 {
     private readonly ITestOutputHelper _output;
-    public Phase5aBFrameTests(ITestOutputHelper output) { _output = output; }
+    public Phase5bCabacBFrameTests(ITestOutputHelper output) { _output = output; }
 
     private static byte[] MakeSolidYuv(int W, int H, byte y, byte u, byte v)
     {
@@ -22,8 +22,6 @@ public class Phase5aBFrameTests
         return data;
     }
 
-    /// <summary>Multi-frame fixture: each frame is a translated version of the same content,
-    /// so motion is exactly predictable. Phase 5a B-MBs should win on most blocks.</summary>
     private static byte[] MakeMotionSequence(int W, int H, int frames)
     {
         int ySize = W * H;
@@ -32,7 +30,7 @@ public class Phase5aBFrameTests
         var buf = new byte[frames * frameSize];
         for (int f = 0; f < frames; f++)
         {
-            int shift = f * 2; // 2-pixel horizontal shift per frame
+            int shift = f * 2;
             int yOff = f * frameSize;
             int uOff = yOff + ySize;
             int vOff = uOff + cSize;
@@ -40,20 +38,31 @@ public class Phase5aBFrameTests
                 for (int x = 0; x < W; x++)
                 {
                     int sx = ((x + shift) % W);
-                    // Gradient with a couple of vertical bands so SAD has signal.
                     byte v = (byte)((sx * 4 + y) & 0xFF);
                     buf[yOff + y * W + x] = v;
                 }
-            // Flat chroma.
             for (int i = 0; i < cSize; i++) { buf[uOff + i] = 128; buf[vOff + i] = 128; }
         }
         return buf;
     }
 
-    [Fact]
-    public void BFrames_SolidColor_3Frames_RoundTrip()
+    private static double ComputeYPsnr(byte[] src, int srcOff, byte[] dec, int decStride, int W, int H)
     {
-        // 3-frame IPBP: I0, P2 (display 2), B1.
+        double mse = 0;
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++)
+            {
+                int d = src[srcOff + y * W + x] - dec[y * decStride + x];
+                mse += d * d;
+            }
+        mse /= (W * H);
+        if (mse <= 0) return 99.0;
+        return 10.0 * Math.Log10(255.0 * 255.0 / mse);
+    }
+
+    [Fact]
+    public void Cabac_BFrames_SolidColor_3Frames_RoundTrip()
+    {
         int W = 32, H = 32;
         var combined = new List<byte>();
         combined.AddRange(MakeSolidYuv(W, H, 100, 128, 128));
@@ -61,7 +70,7 @@ public class Phase5aBFrameTests
         combined.AddRange(MakeSolidYuv(W, H, 100, 128, 128));
         byte[] yuv = combined.ToArray();
         byte[] h264 = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 3,
-            new H264FrameEncoder.Options { EnableBFrames = true });
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = true });
         var pics = new H264FrameDecoder().DecodeAllFrames(h264);
         Assert.Equal(3, pics.Count);
         foreach (var pic in pics)
@@ -75,93 +84,78 @@ public class Phase5aBFrameTests
     }
 
     [Fact]
-    public void BFrames_5Frames_DecodeOrderHasIPBPB_DisplayOrderIsLinear()
+    public void Cabac_BFrames_5Frames_RoundTripPocMonotonic()
     {
-        // 5 frames: I0 P2 B1 P4 B3 in coding order; I P B P B in display order.
         int W = 32, H = 32;
         byte[] yuv = MakeMotionSequence(W, H, 5);
         byte[] h264 = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 5,
-            new H264FrameEncoder.Options { EnableBFrames = true });
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = true });
         var pics = new H264FrameDecoder().DecodeAllFrames(h264);
         Assert.Equal(5, pics.Count);
-        // DecodeAllFrames returns display-ordered pictures (sorted by POC).
-        // Display order should yield monotonically increasing POC.
         for (int i = 1; i < pics.Count; i++)
-            Assert.True(pics[i].PicOrderCnt > pics[i - 1].PicOrderCnt,
-                $"POC not monotonic at i={i}: prev={pics[i - 1].PicOrderCnt}, cur={pics[i].PicOrderCnt}");
-        // Each pic should reconstruct close to its source frame.
+            Assert.True(pics[i].PicOrderCnt > pics[i - 1].PicOrderCnt);
         int frameSize = W * H + 2 * (W / 2) * (H / 2);
         for (int i = 0; i < 5; i++)
         {
-            int maxErr = 0;
-            for (int y = 0; y < H; y++)
-                for (int x = 0; x < W; x++)
-                {
-                    int src = yuv[i * frameSize + y * W + x];
-                    int dec = pics[i].Y[y * pics[i].BufferWidth + x];
-                    maxErr = Math.Max(maxErr, Math.Abs(src - dec));
-                }
-            _output.WriteLine($"frame {i}: maxErr={maxErr}");
-            Assert.InRange(maxErr, 0, 60);
+            double psnr = ComputeYPsnr(yuv, i * frameSize, pics[i].Y, pics[i].BufferWidth, W, H);
+            _output.WriteLine($"frame {i}: PSNR={psnr:F2}dB");
+            Assert.True(psnr > 30.0, $"frame {i} PSNR too low: {psnr:F2}dB");
         }
     }
 
     [Fact]
-    public void BFrames_StreamIsSmallerThanIPPPOnPredictableMotion()
+    public void Cabac_BFrames_SmallerThanCavlcOnPredictableMotion()
     {
-        // On predictable motion the B-frame should benefit from bipred (avg of past+future),
-        // outperforming the IPPP baseline that only references the past.
+        // On the same content with the same mode decisions, CABAC should typically produce
+        // a smaller bitstream than CAVLC. (B-frame residuals are usually low-entropy, which
+        // is exactly CABAC's sweet spot.)
         int W = 32, H = 32;
         byte[] yuv = MakeMotionSequence(W, H, 5);
-        byte[] ippp = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 5,
-            new H264FrameEncoder.Options { EnableBFrames = false });
-        byte[] ipbp = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 5,
-            new H264FrameEncoder.Options { EnableBFrames = true });
-        _output.WriteLine($"IPPP={ippp.Length} bytes, IPBP={ipbp.Length} bytes");
-        // On 5-frame predictable motion, IPBP should at least not be drastically larger.
-        // Phase 5a uses non-iterative bipred and skips B_Skip / B_Direct, so the win can be small;
-        // accept anything <= 1.5x the IPPP size as "reasonable".
-        Assert.True(ipbp.Length <= ippp.Length * 3 / 2,
-            $"IPBP ({ipbp.Length}) is suspiciously larger than IPPP ({ippp.Length})");
+        byte[] cavlc = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 5,
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = false });
+        byte[] cabac = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 5,
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = true });
+        _output.WriteLine($"CAVLC={cavlc.Length} bytes, CABAC={cabac.Length} bytes");
+        // Be generous — within 1.2x is the soft pass; we want to catch catastrophic bloat,
+        // not enforce a tight ratio on the small fixtures we have here.
+        Assert.True(cabac.Length <= cavlc.Length * 12 / 10,
+            $"CABAC bitstream ({cabac.Length}) is significantly larger than CAVLC ({cavlc.Length})");
     }
 
     [Fact]
-    public void BFrames_FfmpegCrossDecodes_3Frames_WhenAvailable()
+    public void Cabac_BFrames_LargerFrame_RoundTrip()
+    {
+        int W = 64, H = 48; // 12 MBs per frame
+        byte[] yuv = MakeMotionSequence(W, H, 3);
+        byte[] h264 = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 3,
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = true });
+        var pics = new H264FrameDecoder().DecodeAllFrames(h264);
+        Assert.Equal(3, pics.Count);
+    }
+
+    [Fact]
+    public void Cabac_BFrames_FfmpegCrossDecodes_3Frames_WhenAvailable()
     {
         string? ffmpeg = FindFfmpeg();
         if (ffmpeg is null) return;
         int W = 32, H = 32;
         byte[] yuv = MakeMotionSequence(W, H, 3);
         byte[] h264 = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 3,
-            new H264FrameEncoder.Options { EnableBFrames = true });
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = true });
         AssertFfmpegDecodesSilently(ffmpeg, h264, W, H);
     }
 
     [Fact]
-    public void BFrames_FfmpegCrossDecodes_5Frames_WhenAvailable()
+    public void Cabac_BFrames_FfmpegCrossDecodes_5Frames_WhenAvailable()
     {
         string? ffmpeg = FindFfmpeg();
         if (ffmpeg is null) return;
         int W = 32, H = 32;
         byte[] yuv = MakeMotionSequence(W, H, 5);
         byte[] h264 = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 5,
-            new H264FrameEncoder.Options { EnableBFrames = true });
+            new H264FrameEncoder.Options { EnableBFrames = true, EnableCabac = true });
         AssertFfmpegDecodesSilently(ffmpeg, h264, W, H);
     }
-
-    [Fact]
-    public void BFrames_LargerFrame_RoundTrip()
-    {
-        int W = 64, H = 48; // 12 MBs per frame
-        byte[] yuv = MakeMotionSequence(W, H, 3);
-        byte[] h264 = H264FrameEncoder.EncodeAnnexB(yuv, W, H, qp: 22, frames: 3,
-            new H264FrameEncoder.Options { EnableBFrames = true });
-        var pics = new H264FrameDecoder().DecodeAllFrames(h264);
-        Assert.Equal(3, pics.Count);
-    }
-
-    // (Phase 5b enables CABAC + B-frames; the standalone test for that combo lives in
-    // Phase5bCabacBFrameTests.)
 
     private static string? FindFfmpeg()
     {

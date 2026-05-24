@@ -65,8 +65,6 @@ public static class H264FrameEncoder
 
         if (options.EnableBFrames)
         {
-            if (options.EnableCabac)
-                throw new NotSupportedException("CABAC + B-frames (Phase 5b) not yet implemented; use EnableCabac=false");
             return EncodeAnnexBWithBFrames(yuv, width, height, qp, frames, options);
         }
 
@@ -135,7 +133,7 @@ public static class H264FrameEncoder
         ReadOnlySpan<byte> yuv, int width, int height, int qp, int frames, Options options)
     {
         var sps = SpsWriter.BuildMain(width, height);
-        var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: false);
+        var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: options.EnableCabac);
         byte[] spsRbsp = SpsWriter.Serialize(sps);
         byte[] ppsRbsp = PpsWriter.Serialize(pps);
 
@@ -296,7 +294,8 @@ public static class H264FrameEncoder
         {
             return EncodeIFrameCabac(srcY, srcU, srcV, qp,
                 picWidthInMbs, picHeightInMbs, bufferWidth, bufferChromaWidth,
-                frameNum, idrPicId, reconYOut, reconUOut, reconVOut, width, height, options);
+                frameNum, idrPicId, reconYOut, reconUOut, reconVOut, width, height, options,
+                spsOverride, ppsOverride);
         }
 
         var sliceWriter = new BitWriter(4096);
@@ -660,12 +659,34 @@ public static class H264FrameEncoder
         SliceHeaderWriter.WriteBSlice(sliceWriter, sps, pps,
             frameNum: frameNum,
             picOrderCntLsb: picOrderCntLsb,
-            isRefPic: false, // B-frames not used as references in Phase 5a (nal_ref_idc=0).
+            isRefPic: false, // B-frames not used as references in Phase 5a/5b (nal_ref_idc=0).
             sliceQpDelta: sliceQpDelta,
-            disableDeblockingFilterIdc: 1);
+            disableDeblockingFilterIdc: 1,
+            cabacInitIdc: 0);
 
         int totalMbs = picWidthInMbs * picHeightInMbs;
         var mbStates = new MacroblockEncoderState?[totalMbs];
+
+        // ---- CABAC state (only when EnableCabac is true). ----
+        H264Decoder.Cabac.CabacEncoder? cabac = null;
+        int prevMbQpDeltaState = 0;
+        if (options.EnableCabac)
+        {
+            // Byte-align before CABAC bytes (cabac_alignment_one_bit padding per spec §7.3.4).
+            while ((sliceWriter.BitPosition & 7) != 0) sliceWriter.WriteBit(1u);
+            var contexts = new H264Decoder.Cabac.CabacContexts(H264Decoder.Cabac.CabacInitTable.ContextCount);
+            // B-slice with cabac_init_idc=0 maps to model index 1 (same row as P-slice idc=0;
+            // decoder uses `model = 1 + cabac_init_idc` for non-I slices).
+            int model = 1;
+            for (int ctxIdx = 0; ctxIdx < H264Decoder.Cabac.CabacInitTable.ContextCount; ctxIdx++)
+            {
+                sbyte m = H264Decoder.Cabac.CabacInitTable.MN[ctxIdx, model, 0];
+                sbyte n = H264Decoder.Cabac.CabacInitTable.MN[ctxIdx, model, 1];
+                if (m == H264Decoder.Cabac.CabacInitTable.CtxNA) continue;
+                contexts.Initialize(ctxIdx, m, n, qp);
+            }
+            cabac = new H264Decoder.Cabac.CabacEncoder(contexts);
+        }
 
         for (int addr = 0; addr < totalMbs; addr++)
         {
@@ -696,17 +717,29 @@ public static class H264FrameEncoder
                 options.SearchRangePel, options.MaxSadEvalsPerMb,
                 options.EnableSubpelMe, lambda);
 
-            // mb_skip_run = 0 prefix for every emitted MB (CAVLC P/SP/B slice syntax).
-            ExpGolombWriter.WriteUe(sliceWriter, 0);
-
             var state = new MacroblockEncoderState
             {
                 MbAddress = addr,
                 QpY = qp,
             };
-            BMbEncoder.EmitBMb16x16(sliceWriter, cand, qp,
-                predL0X, predL0Y, predL1X, predL1Y,
-                state, leftMb, topMb);
+
+            if (options.EnableCabac)
+            {
+                CabacMbEncoderB.EncodeNonSkip(
+                    cabac!, cand, state, addr, qp,
+                    predL0X, predL0Y, predL1X, predL1Y,
+                    leftMb, topMb, ref prevMbQpDeltaState);
+                bool lastMb = addr == totalMbs - 1;
+                CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMb);
+            }
+            else
+            {
+                // CAVLC: mb_skip_run = 0 prefix for every emitted MB (P/SP/B slice syntax).
+                ExpGolombWriter.WriteUe(sliceWriter, 0);
+                BMbEncoder.EmitBMb16x16(sliceWriter, cand, qp,
+                    predL0X, predL0Y, predL1X, predL1Y,
+                    state, leftMb, topMb);
+            }
 
             // Store reconstructed samples into the picture buffers.
             MacroblockEncoderInter.StoreReconToPicture(cand.Bundle,
@@ -716,7 +749,15 @@ public static class H264FrameEncoder
             mbStates[addr] = state;
         }
 
-        sliceWriter.WriteRbspTrailingBits();
+        if (options.EnableCabac)
+        {
+            byte[] cabacBytes = cabac!.Finish();
+            foreach (byte b in cabacBytes) sliceWriter.WriteBits(b, 8);
+        }
+        else
+        {
+            sliceWriter.WriteRbspTrailingBits();
+        }
         byte[] sliceRbsp = sliceWriter.ToByteArray();
         // nal_ref_idc=0: B-frame is not used as a reference for later pictures.
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 0, sliceRbsp);
@@ -732,11 +773,13 @@ public static class H264FrameEncoder
         uint frameNum, uint idrPicId,
         byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
         int width, int height,
-        Options options)
+        Options options,
+        SequenceParameterSet? spsOverride = null,
+        PictureParameterSet? ppsOverride = null)
     {
         var sliceWriter = new BitWriter(4096);
-        var sps = SpsWriter.BuildBaseline(width, height);
-        var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: true);
+        var sps = spsOverride ?? SpsWriter.BuildBaseline(width, height);
+        var pps = ppsOverride ?? PpsWriter.BuildBaseline(entropyCodingModeFlag: true);
         int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
         SliceHeaderWriter.Write(sliceWriter, sps, pps,
             frameNum: frameNum, idrPicId: idrPicId,
