@@ -134,16 +134,16 @@ public static class CavlcEncoder
             if (suffixLength > 0)
             {
                 levelPrefix = levelCode >> suffixLength;
-                if (levelPrefix < 14)
+                if (levelPrefix < 15)
                 {
+                    // Prefix 0..14 are normal: levelCode = (prefix << suffixLength) + suffix.
                     suffixBits = levelCode & ((1 << suffixLength) - 1);
                 }
                 else
                 {
-                    // Escape: levelPrefix=15, suffix length 12.
+                    // Escape: levelPrefix=15, levelCode = (15<<suffixLength) + 12-bit suffix.
                     levelPrefix = 15;
                     int escVal = levelCode - (15 << suffixLength);
-                    // 12-bit escape suffix.
                     suffixSize = 12;
                     suffixBits = escVal;
                 }

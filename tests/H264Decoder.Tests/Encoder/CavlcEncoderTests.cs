@@ -95,4 +95,21 @@ public class CavlcEncoderTests
         int[] block = { 7, -3, 0, 2, 0, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
         RoundTripBlock(block, nC);
     }
+
+    /// <summary>Regression: encoder used to misclassify levelPrefix=14 as "escape" when
+    /// suffixLength > 0, corrupting medium-magnitude levels that need the prefix-suffix form.
+    /// This block produces levelCode=59 at suffixLength=2 (prefix=14, suffix=3) for the
+    /// second coefficient — exactly the edge that broke before.</summary>
+    [Fact]
+    public void RoundTrip_TwoMediumMagnitudes_PrefixFourteen()
+    {
+        // After collection (high-freq first): levels = [-30, -30]. WriteLevels:
+        // i=0 (no trailing ones): adjustedAbs=29, levelCode=57, prefix=15 (escape) at suffixLength=0.
+        // i=1: suffixLength becomes 2 (since absLevel 30 > threshold 3). adjustedAbs=30,
+        //      levelCode=59. prefix = 59>>2 = 14, suffix = 59 & 3 = 3 — must NOT be escape.
+        int[] block = new int[16];
+        block[0] = -30;
+        block[1] = -30;
+        RoundTripBlock(block, nC: 0);
+    }
 }

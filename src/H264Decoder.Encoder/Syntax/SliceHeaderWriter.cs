@@ -3,7 +3,7 @@ using H264Decoder.Syntax;
 
 namespace H264Decoder.Encoder.Syntax;
 
-/// <summary>Serialize an I-slice IDR slice header (spec §7.3.3). I-slice only; no P/B.</summary>
+/// <summary>Serialize a slice header (spec §7.3.3). Supports IDR I-slices and non-IDR P-slices.</summary>
 public static class SliceHeaderWriter
 {
     /// <summary>Encode the slice header for an IDR I-slice into the supplied BitWriter.
@@ -51,6 +51,54 @@ public static class SliceHeaderWriter
             {
                 ExpGolombWriter.WriteSe(w, 0); // slice_alpha_c0_offset_div2
                 ExpGolombWriter.WriteSe(w, 0); // slice_beta_offset_div2
+            }
+        }
+    }
+
+    /// <summary>Encode the slice header for a non-IDR P-slice (single L0 reference).
+    /// Sets slice_type=5 (all-P), num_ref_idx_active_override_flag=0, no ref list modification,
+    /// no pred_weight_table, no adaptive ref-pic marking. Caller supplies nal_ref_idc != 0.</summary>
+    public static void WritePSlice(
+        BitWriter w,
+        SequenceParameterSet sps,
+        PictureParameterSet pps,
+        uint frameNum,
+        int sliceQpDelta,
+        uint disableDeblockingFilterIdc)
+    {
+        ExpGolombWriter.WriteUe(w, 0); // first_mb_in_slice
+        // slice_type = 5 (all-P, "all slices in this picture are P"); spec Table 7-6.
+        ExpGolombWriter.WriteUe(w, 5);
+        ExpGolombWriter.WriteUe(w, pps.PicParameterSetId);
+        int frameNumBits = (int)sps.Log2MaxFrameNumMinus4 + 4;
+        w.WriteBits(frameNum, frameNumBits);
+        // frame_mbs_only=1: no field_pic_flag / bottom_field_flag.
+        // Non-IDR: no idr_pic_id.
+        if (sps.PicOrderCntType == 0)
+        {
+            int lsbBits = (int)sps.Log2MaxPicOrderCntLsbMinus4 + 4;
+            w.WriteBits(0, lsbBits);
+        }
+        // pic_order_cnt_type==2: no extra fields.
+        if (pps.RedundantPicCntPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, 0);
+        }
+        // P-slice ref-list management.
+        w.WriteBit(0); // num_ref_idx_active_override_flag = 0
+        w.WriteBit(0); // ref_pic_list_modification_flag_l0 = 0
+        // pred_weight_table absent (PPS WeightedPredFlag=0).
+        // dec_ref_pic_marking for non-IDR ref slice: adaptive_ref_pic_marking_mode_flag = 0 (sliding window).
+        w.WriteBit(0);
+        // CABAC: not present (PPS EntropyCodingModeFlag=0).
+        ExpGolombWriter.WriteSe(w, sliceQpDelta);
+        if (pps.DeblockingFilterControlPresentFlag)
+        {
+            ExpGolombWriter.WriteUe(w, disableDeblockingFilterIdc);
+            if (disableDeblockingFilterIdc != 1)
+            {
+                ExpGolombWriter.WriteSe(w, 0);
+                ExpGolombWriter.WriteSe(w, 0);
             }
         }
     }

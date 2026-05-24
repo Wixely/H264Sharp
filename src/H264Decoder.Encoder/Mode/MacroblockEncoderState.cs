@@ -18,4 +18,15 @@ internal sealed class MacroblockEncoderState
     public byte[] ReconY = new byte[256];
     public byte[] ReconU = new byte[64];
     public byte[] ReconV = new byte[64];
+
+    // ---- Inter (P-slice) fields ----
+    /// <summary>True if this MB was emitted as P_L0_16x16 (inter, not intra).</summary>
+    public bool IsInterP16x16;
+    /// <summary>True if this MB was a P_Skip (no syntax emitted; mb_skip_run counted it).</summary>
+    public bool IsSkipped;
+    /// <summary>L0 motion vector for the whole 16x16 partition (quarter-pel units).</summary>
+    public int MvL0X;
+    public int MvL0Y;
+    /// <summary>L0 ref index (0 in phase 2 — single reference frame).</summary>
+    public int RefIdxL0;
 }

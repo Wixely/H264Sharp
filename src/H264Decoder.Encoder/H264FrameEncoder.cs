@@ -7,22 +7,39 @@ using H264Decoder.Syntax;
 namespace H264Decoder.Encoder;
 
 /// <summary>Top-level H.264 encoder: takes YUV 4:2:0 frames and produces Baseline-profile
-/// I-frame-only Annex-B byte streams. CAVLC entropy, 4x4 transform only, fixed QP, no
-/// deblocking, no inter prediction. Output is decodable by our existing H264FrameDecoder.</summary>
+/// Annex-B byte streams. Phase 1: I-only. Phase 2 adds P_L0_16x16 with single L0 reference
+/// (previous decoded frame), integer-pel diamond ME, and P_Skip detection. Output is
+/// decodable by our existing H264FrameDecoder and by ffmpeg.</summary>
 public static class H264FrameEncoder
 {
-    /// <summary>Encode a sequence of raw YUV 4:2:0 frames (planar Y then U then V, 8-bit)
-    /// into an Annex-B H.264 byte stream.</summary>
-    /// <param name="yuv">All frames concatenated: each frame is W*H Y, then (W/2)*(H/2) U, then V.</param>
-    /// <param name="width">Display width.</param>
-    /// <param name="height">Display height.</param>
-    /// <param name="qp">Fixed quantization parameter (0..51).</param>
-    /// <param name="frames">Number of frames in <paramref name="yuv"/>.</param>
+    /// <summary>Encoder tuning options. Defaults give phase-2 behaviour. Tests can disable
+    /// individual optimizations to exercise lower-level paths in isolation.</summary>
+    public sealed class Options
+    {
+        /// <summary>When false, every P-frame MB is emitted as an Intra-only refresh (legacy phase-1).</summary>
+        public bool EnableInterPrediction { get; init; } = true;
+        /// <summary>When false, the encoder won't fold inter MBs into P_Skip even when eligible — useful
+        /// for tests that want to see the explicit P_L0_16x16 mb_type emitted for zero residuals.</summary>
+        public bool EnablePSkip { get; init; } = true;
+        /// <summary>When false, ME uses a fixed starting MV (predicted median) without any search refinement.</summary>
+        public bool EnableMotionSearch { get; init; } = true;
+        /// <summary>Max integer-pel search radius for ME.</summary>
+        public int SearchRangePel { get; init; } = 16;
+        /// <summary>Hard cap on SAD evaluations per MB.</summary>
+        public int MaxSadEvalsPerMb { get; init; } = 64;
+    }
+
+    /// <summary>Encode a sequence of raw YUV 4:2:0 frames into an Annex-B H.264 byte stream.</summary>
     public static byte[] EncodeAnnexB(ReadOnlySpan<byte> yuv, int width, int height, int qp, int frames = 1)
+        => EncodeAnnexB(yuv, width, height, qp, frames, new Options());
+
+    /// <summary>Encode with explicit options (used by tests to disable inter/skip features).</summary>
+    public static byte[] EncodeAnnexB(ReadOnlySpan<byte> yuv, int width, int height, int qp, int frames, Options options)
     {
         if (width <= 0 || height <= 0) throw new ArgumentException("invalid frame size");
         if (qp < 0 || qp > 51) throw new ArgumentException("qp must be in [0, 51]");
         if (frames <= 0) throw new ArgumentException("frames must be > 0");
+        ArgumentNullException.ThrowIfNull(options);
 
         var sps = SpsWriter.BuildBaseline(width, height);
         var pps = PpsWriter.BuildBaseline();
@@ -31,7 +48,6 @@ public static class H264FrameEncoder
         byte[] ppsRbsp = PpsWriter.Serialize(pps);
 
         var output = new MemoryStream();
-        // SPS NAL (nal_ref_idc = 3, type = 7)
         byte[] spsNal = AnnexBWriter.BuildNalUnit(NalUnitType.Sps, nalRefIdc: 3, spsRbsp);
         byte[] ppsNal = AnnexBWriter.BuildNalUnit(NalUnitType.Pps, nalRefIdc: 3, ppsRbsp);
         AnnexBWriter.WriteAnnexB(output, new[] { spsNal, ppsNal });
@@ -48,14 +64,37 @@ public static class H264FrameEncoder
             throw new ArgumentException(
                 $"yuv buffer too small: expected {frameBytes * frames}, got {yuv.Length}");
 
+        // Reconstructed reference for inter prediction (previous decoded frame).
+        byte[]? refY = null, refU = null, refV = null;
         for (int frameIdx = 0; frameIdx < frames; frameIdx++)
         {
             ReadOnlySpan<byte> frame = yuv.Slice(frameIdx * frameBytes, frameBytes);
-            byte[] sliceNal = EncodeIFrame(frame, width, height, qp,
-                picWidthInMbs, picHeightInMbs, bufferWidth, bufferHeight,
-                bufferChromaWidth, bufferChromaHeight,
-                frameNum: (uint)(frameIdx & 0xF), idrPicId: (uint)frameIdx);
+            bool isFirst = frameIdx == 0;
+            bool asP = !isFirst && options.EnableInterPrediction;
+            byte[] sliceNal;
+            byte[] reconY = new byte[bufferWidth * bufferHeight];
+            byte[] reconU = new byte[bufferChromaWidth * bufferChromaHeight];
+            byte[] reconV = new byte[bufferChromaWidth * bufferChromaHeight];
+            if (!asP)
+            {
+                sliceNal = EncodeIFrame(frame, width, height, qp,
+                    picWidthInMbs, picHeightInMbs, bufferWidth, bufferHeight,
+                    bufferChromaWidth, bufferChromaHeight,
+                    frameNum: (uint)(frameIdx & 0xF), idrPicId: (uint)frameIdx,
+                    reconY, reconU, reconV);
+            }
+            else
+            {
+                sliceNal = EncodePFrame(frame, width, height, qp,
+                    picWidthInMbs, picHeightInMbs, bufferWidth, bufferHeight,
+                    bufferChromaWidth, bufferChromaHeight,
+                    frameNum: (uint)(frameIdx & 0xF),
+                    reconY, reconU, reconV,
+                    refY!, refU!, refV!,
+                    options);
+            }
             AnnexBWriter.WriteAnnexB(output, new[] { sliceNal });
+            refY = reconY; refU = reconU; refV = reconV;
         }
         return output.ToArray();
     }
@@ -64,17 +103,13 @@ public static class H264FrameEncoder
         ReadOnlySpan<byte> yuv, int width, int height, int qp,
         int picWidthInMbs, int picHeightInMbs,
         int bufferWidth, int bufferHeight, int bufferChromaWidth, int bufferChromaHeight,
-        uint frameNum, uint idrPicId)
+        uint frameNum, uint idrPicId,
+        byte[] reconYOut, byte[] reconUOut, byte[] reconVOut)
     {
         // Allocate MB-aligned planes with edge padding by replicating the last row/column.
-        var picY = new byte[bufferWidth * bufferHeight];
-        var picU = new byte[bufferChromaWidth * bufferChromaHeight];
-        var picV = new byte[bufferChromaWidth * bufferChromaHeight];
-        // Source planes: just for reading (we don't write back).
         var srcY = new byte[bufferWidth * bufferHeight];
         var srcU = new byte[bufferChromaWidth * bufferChromaHeight];
         var srcV = new byte[bufferChromaWidth * bufferChromaHeight];
-        // Copy with edge padding.
         int yOffset = 0;
         int uOffset = width * height;
         int vOffset = uOffset + (width / 2) * (height / 2);
@@ -82,13 +117,10 @@ public static class H264FrameEncoder
         CopyPlaneWithEdgePad(yuv.Slice(uOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcU, bufferChromaWidth, bufferChromaHeight);
         CopyPlaneWithEdgePad(yuv.Slice(vOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcV, bufferChromaWidth, bufferChromaHeight);
 
-        // Build slice header into the same BitWriter the MB layer will append to.
         var sliceWriter = new BitWriter(4096);
         var sps = SpsWriter.BuildBaseline(width, height);
         var pps = PpsWriter.BuildBaseline();
-        // slice_qp_delta = qp - 26 - pps.PicInitQpMinus26.
         int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
-        // disable_deblocking_filter_idc = 1 (no deblocking).
         SliceHeaderWriter.Write(sliceWriter, sps, pps,
             frameNum: frameNum, idrPicId: idrPicId,
             sliceQpDelta: sliceQpDelta, disableDeblockingFilterIdc: 1);
@@ -96,7 +128,6 @@ public static class H264FrameEncoder
         int totalMbs = picWidthInMbs * picHeightInMbs;
         var mbStates = new MacroblockEncoderState?[totalMbs];
 
-        // Encode each MB in raster order.
         for (int addr = 0; addr < totalMbs; addr++)
         {
             int mbX = addr % picWidthInMbs;
@@ -110,17 +141,168 @@ public static class H264FrameEncoder
                 sliceWriter,
                 mbSrcY, mbSrcU, mbSrcV,
                 srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
-                picY, picU, picV,
+                reconYOut, reconUOut, reconVOut,
                 picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
                 mbX, mbY, mbsPerRow: picWidthInMbs,
                 qpY: qp,
                 mbStates, mbAddress: addr);
         }
 
-        // rbsp_trailing_bits + flush to bytes.
         sliceWriter.WriteRbspTrailingBits();
         byte[] sliceRbsp = sliceWriter.ToByteArray();
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceIdr, nalRefIdc: 3, sliceRbsp);
+    }
+
+    private static byte[] EncodePFrame(
+        ReadOnlySpan<byte> yuv, int width, int height, int qp,
+        int picWidthInMbs, int picHeightInMbs,
+        int bufferWidth, int bufferHeight, int bufferChromaWidth, int bufferChromaHeight,
+        uint frameNum,
+        byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
+        byte[] refY, byte[] refU, byte[] refV,
+        Options options)
+    {
+        var srcY = new byte[bufferWidth * bufferHeight];
+        var srcU = new byte[bufferChromaWidth * bufferChromaHeight];
+        var srcV = new byte[bufferChromaWidth * bufferChromaHeight];
+        int yOffset = 0;
+        int uOffset = width * height;
+        int vOffset = uOffset + (width / 2) * (height / 2);
+        CopyPlaneWithEdgePad(yuv.Slice(yOffset, width * height), width, height, srcY, bufferWidth, bufferHeight);
+        CopyPlaneWithEdgePad(yuv.Slice(uOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcU, bufferChromaWidth, bufferChromaHeight);
+        CopyPlaneWithEdgePad(yuv.Slice(vOffset, (width / 2) * (height / 2)), width / 2, height / 2, srcV, bufferChromaWidth, bufferChromaHeight);
+
+        var sliceWriter = new BitWriter(4096);
+        var sps = SpsWriter.BuildBaseline(width, height);
+        var pps = PpsWriter.BuildBaseline();
+        int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
+        SliceHeaderWriter.WritePSlice(sliceWriter, sps, pps,
+            frameNum: frameNum,
+            sliceQpDelta: sliceQpDelta, disableDeblockingFilterIdc: 1);
+
+        int totalMbs = picWidthInMbs * picHeightInMbs;
+        var mbStates = new MacroblockEncoderState?[totalMbs];
+
+        // mb_skip_run accumulator: number of skipped MBs since the last emitted (non-skip) MB.
+        int pendingSkipRun = 0;
+        Span<byte> srcLuma = stackalloc byte[256];
+
+        for (int addr = 0; addr < totalMbs; addr++)
+        {
+            int mbX = addr % picWidthInMbs;
+            int mbY = addr / picWidthInMbs;
+            int y0 = mbY * 16;
+            int x0 = mbX * 16;
+            ReadOnlySpan<byte> mbSrcY = srcY.AsSpan(y0 * bufferWidth + x0);
+            ReadOnlySpan<byte> mbSrcU = srcU.AsSpan((y0 / 2) * bufferChromaWidth + (x0 / 2));
+            ReadOnlySpan<byte> mbSrcV = srcV.AsSpan((y0 / 2) * bufferChromaWidth + (x0 / 2));
+
+            // Neighbors for both MV prediction and CAVLC nC.
+            var leftMb = mbX > 0 ? mbStates[addr - 1] : null;
+            var topMb = mbY > 0 ? mbStates[addr - picWidthInMbs] : null;
+            var topRightMb = (mbY > 0 && mbX + 1 < picWidthInMbs) ? mbStates[addr - picWidthInMbs + 1] : null;
+            var topLeftMb = (mbY > 0 && mbX > 0) ? mbStates[addr - picWidthInMbs - 1] : null;
+
+            // Compute the median-predicted MV for THIS MB (caller's reference for mvd computation
+            // and the start point of ME).
+            (int predX, int predY) = MacroblockEncoderInter.PredictMvMedian(leftMb, topMb, topRightMb, topLeftMb);
+
+            // Motion estimation.
+            MotionEstimator.MeResult meResult;
+            if (options.EnableMotionSearch)
+            {
+                for (int y = 0; y < 16; y++)
+                    for (int x = 0; x < 16; x++)
+                        srcLuma[y * 16 + x] = mbSrcY[y * bufferWidth + x];
+                meResult = MotionEstimator.Search(
+                    refY, bufferWidth, bufferHeight,
+                    srcLuma,
+                    mbX * 16, mbY * 16,
+                    predX, predY,
+                    options.SearchRangePel,
+                    options.MaxSadEvalsPerMb);
+            }
+            else
+            {
+                meResult = new MotionEstimator.MeResult(predX, predY, 0);
+            }
+
+            int mvX = meResult.MvX;
+            int mvY = meResult.MvY;
+
+            // Build the inter candidate (predict + residual + reconstruct).
+            var bundle = MacroblockEncoderInter.BuildInterCandidate(
+                mbSrcY, mbSrcU, mbSrcV,
+                bufferWidth, bufferChromaWidth,
+                refY, refU, refV,
+                bufferWidth, bufferHeight, bufferChromaWidth, bufferChromaHeight,
+                mbX, mbY, qp, mvX, mvY);
+
+            // P_Skip eligibility: MV matches P_Skip-derived MV AND residual is all-zero AND refIdx=0.
+            (int skipMvX, int skipMvY) = MacroblockEncoderInter.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
+            bool eligibleSkip = options.EnablePSkip
+                && mvX == skipMvX && mvY == skipMvY
+                && bundle.CbpLuma == 0 && bundle.CbpChroma == 0;
+
+            if (eligibleSkip)
+            {
+                // Emit no syntax — accumulate into mb_skip_run.
+                pendingSkipRun++;
+                // Reconstruction: copy MC prediction directly (no residual to add).
+                MacroblockEncoderInter.StoreReconToPicture(bundle,
+                    reconYOut, reconUOut, reconVOut,
+                    bufferWidth, bufferChromaWidth, mbX, mbY);
+                var skipState = new MacroblockEncoderState
+                {
+                    MbAddress = addr,
+                    IsSkipped = true,
+                    IsInterP16x16 = false,
+                    MvL0X = skipMvX,
+                    MvL0Y = skipMvY,
+                    RefIdxL0 = 0,
+                    QpY = qp,
+                };
+                bundle.ReconY.CopyTo(skipState.ReconY, 0);
+                bundle.ReconU.CopyTo(skipState.ReconU, 0);
+                bundle.ReconV.CopyTo(skipState.ReconV, 0);
+                mbStates[addr] = skipState;
+                continue;
+            }
+
+            // Flush any pending skip run before this coded MB.
+            ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+            pendingSkipRun = 0;
+
+            int mvdX = mvX - predX;
+            int mvdY = mvY - predY;
+
+            var state = new MacroblockEncoderState
+            {
+                MbAddress = addr,
+                QpY = qp,
+            };
+            MacroblockEncoderInter.EmitP_L0_16x16(
+                sliceWriter, bundle, qp,
+                mvdX, mvdY, mvX, mvY,
+                refIdxBits: 0,
+                leftMb, topMb, state);
+            MacroblockEncoderInter.StoreReconToPicture(bundle,
+                reconYOut, reconUOut, reconVOut,
+                bufferWidth, bufferChromaWidth, mbX, mbY);
+            mbStates[addr] = state;
+        }
+
+        // Trailing mb_skip_run (only when the slice ends in a skip-run AND mb_skip_run > 0).
+        // Per spec §7.3.4, a skip-run with no following coded MB must still be emitted before
+        // rbsp_trailing_bits — otherwise the decoder loses count of the trailing skipped MBs.
+        if (pendingSkipRun > 0)
+        {
+            ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+        }
+
+        sliceWriter.WriteRbspTrailingBits();
+        byte[] sliceRbsp = sliceWriter.ToByteArray();
+        return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 2, sliceRbsp);
     }
 
     private static void CopyPlaneWithEdgePad(
