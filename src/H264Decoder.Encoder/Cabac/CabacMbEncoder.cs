@@ -17,7 +17,10 @@ internal static class CabacMbEncoder
     public static readonly (int X, int Y)[] LumaBlockPos = MacroblockParser.LumaBlockPos;
     private static readonly int[] ZigZag4x4 = { 0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15 };
 
-    /// <summary>Encode one I-slice Intra_16x16 macroblock through CABAC.</summary>
+    /// <summary>Encode one Intra_16x16 macroblock through CABAC. When <paramref name="bSliceIntra"/>
+    /// is true, emits B-slice intra mb_type (prefix to code 23 + intra body at ctxIdxOffset=32)
+    /// instead of I-slice mb_type. The post-mb_type encoding (chroma pred mode, qp_delta, residual)
+    /// is identical between I and B slices.</summary>
     public static void EncodeIntra16x16(
         CabacEncoder cabac,
         ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
@@ -28,7 +31,8 @@ internal static class CabacMbEncoder
         int qpY,
         MacroblockEncoderState?[] mbStates,
         int mbAddress,
-        ref int prevMbQpDeltaState)
+        ref int prevMbQpDeltaState,
+        bool bSliceIntra = false)
     {
         var leftMb = mbX > 0 ? mbStates[mbAddress - 1] : null;
         var topMb = mbY > 0 ? mbStates[mbAddress - mbsPerRow] : null;
@@ -131,7 +135,10 @@ internal static class CabacMbEncoder
         int mbType = 1 + group * 4 + p;
 
         // ---- Emit CABAC syntax ----
-        CabacEncSlice.EncodeMbTypeI(cabac, mbType, leftMb, topMb);
+        if (bSliceIntra)
+            CabacEncSliceB.EncodeMbTypeBIntra16x16(cabac, mbType, leftMb, topMb);
+        else
+            CabacEncSlice.EncodeMbTypeI(cabac, mbType, leftMb, topMb);
         CabacEncSlice.EncodeIntraChromaPredMode(cabac, (int)chroma.ChromaMode, leftMb, topMb);
         // For Intra_16x16, no separate CBP — encoded in mb_type. qp_delta always present.
         CabacEncSlice.EncodeMbQpDelta(cabac, 0, ref prevMbQpDeltaState);

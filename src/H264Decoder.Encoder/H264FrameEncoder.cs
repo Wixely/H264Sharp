@@ -736,6 +736,54 @@ public static class H264FrameEncoder
                 leftMb, topMb, topRightMb, topLeftMb,
                 colocatedMbStates, picWidthInMbs, addr);
 
+            // Intra_16x16 candidate: SAD-only estimate against the lowest-cost inter cand. With a
+            // conservative bias (λ·64) intra wins only when its SAD is dramatically lower —
+            // which usually means a new object or scene boundary that the refs can't predict.
+            int intraSad = MacroblockEncoder.EstimateBestIntra16x16Sad(
+                mbSrcY, bufferWidth,
+                reconYOut, bufferWidth, mbX, mbY, mbsPerRow: picWidthInMbs,
+                mbStates, addr);
+            int intraBias = lambda * 64;
+            bool useIntra = intraSad + intraBias < cand.TotalCost;
+            if (useIntra)
+            {
+                // mb_states[addr] is populated inside the intra encoder; bypass the inter emit path.
+                if (options.EnableCabac)
+                {
+                    CabacEncSliceB.EncodeMbSkipFlagB(cabac!, isSkip: false, leftMb, topMb);
+                    CabacMbEncoder.EncodeIntra16x16(
+                        cabac!,
+                        mbSrcY, mbSrcU, mbSrcV,
+                        srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                        reconYOut, reconUOut, reconVOut,
+                        picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                        mbX, mbY, mbsPerRow: picWidthInMbs,
+                        qpY: qp,
+                        mbStates, mbAddress: addr,
+                        ref prevMbQpDeltaState,
+                        bSliceIntra: true);
+                    bool lastMbIntra = addr == totalMbs - 1;
+                    CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMbIntra);
+                }
+                else
+                {
+                    // CAVLC: flush any pending mb_skip_run before the intra MB.
+                    ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+                    pendingSkipRun = 0;
+                    MacroblockEncoder.EncodeIntra16x16(
+                        sliceWriter,
+                        mbSrcY, mbSrcU, mbSrcV,
+                        srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                        reconYOut, reconUOut, reconVOut,
+                        picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                        mbX, mbY, mbsPerRow: picWidthInMbs,
+                        qpY: qp,
+                        mbStates, mbAddress: addr,
+                        mbTypeOffset: 23); // B-slice: I-slice mb_type 1..24 → B mb_type 24..47.
+                }
+                continue;
+            }
+
             var state = new MacroblockEncoderState
             {
                 MbAddress = addr,

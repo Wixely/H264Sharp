@@ -126,6 +126,46 @@ internal static class CabacEncSliceB
         throw new InvalidOperationException($"unhandled B mb_type {mbType}");
     }
 
+    /// <summary>Encode the B-slice intra-branch mb_type for an Intra_16x16 MB. Emits the prefix
+    /// bins for B mb_type code 23 (1 1 1 1 0 1) followed by the intra body at ctxIdxOffset=32 per
+    /// spec Table 9-39 (binIdx 0=0, then +1, +2, +2, +3, +3). <paramref name="iSliceMbType"/> is
+    /// the I-slice mb_type value (1..24 for Intra_16x16; I_NxN and I_PCM not yet supported).</summary>
+    public static void EncodeMbTypeBIntra16x16(CabacEncoder cabac, int iSliceMbType,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
+    {
+        if (iSliceMbType < 1 || iSliceMbType > 24)
+            throw new NotSupportedException(
+                $"CABAC encode: B-slice intra I-slice mb_type {iSliceMbType} not supported (only 1..24 / Intra_16x16)");
+
+        int condA = NeighborMbTypeFlagB(leftMb);
+        int condB = NeighborMbTypeFlagB(topMb);
+        // ---- B mb_type prefix for code 23 (intra branch entry): bins "1 1 1 1 0 1". ----
+        cabac.EncodeBin(27 + condA + condB, 1); // bin0
+        cabac.EncodeBin(30, 1);                 // bin1
+        cabac.EncodeBin(31, 1);                 // bin2 (b1==1 → ctx 31)
+        cabac.EncodeBin(32, 1);                 // bin3
+        cabac.EncodeBin(32, 0);                 // bin4
+        cabac.EncodeBin(32, 1);                 // bin5
+
+        // ---- Intra body at ctxIdxOffset = 32 (Table 9-39). ----
+        const int Off = 32;
+        cabac.EncodeBin(Off, 1);                // bin0 = 1 (not I_NxN)
+        cabac.EncodeTerminate(0);               // terminate = 0 (not I_PCM)
+
+        int m0 = iSliceMbType - 1;
+        int p = m0 % 4;
+        int g = m0 / 4;
+        cabac.EncodeBin(Off + 1, g >= 3 ? 1 : 0); // bin "+12"
+        int cbpChroma = g % 3;
+        cabac.EncodeBin(Off + 2, cbpChroma > 0 ? 1 : 0); // bin "+8/+4 outer"
+        if (cbpChroma > 0)
+        {
+            cabac.EncodeBin(Off + 2, cbpChroma == 2 ? 1 : 0); // bin "+8 inner" (same ctx as outer per spec)
+        }
+        cabac.EncodeBin(Off + 3, (p >> 1) & 1); // bin "+2"
+        cabac.EncodeBin(Off + 3, p & 1);        // bin "+1"
+    }
+
     /// <summary>Mirror of decoder's <c>NeighborMbTypeFlagB</c> condTermFlag derivation.</summary>
     private static int NeighborMbTypeFlagB(MacroblockEncoderState? mb)
     {

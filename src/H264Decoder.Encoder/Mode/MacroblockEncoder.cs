@@ -30,7 +30,8 @@ internal static class MacroblockEncoder
         int mbX, int mbY, int mbsPerRow,
         int qpY,
         MacroblockEncoderState?[] mbStates,
-        int mbAddress)
+        int mbAddress,
+        int mbTypeOffset = 0)
     {
         var leftMb = mbX > 0 ? mbStates[mbAddress - 1] : null;
         var topMb = mbY > 0 ? mbStates[mbAddress - mbsPerRow] : null;
@@ -175,7 +176,8 @@ internal static class MacroblockEncoder
         int mbType = 1 + group * 4 + predModeIdx;
 
         // ---- Write macroblock_layer ----
-        ExpGolombWriter.WriteUe(w, (uint)mbType);
+        // B-slice intra uses mbType + 23 (codes 24..47); I-slice uses mbType directly (1..24).
+        ExpGolombWriter.WriteUe(w, (uint)(mbType + mbTypeOffset));
         // mb_pred: intra_chroma_pred_mode (since Intra_16x16 uses MbPartPredMode.Intra16x16).
         ExpGolombWriter.WriteUe(w, (uint)chromaResult.ChromaMode);
 
