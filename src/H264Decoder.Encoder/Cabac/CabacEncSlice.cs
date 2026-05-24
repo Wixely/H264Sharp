@@ -149,6 +149,22 @@ internal static class CabacEncSlice
         cabac.EncodeTerminate(endOfSlice ? 1 : 0);
     }
 
+    /// <summary>Encode prev_intra4x4_pred_mode_flag (single bin, ctx 68). Inverse of the
+    /// decoder's <c>cabac.DecodeBin(68)</c> at <c>CabacSliceI.ParseIntraMbBody</c> Intra_4x4 branch.</summary>
+    public static void EncodePrevIntra4x4PredModeFlag(CabacEncoder cabac, bool useNeighborPrediction)
+    {
+        cabac.EncodeBin(68, useNeighborPrediction ? 1 : 0);
+    }
+
+    /// <summary>Encode rem_intra4x4_pred_mode (3 bins, ctx 69, LSB first). The decoder reads
+    /// r0,r1,r2 and assembles <c>(r2&lt;&lt;2) | (r1&lt;&lt;1) | r0</c>; we emit in the same order.</summary>
+    public static void EncodeRemIntra4x4PredMode(CabacEncoder cabac, int rem)
+    {
+        cabac.EncodeBin(69, rem & 1);
+        cabac.EncodeBin(69, (rem >> 1) & 1);
+        cabac.EncodeBin(69, (rem >> 2) & 1);
+    }
+
     // -----------------------------------------------------------------------------------
     // Helpers — replicate decoder logic for "is intra non-PCM" / "is non-INxN intra".
     // -----------------------------------------------------------------------------------

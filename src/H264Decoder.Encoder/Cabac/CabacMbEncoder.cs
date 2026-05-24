@@ -286,4 +286,135 @@ internal static class CabacMbEncoder
         else condB = topMb.ChromaAcCbf[comp, blockIdx + 2] ? 1 : 0;
         return (condA, condB);
     }
+
+    /// <summary>Encode one I_NxN (Intra_4x4) macroblock as CABAC. The prediction +
+    /// transform/quant/reconstruction pipeline is shared with the CAVLC Intra_4x4 path via
+    /// <see cref="IntraEncoder4x4.PrepareIntra4x4"/>; only the syntax stage differs. Inverse of
+    /// decoder's <c>CabacSliceI.ParseIntraMbBody</c> Intra_4x4 branch.</summary>
+    public static void EncodeIntra4x4(
+        CabacEncoder cabac,
+        ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
+        int srcStrideY, int srcStrideC,
+        byte[] picY, byte[] picU, byte[] picV,
+        int picStrideY, int picStrideC,
+        int mbX, int mbY, int mbsPerRow,
+        int qpY,
+        MacroblockEncoderState?[] mbStates,
+        int mbAddress,
+        ref int prevMbQpDeltaState)
+    {
+        var prep = IntraEncoder4x4.PrepareIntra4x4(
+            srcY, srcU, srcV, srcStrideY, srcStrideC,
+            picY, picU, picV, picStrideY, picStrideC,
+            mbX, mbY, mbsPerRow, qpY, mbStates, mbAddress);
+        var state = prep.State;
+        var leftMb = prep.LeftMb;
+        var topMb = prep.TopMb;
+        int cbpLuma = prep.CbpLuma;
+        int cbpChroma = prep.CbpChroma;
+        var chroma = prep.Chroma;
+
+        // ---- Syntax: mb_type=0 (I_NxN) ----
+        CabacEncSlice.EncodeMbTypeI(cabac, mbType: 0, leftMb, topMb);
+
+        // ---- 16 × (prev_intra4x4_pred_mode_flag, [rem_intra4x4_pred_mode]) ----
+        // Spec §8.3.1.1: predicted mode = min(neighborLeft, neighborTop) with -1 sentinel
+        // collapsing to DC. We compare actualMode vs predicted: equal → flag=1, otherwise
+        // flag=0 + 3 bits rem = chosen<predicted ? chosen : chosen-1.
+        for (int i = 0; i < 16; i++)
+        {
+            (int bx, int by) = IntraEncoder4x4.LumaBlockPos[i];
+            int predicted = IntraEncoder4x4.PredictIntra4x4ModeFromNeighbors(state, leftMb, topMb, bx, by);
+            int chosen = prep.ActualMode[i];
+            if (chosen == predicted)
+            {
+                CabacEncSlice.EncodePrevIntra4x4PredModeFlag(cabac, useNeighborPrediction: true);
+            }
+            else
+            {
+                CabacEncSlice.EncodePrevIntra4x4PredModeFlag(cabac, useNeighborPrediction: false);
+                int rem = chosen < predicted ? chosen : chosen - 1;
+                CabacEncSlice.EncodeRemIntra4x4PredMode(cabac, rem);
+            }
+        }
+
+        // ---- intra_chroma_pred_mode ----
+        CabacEncSlice.EncodeIntraChromaPredMode(cabac, (int)chroma.ChromaMode, leftMb, topMb);
+
+        // ---- coded_block_pattern (luma 4 bins + chroma 1..2 bins) ----
+        CabacEncSlice.EncodeCbpLumaIntra(cabac, cbpLuma, leftMb, topMb);
+        CabacEncSlice.EncodeCbpChromaIntra(cabac, cbpChroma, leftMb, topMb);
+
+        // ---- mb_qp_delta + residual (only when cbp != 0) ----
+        bool hasResidual = (cbpLuma != 0) || (cbpChroma != 0);
+        if (!hasResidual)
+        {
+            // Decoder resets prevMbQpDeltaState=0 when no qp_delta is read; mirror that.
+            prevMbQpDeltaState = 0;
+            mbStates[mbAddress] = state;
+            return;
+        }
+        CabacEncSlice.EncodeMbQpDelta(cabac, mbQpDelta: 0, ref prevMbQpDeltaState);
+
+        // ---- Luma 4x4 residual: 16 blocks, gated by cbpLuma bit per 8x8 quadrant. ----
+        Span<int> blockScan = stackalloc int[16];
+        for (int i = 0; i < 16; i++)
+        {
+            bool quadCoded = (cbpLuma & (1 << (i >> 2))) != 0;
+            if (!quadCoded)
+            {
+                state.LumaAcCbf[i] = false;
+                state.NonZeroCountLuma[i] = 0;
+                continue;
+            }
+            for (int k = 0; k < 16; k++) blockScan[k] = prep.ResidualZig[i, k];
+            (int cA, int cB) = LumaAcNeighborCbfIntra(i, state, leftMb, topMb);
+            bool acCbf = CabacEncResidual.EncodeResidualBlock(
+                cabac, blockScan, maxNumCoeff: 16, ctxBlockCat: CabacEncResidual.CatLuma4x4,
+                condTermFlagA: cA, condTermFlagB: cB);
+            state.LumaAcCbf[i] = acCbf;
+            // NonZeroCountLuma is used by the CAVLC nC neighbor lookups; CABAC neighbor lookups go
+            // through LumaAcCbf instead, so the count itself need not match — but mirror the
+            // decoder's "set to 1 when any non-zero" so CAVLC neighbors of a future MB see a
+            // consistent count if entropy switches.
+            state.NonZeroCountLuma[i] = acCbf ? 1 : 0;
+        }
+
+        // ---- Chroma DC ----
+        if ((cbpChroma & 3) != 0)
+        {
+            Span<int> dc = stackalloc int[4];
+            for (int c = 0; c < 2; c++)
+            {
+                for (int k = 0; k < 4; k++) dc[k] = chroma.ChromaDc[c, k];
+                int caC = (leftMb == null) ? 1 : (leftMb.ChromaDcCbf[c] ? 1 : 0);
+                int cbC = (topMb == null) ? 1 : (topMb.ChromaDcCbf[c] ? 1 : 0);
+                bool cbf = CabacEncResidual.EncodeResidualBlock(
+                    cabac, dc, maxNumCoeff: 4, ctxBlockCat: CabacEncResidual.CatChromaDc,
+                    condTermFlagA: caC, condTermFlagB: cbC);
+                state.ChromaDcCbf[c] = cbf;
+            }
+        }
+
+        // ---- Chroma AC ----
+        if ((cbpChroma & 2) != 0)
+        {
+            Span<int> ac = stackalloc int[15];
+            for (int c = 0; c < 2; c++)
+            {
+                for (int i = 0; i < 4; i++)
+                {
+                    for (int k = 0; k < 15; k++) ac[k] = chroma.ChromaAc[c, i, k];
+                    (int cA, int cB) = ChromaAcNeighborCbfIntra(c, i, state, leftMb, topMb);
+                    bool cbf = CabacEncResidual.EncodeResidualBlock(
+                        cabac, ac, maxNumCoeff: 15, ctxBlockCat: CabacEncResidual.CatChromaAc,
+                        condTermFlagA: cA, condTermFlagB: cB);
+                    state.ChromaAcCbf[c, i] = cbf;
+                    state.NonZeroCountChromaAc[c, i] = cbf ? 1 : 0;
+                }
+            }
+        }
+
+        mbStates[mbAddress] = state;
+    }
 }

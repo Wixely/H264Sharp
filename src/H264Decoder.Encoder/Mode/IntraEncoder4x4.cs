@@ -110,11 +110,27 @@ internal static class IntraEncoder4x4
         return totalSad;
     }
 
-    /// <summary>Encode the MB as Intra_4x4. Writes syntax to <paramref name="w"/> and updates the
-    /// picture reconstruction in <paramref name="picY"/>/U/V. Sets up <paramref name="state"/> for
-    /// neighbor lookups.</summary>
-    public static void EncodeIntra4x4(
-        BitWriter w,
+    /// <summary>Output of <see cref="PrepareIntra4x4"/>: everything an entropy coder needs to
+    /// emit syntax for an Intra_4x4 MB. <see cref="State"/> is populated with reconstructed Y/U/V
+    /// + per-block Intra4x4Mode + CbpLuma/CbpChroma; entropy-specific fields (NonZeroCountLuma,
+    /// LumaAcCbf, ChromaAcCbf, ChromaDcCbf) are left for the caller to fill.</summary>
+    internal sealed class PrepareResult
+    {
+        public MacroblockEncoderState State = null!;
+        public MacroblockEncoderState? LeftMb;
+        public MacroblockEncoderState? TopMb;
+        public int[] ActualMode = new int[16];
+        public int[,] ResidualZig = new int[16, 16];
+        public int CbpLuma;
+        public int CbpChroma;
+        public EncodeChromaResult Chroma = null!;
+    }
+
+    /// <summary>Shared core for both CAVLC and CABAC Intra_4x4 encoding: pick per-block prediction
+    /// modes, compute + quantize residuals, reconstruct into picY/U/V and into state.ReconY/U/V.
+    /// Returns everything the syntax emitter needs. Side effects: writes reconstructed samples
+    /// into <paramref name="picY"/>/<paramref name="picU"/>/<paramref name="picV"/>.</summary>
+    internal static PrepareResult PrepareIntra4x4(
         ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
         int srcStrideY, int srcStrideC,
         byte[] picY, byte[] picU, byte[] picV,
@@ -134,7 +150,6 @@ internal static class IntraEncoder4x4
             QpY = qpY,
         };
 
-        // Per-block storage: actual mode, residual coefficients in zigzag order.
         int[] actualMode = new int[16];
         int[,] residualZig = new int[16, 16];
 
@@ -152,7 +167,6 @@ internal static class IntraEncoder4x4
             int px0 = mbX * 16 + bx * 4;
             int py0 = mbY * 16 + by * 4;
 
-            // Read source block.
             for (int yy = 0; yy < 4; yy++)
                 for (int xx = 0; xx < 4; xx++)
                     srcBlk[yy * 4 + xx] = srcY[(by * 4 + yy) * srcStrideY + (bx * 4 + xx)];
@@ -166,15 +180,12 @@ internal static class IntraEncoder4x4
                 (leftMb != null);
             bool topRightAvail = ComputeTopRightAvail(i, bx, by, mbX, mbsPerRow, topMb, topRightMb);
 
-            // Sample neighbors from the running picture buffer (in-MB samples were written by
-            // previous iterations after reconstruction).
             GatherNeighborSamplesFromPic(picY, picStrideY, px0, py0,
                 topAvail, leftAvail, topLeftAvail, topRightAvail,
                 top, left, out byte topLeft);
 
-            // Try all 9 modes (subject to availability). Pick lowest SAD against source.
             int bestSad = int.MaxValue;
-            int bestMode = 2; // DC fallback
+            int bestMode = 2;
             for (int m = 0; m < 9; m++)
             {
                 if (!ModeAvailable(m, topAvail, leftAvail, topLeftAvail)) continue;
@@ -191,7 +202,6 @@ internal static class IntraEncoder4x4
             actualMode[i] = bestMode;
             state.Intra4x4Mode[i] = bestMode;
 
-            // Predict using the chosen mode.
             IntraPrediction.PredictIntra4x4(
                 (IntraPrediction.Intra4x4Mode)bestMode,
                 top, topAvail, topRightAvail,
@@ -199,23 +209,15 @@ internal static class IntraEncoder4x4
                 topLeft, topLeftAvail,
                 predBlk);
 
-            // Residual: source - prediction; forward 4x4 DCT; quant (intra=true).
             for (int yy = 0; yy < 4; yy++)
                 for (int xx = 0; xx < 4; xx++)
                     coeffsRaster[yy * 4 + xx] = srcBlk[yy * 4 + xx] - predBlk[yy * 4 + xx];
             ForwardTransform.Forward4x4(coeffsRaster);
-            // 4x4 quant: spec §8.5.10 covers full 4x4 with DC for Intra_4x4 (no separate DC chain).
             Quant4x4Full(coeffsRaster, qpY);
 
-            // Save zigzag-scanned coefficients (decoder expects scan order in mb.Luma[i,j]).
             for (int s = 0; s < 16; s++) coeffsScan[s] = coeffsRaster[ZigZag4x4[s]];
             for (int s = 0; s < 16; s++) residualZig[i, s] = coeffsScan[s];
 
-            // Reconstruct: dequant + inverse 4x4 + add pred + clip; write into picY.
-            for (int yy = 0; yy < 4; yy++)
-                for (int xx = 0; xx < 4; xx++)
-                    coeffsRaster[yy * 4 + xx] = coeffsScan[0]; // placeholder; will rebuild
-            // Rebuild raster from scan and dequantize.
             for (int k = 0; k < 16; k++) coeffsRaster[k] = 0;
             for (int s = 0; s < 16; s++) coeffsRaster[ZigZag4x4[s]] = coeffsScan[s];
             Dequant4x4Full(coeffsRaster, qpY);
@@ -228,10 +230,8 @@ internal static class IntraEncoder4x4
                     picY[(py0 + yy) * picStrideY + (px0 + xx)] = clipped;
                     state.ReconY[(by * 4 + yy) * 16 + (bx * 4 + xx)] = clipped;
                 }
-            _ = bestSad;
         }
 
-        // ---- Chroma encoding (same pipeline as Intra_16x16). ----
         Span<byte> srcCb = stackalloc byte[64];
         Span<byte> srcCr = stackalloc byte[64];
         for (int y = 0; y < 8; y++)
@@ -243,7 +243,6 @@ internal static class IntraEncoder4x4
         var chroma = EncodeChromaSharedShim(srcCb, srcCr, picU, picV, picStrideC, mbX, mbY, qpY,
             leftMb, topMb);
 
-        // ---- Compute CBP-luma from non-zero counts (any of the 4 4x4 blocks in a quadrant). ----
         int cbpLuma = 0;
         for (int i = 0; i < 16; i++)
         {
@@ -253,7 +252,56 @@ internal static class IntraEncoder4x4
         }
         int cbpChroma = chroma.CbpChroma;
 
-        // ---- Write macroblock_layer syntax (mb_type=0 = I_NxN). ----
+        state.CbpLuma = cbpLuma;
+        state.CbpChroma = cbpChroma;
+        state.ChromaPredMode = chroma.ChromaMode;
+        chroma.ReconU.CopyTo(state.ReconU, 0);
+        chroma.ReconV.CopyTo(state.ReconV, 0);
+        int cmbX = mbX * 8, cmbY = mbY * 8;
+        for (int y = 0; y < 8; y++)
+            for (int x = 0; x < 8; x++)
+            {
+                picU[(cmbY + y) * picStrideC + cmbX + x] = state.ReconU[y * 8 + x];
+                picV[(cmbY + y) * picStrideC + cmbX + x] = state.ReconV[y * 8 + x];
+            }
+
+        return new PrepareResult
+        {
+            State = state,
+            LeftMb = leftMb,
+            TopMb = topMb,
+            ActualMode = actualMode,
+            ResidualZig = residualZig,
+            CbpLuma = cbpLuma,
+            CbpChroma = cbpChroma,
+            Chroma = chroma,
+        };
+    }
+
+    /// <summary>Encode the MB as Intra_4x4 (CAVLC). Writes syntax to <paramref name="w"/> and
+    /// updates the picture reconstruction in <paramref name="picY"/>/U/V.</summary>
+    public static void EncodeIntra4x4(
+        BitWriter w,
+        ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
+        int srcStrideY, int srcStrideC,
+        byte[] picY, byte[] picU, byte[] picV,
+        int picStrideY, int picStrideC,
+        int mbX, int mbY, int mbsPerRow,
+        int qpY,
+        MacroblockEncoderState?[] mbStates, int mbAddress)
+    {
+        var prep = PrepareIntra4x4(srcY, srcU, srcV, srcStrideY, srcStrideC,
+            picY, picU, picV, picStrideY, picStrideC,
+            mbX, mbY, mbsPerRow, qpY, mbStates, mbAddress);
+        var state = prep.State;
+        var leftMb = prep.LeftMb;
+        var topMb = prep.TopMb;
+        var actualMode = prep.ActualMode;
+        var residualZig = prep.ResidualZig;
+        int cbpLuma = prep.CbpLuma;
+        int cbpChroma = prep.CbpChroma;
+        var chroma = prep.Chroma;
+
         ExpGolombWriter.WriteUe(w, 0); // mb_type = 0
 
         // 16 × (prev_intra4x4_pred_mode_flag, [rem_intra4x4_pred_mode])
@@ -342,20 +390,6 @@ internal static class IntraEncoder4x4
                 }
             }
         }
-
-        // Persist state.
-        state.CbpLuma = cbpLuma;
-        state.CbpChroma = cbpChroma;
-        // Copy chroma reconstruction into state + picture.
-        chroma.ReconU.CopyTo(state.ReconU, 0);
-        chroma.ReconV.CopyTo(state.ReconV, 0);
-        int cmbX = mbX * 8, cmbY = mbY * 8;
-        for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++)
-            {
-                picU[(cmbY + y) * picStrideC + cmbX + x] = state.ReconU[y * 8 + x];
-                picV[(cmbY + y) * picStrideC + cmbX + x] = state.ReconV[y * 8 + x];
-            }
 
         mbStates[mbAddress] = state;
     }

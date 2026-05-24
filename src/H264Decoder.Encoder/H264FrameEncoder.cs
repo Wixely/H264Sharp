@@ -140,7 +140,7 @@ public static class H264FrameEncoder
         {
             return EncodeIFrameCabac(srcY, srcU, srcV, qp,
                 picWidthInMbs, picHeightInMbs, bufferWidth, bufferChromaWidth,
-                frameNum, idrPicId, reconYOut, reconUOut, reconVOut, width, height);
+                frameNum, idrPicId, reconYOut, reconUOut, reconVOut, width, height, options);
         }
 
         var sliceWriter = new BitWriter(4096);
@@ -472,17 +472,17 @@ public static class H264FrameEncoder
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 2, sliceRbsp);
     }
 
-    /// <summary>CABAC-mode I-frame encoder. Currently Intra_16x16 only — when EnableCabac is on,
-    /// the encoder forces Intra_16x16 selection for all MBs (the CABAC residual encoder for
-    /// the Intra_4x4 / I_NxN ctxBlockCat=2 path is not yet wired through). Emits one slice with
-    /// CABAC byte-aligned macroblock data ending in end_of_slice_flag.</summary>
+    /// <summary>CABAC-mode I-frame encoder. Picks per-MB between Intra_16x16 and Intra_4x4
+    /// (when <c>EnableIntra4x4</c> is on) using the same SAD-with-λ-bias decision as the CAVLC
+    /// path. Emits one slice with CABAC byte-aligned macroblock data ending in end_of_slice_flag.</summary>
     private static byte[] EncodeIFrameCabac(
         byte[] srcY, byte[] srcU, byte[] srcV, int qp,
         int picWidthInMbs, int picHeightInMbs,
         int bufferWidth, int bufferChromaWidth,
         uint frameNum, uint idrPicId,
         byte[] reconYOut, byte[] reconUOut, byte[] reconVOut,
-        int width, int height)
+        int width, int height,
+        Options options)
     {
         var sliceWriter = new BitWriter(4096);
         var sps = SpsWriter.BuildBaseline(width, height);
@@ -521,16 +521,49 @@ public static class H264FrameEncoder
             ReadOnlySpan<byte> mbSrcY = srcY.AsSpan(y0 * bufferWidth + x0);
             ReadOnlySpan<byte> mbSrcU = srcU.AsSpan((y0 / 2) * bufferChromaWidth + (x0 / 2));
             ReadOnlySpan<byte> mbSrcV = srcV.AsSpan((y0 / 2) * bufferChromaWidth + (x0 / 2));
-            H264Decoder.Encoder.Cabac.CabacMbEncoder.EncodeIntra16x16(
-                cabac,
-                mbSrcY, mbSrcU, mbSrcV,
-                srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
-                reconYOut, reconUOut, reconVOut,
-                picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
-                mbX, mbY, mbsPerRow: picWidthInMbs,
-                qpY: qp,
-                mbStates, mbAddress: addr,
-                ref prevMbQpDeltaState);
+
+            bool useIntra4x4 = false;
+            if (options.EnableIntra4x4)
+            {
+                int sad16 = MacroblockEncoder.EstimateBestIntra16x16Sad(
+                    mbSrcY, bufferWidth,
+                    reconYOut, bufferWidth, mbX, mbY, mbsPerRow: picWidthInMbs,
+                    mbStates, addr);
+                int sad4 = IntraEncoder4x4.EstimateMbSad(
+                    mbSrcY, bufferWidth,
+                    reconYOut, bufferWidth, mbX, mbY, mbsPerRow: picWidthInMbs,
+                    mbStates, addr);
+                int lambda = DefaultLambda(qp);
+                int bias = lambda * 32;
+                useIntra4x4 = sad4 + bias < sad16;
+            }
+
+            if (useIntra4x4)
+            {
+                H264Decoder.Encoder.Cabac.CabacMbEncoder.EncodeIntra4x4(
+                    cabac,
+                    mbSrcY, mbSrcU, mbSrcV,
+                    srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                    reconYOut, reconUOut, reconVOut,
+                    picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                    mbX, mbY, mbsPerRow: picWidthInMbs,
+                    qpY: qp,
+                    mbStates, mbAddress: addr,
+                    ref prevMbQpDeltaState);
+            }
+            else
+            {
+                H264Decoder.Encoder.Cabac.CabacMbEncoder.EncodeIntra16x16(
+                    cabac,
+                    mbSrcY, mbSrcU, mbSrcV,
+                    srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                    reconYOut, reconUOut, reconVOut,
+                    picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                    mbX, mbY, mbsPerRow: picWidthInMbs,
+                    qpY: qp,
+                    mbStates, mbAddress: addr,
+                    ref prevMbQpDeltaState);
+            }
             // end_of_slice_flag: 1 only on the final MB.
             bool last = addr == totalMbs - 1;
             H264Decoder.Encoder.Cabac.CabacEncSlice.EncodeEndOfSliceFlag(cabac, last);
