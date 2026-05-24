@@ -27,6 +27,14 @@ public static class H264FrameEncoder
         public int SearchRangePel { get; init; } = 16;
         /// <summary>Hard cap on SAD evaluations per MB.</summary>
         public int MaxSadEvalsPerMb { get; init; } = 64;
+        /// <summary>When false, ME stops at integer-pel (no half/quarter-pel refinement).</summary>
+        public bool EnableSubpelMe { get; init; } = true;
+        /// <summary>When false, only P_L0_16x16 / P_Skip / Intra are considered for P MBs
+        /// (skips P_L0_L0_16x8 / P_L0_L0_8x16 / P_8x8 mode decision — legacy phase-2 behavior).</summary>
+        public bool EnableSubMbPartitions { get; init; } = true;
+        /// <summary>Lambda value for SAD + λ*bits cost weighting in partition mode decision.
+        /// When 0, decision is by raw SAD (phase 2 behavior). x264-style λ ≈ pow(2,(QP-12)/3).</summary>
+        public int ModeDecisionLambda { get; init; } = -1;
     }
 
     /// <summary>Encode a sequence of raw YUV 4:2:0 frames into an Annex-B H.264 byte stream.</summary>
@@ -207,40 +215,69 @@ public static class H264FrameEncoder
             // and the start point of ME).
             (int predX, int predY) = MacroblockEncoderInter.PredictMvMedian(leftMb, topMb, topRightMb, topLeftMb);
 
-            // Motion estimation.
-            MotionEstimator.MeResult meResult;
+            // Read 16x16 luma source into a contiguous span.
+            for (int y = 0; y < 16; y++)
+                for (int x = 0; x < 16; x++)
+                    srcLuma[y * 16 + x] = mbSrcY[y * bufferWidth + x];
+
+            // Partition mode decision. If sub-MB partitions are disabled, this always returns a 16x16 candidate.
+            int lambda = options.ModeDecisionLambda >= 0 ? options.ModeDecisionLambda : DefaultLambda(qp);
+            MacroblockEncoderPartition.PartitionCandidate cand;
             if (options.EnableMotionSearch)
             {
-                for (int y = 0; y < 16; y++)
-                    for (int x = 0; x < 16; x++)
-                        srcLuma[y * 16 + x] = mbSrcY[y * bufferWidth + x];
-                meResult = MotionEstimator.Search(
-                    refY, bufferWidth, bufferHeight,
+                cand = MacroblockEncoderPartition.ChooseBestPartition(
                     srcLuma,
-                    mbX * 16, mbY * 16,
+                    refY, bufferWidth, bufferHeight,
+                    mbX, mbY,
                     predX, predY,
                     options.SearchRangePel,
-                    options.MaxSadEvalsPerMb);
+                    options.MaxSadEvalsPerMb,
+                    options.EnableSubpelMe,
+                    options.EnableSubMbPartitions,
+                    lambda);
             }
             else
             {
-                meResult = new MotionEstimator.MeResult(predX, predY, 0);
+                cand = new MacroblockEncoderPartition.PartitionCandidate { RawMbType = 0 };
+                cand.Partitions.Add(new MacroblockEncoderPartition.Partition(0, 0, 4, 4, predX, predY));
             }
 
-            int mvX = meResult.MvX;
-            int mvY = meResult.MvY;
+            // Build the inter candidate (predict + residual + reconstruct). For RawMbType=0 we can
+            // call the legacy single-MV path; for partitioned shapes we predict per partition first.
+            MacroblockEncoderInter.InterEncodeBundle bundle;
+            int mvX, mvY;
+            if (cand.RawMbType == 0)
+            {
+                mvX = cand.Partitions[0].MvX;
+                mvY = cand.Partitions[0].MvY;
+                bundle = MacroblockEncoderInter.BuildInterCandidate(
+                    mbSrcY, mbSrcU, mbSrcV,
+                    bufferWidth, bufferChromaWidth,
+                    refY, refU, refV,
+                    bufferWidth, bufferHeight, bufferChromaWidth, bufferChromaHeight,
+                    mbX, mbY, qp, mvX, mvY);
+            }
+            else
+            {
+                bundle = new MacroblockEncoderInter.InterEncodeBundle();
+                MacroblockEncoderPartition.BuildPrediction(
+                    cand,
+                    refY, bufferWidth, bufferHeight,
+                    refU, refV, bufferChromaWidth, bufferChromaHeight,
+                    mbX, mbY,
+                    bundle.PredY, bundle.PredU, bundle.PredV);
+                MacroblockEncoderInter.BuildInterCandidateFromPrediction(bundle, mbSrcY, bufferWidth, qp);
+                int qPc = MacroblockEncoderInter.ChromaQpFromLuma(qp);
+                MacroblockEncoderInter.EncodeChromaFromPrediction(mbSrcU, mbSrcV, bufferChromaWidth, qPc, bundle);
+                mvX = cand.Partitions[0].MvX;
+                mvY = cand.Partitions[0].MvY;
+            }
 
-            // Build the inter candidate (predict + residual + reconstruct).
-            var bundle = MacroblockEncoderInter.BuildInterCandidate(
-                mbSrcY, mbSrcU, mbSrcV,
-                bufferWidth, bufferChromaWidth,
-                refY, refU, refV,
-                bufferWidth, bufferHeight, bufferChromaWidth, bufferChromaHeight,
-                mbX, mbY, qp, mvX, mvY);
-
-            // P_Skip eligibility: MV matches P_Skip-derived MV AND residual is all-zero AND refIdx=0.
+            // P_Skip eligibility: only applies to 16x16 partition with single MV matching P_Skip MV
+            // AND zero residual AND refIdx=0.
             (int skipMvX, int skipMvY) = MacroblockEncoderInter.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
             bool eligibleSkip = options.EnablePSkip
+                && cand.RawMbType == 0
                 && mvX == skipMvX && mvY == skipMvY
                 && bundle.CbpLuma == 0 && bundle.CbpChroma == 0;
 
@@ -248,7 +285,6 @@ public static class H264FrameEncoder
             {
                 // Emit no syntax — accumulate into mb_skip_run.
                 pendingSkipRun++;
-                // Reconstruction: copy MC prediction directly (no residual to add).
                 MacroblockEncoderInter.StoreReconToPicture(bundle,
                     reconYOut, reconUOut, reconVOut,
                     bufferWidth, bufferChromaWidth, mbX, mbY);
@@ -256,12 +292,21 @@ public static class H264FrameEncoder
                 {
                     MbAddress = addr,
                     IsSkipped = true,
+                    IsInter = true,
                     IsInterP16x16 = false,
+                    RawMbType = -1,
                     MvL0X = skipMvX,
                     MvL0Y = skipMvY,
                     RefIdxL0 = 0,
                     QpY = qp,
                 };
+                // P_Skip implies the whole MB MV is (skipMvX, skipMvY), set per-block.
+                for (int i = 0; i < 16; i++)
+                {
+                    skipState.MvL0XBlock[i] = skipMvX;
+                    skipState.MvL0YBlock[i] = skipMvY;
+                }
+                for (int q = 0; q < 4; q++) skipState.RefIdxL08x8[q] = 0;
                 bundle.ReconY.CopyTo(skipState.ReconY, 0);
                 bundle.ReconU.CopyTo(skipState.ReconU, 0);
                 bundle.ReconV.CopyTo(skipState.ReconV, 0);
@@ -273,19 +318,37 @@ public static class H264FrameEncoder
             ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
             pendingSkipRun = 0;
 
-            int mvdX = mvX - predX;
-            int mvdY = mvY - predY;
-
             var state = new MacroblockEncoderState
             {
                 MbAddress = addr,
                 QpY = qp,
             };
-            MacroblockEncoderInter.EmitP_L0_16x16(
-                sliceWriter, bundle, qp,
-                mvdX, mvdY, mvX, mvY,
-                refIdxBits: 0,
-                leftMb, topMb, state);
+            if (cand.RawMbType == 0)
+            {
+                int mvdX = mvX - predX;
+                int mvdY = mvY - predY;
+                state.IsInter = true;
+                MacroblockEncoderInter.EmitP_L0_16x16(
+                    sliceWriter, bundle, qp,
+                    mvdX, mvdY, mvX, mvY,
+                    refIdxBits: 0,
+                    leftMb, topMb, state);
+                // EmitP_L0_16x16 doesn't fill per-block arrays for non-trivial neighbors — do so.
+                for (int i = 0; i < 16; i++)
+                {
+                    state.MvL0XBlock[i] = mvX;
+                    state.MvL0YBlock[i] = mvY;
+                }
+                for (int qq = 0; qq < 4; qq++) state.RefIdxL08x8[qq] = 0;
+                state.RawMbType = 0;
+            }
+            else
+            {
+                MacroblockEncoderPartition.EmitPartitionMb(
+                    sliceWriter, cand, bundle, qp,
+                    leftMb, topMb, topRightMb, topLeftMb,
+                    state);
+            }
             MacroblockEncoderInter.StoreReconToPicture(bundle,
                 reconYOut, reconUOut, reconVOut,
                 bufferWidth, bufferChromaWidth, mbX, mbY);
@@ -303,6 +366,16 @@ public static class H264FrameEncoder
         sliceWriter.WriteRbspTrailingBits();
         byte[] sliceRbsp = sliceWriter.ToByteArray();
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 2, sliceRbsp);
+    }
+
+    /// <summary>x264-style default λ for SAD+λ*bits mode decision.</summary>
+    private static int DefaultLambda(int qp)
+    {
+        // λ ≈ pow(2, (QP-12)/3), rounded; clamped to a safe range.
+        double lam = Math.Pow(2.0, (qp - 12) / 3.0);
+        if (lam < 1) lam = 1;
+        if (lam > 256) lam = 256;
+        return (int)Math.Round(lam);
     }
 
     private static void CopyPlaneWithEdgePad(

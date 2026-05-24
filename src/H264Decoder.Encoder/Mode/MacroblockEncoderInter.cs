@@ -58,12 +58,29 @@ internal static class MacroblockEncoderInter
         int mbX, int mbY, int qpY,
         int mvX, int mvY)
     {
+        // Single 16x16 partition shortcut: produce 16x16 prediction with one MC call, then
+        // hand off to the shared multi-partition pipeline. Chroma uses the same single MV.
         var bundle = new InterEncodeBundle();
-
         Span<byte> pred = bundle.PredY;
-        MotionEstimator.IntegerLumaPredict(refY, refW, refH,
-            mbX * 16, mbY * 16, mvX, mvY, pred);
+        MotionEstimator.LumaPredictBlock(refY, refW, refH,
+            mbX * 16, mbY * 16, mvX, mvY, 16, 16, pred);
+        BuildInterCandidateFromPrediction(
+            bundle, srcY, srcStrideY, qpY);
+        int qPc = ChromaQpFromLumaQp(qpY);
+        // Chroma: single MV for the whole 8x8 (matches 16x16 luma partition).
+        MotionEstimator.ChromaPredictBlock(refU, refCw, refCh, mbX * 8, mbY * 8, mvX, mvY, 8, 8, bundle.PredU);
+        MotionEstimator.ChromaPredictBlock(refV, refCw, refCh, mbX * 8, mbY * 8, mvX, mvY, 8, 8, bundle.PredV);
+        EncodeChromaFromPrediction(srcU, srcV, srcStrideC, qPc, bundle);
+        return bundle;
+    }
 
+    /// <summary>Run forward residual + reconstruction for a 16x16 MB whose 16x16 luma prediction
+    /// is already in <paramref name="bundle"/>.PredY. SAD, CbpLuma, Luma4x4 coeffs, and ReconY are filled.</summary>
+    internal static void BuildInterCandidateFromPrediction(
+        InterEncodeBundle bundle,
+        ReadOnlySpan<byte> srcY, int srcStrideY, int qpY)
+    {
+        Span<byte> pred = bundle.PredY;
         Span<byte> srcLuma = stackalloc byte[256];
         for (int y = 0; y < 16; y++)
             for (int x = 0; x < 16; x++)
@@ -130,13 +147,6 @@ internal static class MacroblockEncoderInter
                     bundle.ReconY[(by * 4 + yy) * 16 + (bx * 4 + xx)] = clipped;
                 }
         }
-
-        int qPc = ChromaQpFromLumaQp(qpY);
-        EncodeInterChroma(srcU, srcV, srcStrideC,
-            refU, refV, refCw, refCh,
-            mbX, mbY, mvX, mvY, qPc, bundle);
-
-        return bundle;
     }
 
     /// <summary>Emit the P_L0_16x16 macroblock_layer() syntax + residual for an already-built
@@ -170,8 +180,10 @@ internal static class MacroblockEncoderInter
             ExpGolombWriter.WriteSe(w, 0);
         }
 
+        state.IsInter = true;
         state.IsInterP16x16 = true;
         state.IsIntra16x16 = false;
+        state.RawMbType = 0;
         state.CbpLuma = bundle.CbpLuma;
         state.CbpChroma = bundle.CbpChroma;
         state.QpY = qpY;
@@ -243,17 +255,15 @@ internal static class MacroblockEncoderInter
             }
     }
 
-    private static void EncodeInterChroma(
+    /// <summary>Forward chroma residual + reconstruction given that bundle.PredU/V is already
+    /// filled with chroma-MC samples. Sets bundle.ChromaDc/Ac/CbpChroma/ReconU/V.</summary>
+    internal static void EncodeChromaFromPrediction(
         ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV, int srcStrideC,
-        byte[] refU, byte[] refV, int refCw, int refCh,
-        int mbX, int mbY, int mvX, int mvY,
         int qPc,
         InterEncodeBundle bundle)
     {
         Span<byte> predU = bundle.PredU;
         Span<byte> predV = bundle.PredV;
-        MotionEstimator.IntegerChromaPredict(refU, refCw, refCh, mbX * 8, mbY * 8, mvX, mvY, predU);
-        MotionEstimator.IntegerChromaPredict(refV, refCw, refCh, mbX * 8, mbY * 8, mvX, mvY, predV);
 
         Span<byte> srcCb = stackalloc byte[64];
         Span<byte> srcCr = stackalloc byte[64];
@@ -342,62 +352,68 @@ internal static class MacroblockEncoderInter
         bundle.CbpChroma = anyAc ? 2 : (anyDc ? 1 : 0);
     }
 
-    /// <summary>P_Skip MV derivation per spec §8.4.1.1.</summary>
+    /// <summary>P_Skip MV derivation per spec §8.4.1.1. Uses block (0,0) MV of left/top neighbor
+    /// for partitioned MBs (instead of the scalar MvL0X/Y which only reflects partition 0).</summary>
     public static (int X, int Y) DerivePSkipMv(
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
         MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb)
     {
-        bool aIsInter = leftMb is not null && (leftMb.IsInterP16x16 || leftMb.IsSkipped);
-        bool bIsInter = topMb is not null && (topMb.IsInterP16x16 || topMb.IsSkipped);
+        // Neighbor block coordinates for the current MB's block (0,0) per §8.4.1.1:
+        //   A = left MB's block at (3,0) → raster idx 5
+        //   B = top MB's block at (0,3) → raster idx 10
+        int aMvX = 0, aMvY = 0, aRefIdx = -1;
+        if (leftMb is not null && leftMb.IsInter)
+        {
+            aMvX = leftMb.MvL0XBlock[5];
+            aMvY = leftMb.MvL0YBlock[5];
+            aRefIdx = leftMb.RefIdxL08x8[1]; // quadrant 1 = TR (where block (3,0) lives)
+        }
+        int bMvX = 0, bMvY = 0, bRefIdx = -1;
+        if (topMb is not null && topMb.IsInter)
+        {
+            bMvX = topMb.MvL0XBlock[10];
+            bMvY = topMb.MvL0YBlock[10];
+            bRefIdx = topMb.RefIdxL08x8[2]; // quadrant 2 = BL (where block (0,3) lives)
+        }
         bool aUnavailOrZero = leftMb is null
-            || (aIsInter && leftMb!.RefIdxL0 == 0 && leftMb.MvL0X == 0 && leftMb.MvL0Y == 0);
+            || (leftMb.IsInter && aRefIdx == 0 && aMvX == 0 && aMvY == 0);
         bool bUnavailOrZero = topMb is null
-            || (bIsInter && topMb!.RefIdxL0 == 0 && topMb.MvL0X == 0 && topMb.MvL0Y == 0);
+            || (topMb.IsInter && bRefIdx == 0 && bMvX == 0 && bMvY == 0);
         if (aUnavailOrZero || bUnavailOrZero) return (0, 0);
         return PredictMvMedian(leftMb, topMb, topRightMb, topLeftMb);
     }
 
-    /// <summary>Predict the 16x16 partition MV: median of A=left, B=top, C=top-right (or D=top-left if C absent).</summary>
+    /// <summary>Predict the 16x16 partition MV: median of A=left, B=top, C=top-right (or D=top-left if C absent).
+    /// Uses the per-block MV of the appropriate neighbor block (spec §8.4.1.3.1).</summary>
     public static (int X, int Y) PredictMvMedian(
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
         MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb)
     {
-        MacroblockEncoderState? cMb = topRightMb ?? topLeftMb;
-        bool aAvail = leftMb is not null;
-        bool bAvail = topMb is not null;
-        bool cAvail = cMb is not null;
-        if (!bAvail && !cAvail && aAvail)
-        {
-            return (leftMb!.MvL0X, leftMb.MvL0Y);
-        }
-        (int x, int y, int refIdx) A = aAvail && (leftMb!.IsInterP16x16 || leftMb.IsSkipped)
-            ? (leftMb.MvL0X, leftMb.MvL0Y, leftMb.RefIdxL0)
-            : (0, 0, -1);
-        (int x, int y, int refIdx) B = bAvail && (topMb!.IsInterP16x16 || topMb.IsSkipped)
-            ? (topMb.MvL0X, topMb.MvL0Y, topMb.RefIdxL0)
-            : (0, 0, -1);
-        (int x, int y, int refIdx) C = cAvail && (cMb!.IsInterP16x16 || cMb.IsSkipped)
-            ? (cMb.MvL0X, cMb.MvL0Y, cMb.RefIdxL0)
-            : (0, 0, -1);
-        int cur = 0;
-        int matchCount = (A.refIdx == cur ? 1 : 0) + (B.refIdx == cur ? 1 : 0) + (C.refIdx == cur ? 1 : 0);
-        if (matchCount == 1)
-        {
-            if (A.refIdx == cur) return (A.x, A.y);
-            if (B.refIdx == cur) return (B.x, B.y);
-            return (C.x, C.y);
-        }
-        return (Median3(A.x, B.x, C.x), Median3(A.y, B.y, C.y));
+        // Use the shared partition predictor with rawMbType=0 sentinel and curRefIdx=0 — gives the
+        // standard median over A=block(-1,0) / B=block(0,-1) / C=block(4,-1)|D=block(-1,-1).
+        // Need a stand-in for the "current" MB's state; we build a dummy with all zero blocks.
+        var dummy = new MacroblockEncoderState();
+        return PartitionMvPredictor.Predict(
+            dummy, rawMbType: 0, partIdx: 0,
+            bx: 0, by: 0, bw: 4, bh: 4, curRefIdx: 0,
+            leftMb, topMb, topRightMb, topLeftMb);
     }
 
-    private static int Median3(int a, int b, int c)
-    {
-        int min = Math.Min(a, Math.Min(b, c));
-        int max = Math.Max(a, Math.Max(b, c));
-        return a + b + c - min - max;
-    }
+    /// <summary>Lookup table: cbp → CAVLC code num for inter (Table 9-4 inter column). -1 = unmappable.</summary>
+    public static int CbpToCodeNumInter(int cbp) => _cbpToCodeNumInter[cbp];
 
-    private static int NcLumaBlock(
+    /// <summary>Compute luma 4x4 block nC predictor for a given block index within the current MB.</summary>
+    public static int NcLumaBlock(
+        MacroblockEncoderState cur, MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb, int blockIdx)
+        => NcLumaBlockImpl(cur, leftMb, topMb, blockIdx);
+
+    /// <summary>Compute chroma AC 4x4 block nC predictor for a given component / block index.</summary>
+    public static int NcChromaBlock(
+        MacroblockEncoderState cur, MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        int comp, int blockIdx)
+        => NcChromaBlockImpl(cur, leftMb, topMb, comp, blockIdx);
+
+    private static int NcLumaBlockImpl(
         MacroblockEncoderState cur, MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb, int blockIdx)
     {
         (int x, int y) = MacroblockEncoder.LumaBlockPos[blockIdx];
@@ -412,7 +428,7 @@ internal static class MacroblockEncoderInter
         return ComputeNc(nA, nB);
     }
 
-    private static int NcChromaBlock(
+    private static int NcChromaBlockImpl(
         MacroblockEncoderState cur, MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
         int comp, int blockIdx)
     {
@@ -454,4 +470,7 @@ internal static class MacroblockEncoderInter
         else if (qPi > 51) qPi = 51;
         return _qpcTable[qPi];
     }
+
+    /// <summary>Public wrapper over the QPy → QPc table for cross-module callers.</summary>
+    public static int ChromaQpFromLuma(int qPy) => ChromaQpFromLumaQp(qPy);
 }
