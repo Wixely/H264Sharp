@@ -753,7 +753,8 @@ public static class H264FrameEncoder
                     CabacMbEncoderB.EncodeNonSkip(
                         cabac!, cand, state, addr, qp,
                         predL0X, predL0Y, predL1X, predL1Y,
-                        leftMb, topMb, ref prevMbQpDeltaState);
+                        leftMb, topMb, topRightMb, topLeftMb,
+                        ref prevMbQpDeltaState);
                 }
                 bool lastMb = addr == totalMbs - 1;
                 CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMb);
@@ -775,9 +776,9 @@ public static class H264FrameEncoder
                     // CAVLC: flush pending mb_skip_run before each emitted MB.
                     ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
                     pendingSkipRun = 0;
-                    BMbEncoder.EmitBMb16x16(sliceWriter, cand, qp,
+                    BMbEncoder.EmitBMb(sliceWriter, cand, qp,
                         predL0X, predL0Y, predL1X, predL1Y,
-                        state, leftMb, topMb);
+                        state, leftMb, topMb, topRightMb, topLeftMb);
                 }
             }
 

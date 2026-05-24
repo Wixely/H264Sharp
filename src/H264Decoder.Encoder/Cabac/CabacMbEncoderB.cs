@@ -47,58 +47,29 @@ internal static class CabacMbEncoderB
         int mbAddress, int qpY,
         int predL0X, int predL0Y, int predL1X, int predL1Y,
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb,
         ref int prevMbQpDeltaState)
     {
         // mb_skip_flag = 0 (B-slice ctxIdxOffset=24).
         CabacEncSliceB.EncodeMbSkipFlagB(cabac, isSkip: false, leftMb, topMb);
 
         // mb_type.
-        int mbType = cand.Direction switch
-        {
-            BMbEncoder.Dir.Direct => 0,
-            BMbEncoder.Dir.L0 => 1,
-            BMbEncoder.Dir.L1 => 2,
-            BMbEncoder.Dir.Bi => 3,
-            _ => throw new InvalidOperationException()
-        };
+        int mbType = BMbEncoder.MbTypeOf(cand);
         CabacEncSliceB.EncodeMbTypeB16x16(cabac, mbType, leftMb, topMb);
 
         // ---- Populate state for in-MB neighbor lookups during residual phase. ----
         BMbEncoder.PopulateBMbState(cand, state, mbAddress, qpY, 0, 0, 0, 0);
 
-        // ---- mvd_l0 then mvd_l1 (per decoder iteration order). Direct emits none. ----
-        int mvdL0X = 0, mvdL0Y = 0, mvdL1X = 0, mvdL1Y = 0;
-        if (cand.Direction != BMbEncoder.Dir.Direct)
+        // ---- MVD emission ----
+        if (cand.Shape == BMbEncoder.Shape.Sq16x16 && cand.Direction != BMbEncoder.Dir.Direct)
         {
-            bool useL0 = cand.Direction != BMbEncoder.Dir.L1;
-            bool useL1 = cand.Direction != BMbEncoder.Dir.L0;
-            if (useL0)
-            {
-                mvdL0X = cand.MvL0X - predL0X;
-                mvdL0Y = cand.MvL0Y - predL0Y;
-                int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: true);
-                int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: false);
-                CabacEncSliceP.EncodeMvd(cabac, mvdL0X, sumX, ctxBase: 40);
-                CabacEncSliceP.EncodeMvd(cabac, mvdL0Y, sumY, ctxBase: 47);
-            }
-            if (useL1)
-            {
-                mvdL1X = cand.MvL1X - predL1X;
-                mvdL1Y = cand.MvL1Y - predL1Y;
-                int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: true);
-                int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: false);
-                CabacEncSliceP.EncodeMvd(cabac, mvdL1X, sumX, ctxBase: 40);
-                CabacEncSliceP.EncodeMvd(cabac, mvdL1Y, sumY, ctxBase: 47);
-            }
-            // Re-populate per-block mvds now that we know them (state currently has zeros).
-            for (int i = 0; i < 16; i++)
-            {
-                state.MvdL0XBlock[i] = useL0 ? mvdL0X : 0;
-                state.MvdL0YBlock[i] = useL0 ? mvdL0Y : 0;
-                state.MvdL1XBlock[i] = useL1 ? mvdL1X : 0;
-                state.MvdL1YBlock[i] = useL1 ? mvdL1Y : 0;
-            }
+            EmitMvdsSq16x16(cabac, cand, state, predL0X, predL0Y, predL1X, predL1Y, leftMb, topMb);
         }
+        else if (cand.Shape != BMbEncoder.Shape.Sq16x16)
+        {
+            EmitMvdsPartitioned(cabac, cand, state, leftMb, topMb, topRightMb, topLeftMb);
+        }
+        // Direct (Sq16x16 Direct) and Skip emit no MVDs.
 
         // ---- CBP luma + chroma (shared with P-slice CABAC encoder). ----
         var bundle = cand.Bundle;
@@ -123,6 +94,155 @@ internal static class CabacMbEncoderB
         bundle.ReconY.CopyTo(state.ReconY, 0);
         bundle.ReconU.CopyTo(state.ReconU, 0);
         bundle.ReconV.CopyTo(state.ReconV, 0);
+    }
+
+    /// <summary>MVD emission for a Sq16x16 inter (L0/L1/Bi) candidate. Single 16x16 partition with
+    /// neighbor blocks at (-1,0) and (0,-1).</summary>
+    private static void EmitMvdsSq16x16(
+        CabacEncoder cabac, BMbEncoder.BCandidate cand, MacroblockEncoderState state,
+        int predL0X, int predL0Y, int predL1X, int predL1Y,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
+    {
+        bool useL0 = cand.Direction != BMbEncoder.Dir.L1;
+        bool useL1 = cand.Direction != BMbEncoder.Dir.L0;
+        int mvdL0X = 0, mvdL0Y = 0, mvdL1X = 0, mvdL1Y = 0;
+        if (useL0)
+        {
+            mvdL0X = cand.MvL0X - predL0X;
+            mvdL0Y = cand.MvL0Y - predL0Y;
+            int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: true);
+            int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 0, xComp: false);
+            CabacEncSliceP.EncodeMvd(cabac, mvdL0X, sumX, ctxBase: 40);
+            CabacEncSliceP.EncodeMvd(cabac, mvdL0Y, sumY, ctxBase: 47);
+        }
+        if (useL1)
+        {
+            mvdL1X = cand.MvL1X - predL1X;
+            mvdL1Y = cand.MvL1Y - predL1Y;
+            int sumX = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: true);
+            int sumY = NeighborAbsMvdSum(leftMb, topMb, listX: 1, xComp: false);
+            CabacEncSliceP.EncodeMvd(cabac, mvdL1X, sumX, ctxBase: 40);
+            CabacEncSliceP.EncodeMvd(cabac, mvdL1Y, sumY, ctxBase: 47);
+        }
+        // Re-populate per-block mvds (the PopulateBMbState call left them as zero).
+        for (int i = 0; i < 16; i++)
+        {
+            state.MvdL0XBlock[i] = useL0 ? mvdL0X : 0;
+            state.MvdL0YBlock[i] = useL0 ? mvdL0Y : 0;
+            state.MvdL1XBlock[i] = useL1 ? mvdL1X : 0;
+            state.MvdL1YBlock[i] = useL1 ? mvdL1Y : 0;
+        }
+    }
+
+    /// <summary>MVD emission for a partitioned (16x8 or 8x16) B-MB candidate. Iterates L0 over all
+    /// partitions, then L1 over all partitions (per decoder iteration order). Uses the same
+    /// shape-aware per-partition predictor as the CAVLC path so the decoder reconstructs identical
+    /// MVs. absMvdSum is computed from the partition's top-left neighbor blocks (in-MB for
+    /// partition 1 of 16x8 / 8x16 reads partition 0's stored MVDs).</summary>
+    private static void EmitMvdsPartitioned(
+        CabacEncoder cabac, BMbEncoder.BCandidate cand, MacroblockEncoderState state,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb)
+    {
+        (int Bx, int By, int Bw, int Bh)[] partsB = cand.Shape == BMbEncoder.Shape.P16x8
+            ? new[] { (0, 0, 4, 2), (0, 2, 4, 2) }
+            : new[] { (0, 0, 2, 4), (2, 0, 2, 4) };
+
+        int mbType = BMbEncoder.MbTypeOf(cand);
+
+        // L0 over partitions.
+        for (int p = 0; p < 2; p++)
+        {
+            BMbEncoder.Dir d = p == 0 ? cand.Direction : cand.Part1Direction;
+            if (d != BMbEncoder.Dir.L0 && d != BMbEncoder.Dir.Bi) continue;
+            var (bx, by, bw, bh) = partsB[p];
+            (int predX, int predY) = BMbEncoder.PredictPartitionMvBListPublic(
+                state, mbType, p, bx, by, bw, bh, curRefIdx: 0, listX: 0,
+                leftMb, topMb, topRightMb, topLeftMb);
+            int mvX = p == 0 ? cand.MvL0X : cand.Part1MvL0X;
+            int mvY = p == 0 ? cand.MvL0Y : cand.Part1MvL0Y;
+            int mvdX = mvX - predX;
+            int mvdY = mvY - predY;
+            int sumX = NeighborAbsMvdSumAt(state, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 0, xComp: true);
+            int sumY = NeighborAbsMvdSumAt(state, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 0, xComp: false);
+            CabacEncSliceP.EncodeMvd(cabac, mvdX, sumX, ctxBase: 40);
+            CabacEncSliceP.EncodeMvd(cabac, mvdY, sumY, ctxBase: 47);
+            FillBlockMvds(state, bx, by, bw, bh, listX: 0, mvdX, mvdY);
+        }
+        // L1 over partitions.
+        for (int p = 0; p < 2; p++)
+        {
+            BMbEncoder.Dir d = p == 0 ? cand.Direction : cand.Part1Direction;
+            if (d != BMbEncoder.Dir.L1 && d != BMbEncoder.Dir.Bi) continue;
+            var (bx, by, bw, bh) = partsB[p];
+            (int predX, int predY) = BMbEncoder.PredictPartitionMvBListPublic(
+                state, mbType, p, bx, by, bw, bh, curRefIdx: 0, listX: 1,
+                leftMb, topMb, topRightMb, topLeftMb);
+            int mvX = p == 0 ? cand.MvL1X : cand.Part1MvL1X;
+            int mvY = p == 0 ? cand.MvL1Y : cand.Part1MvL1Y;
+            int mvdX = mvX - predX;
+            int mvdY = mvY - predY;
+            int sumX = NeighborAbsMvdSumAt(state, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 1, xComp: true);
+            int sumY = NeighborAbsMvdSumAt(state, bx, by, leftMb, topMb, topRightMb, topLeftMb, listX: 1, xComp: false);
+            CabacEncSliceP.EncodeMvd(cabac, mvdX, sumX, ctxBase: 40);
+            CabacEncSliceP.EncodeMvd(cabac, mvdY, sumY, ctxBase: 47);
+            FillBlockMvds(state, bx, by, bw, bh, listX: 1, mvdX, mvdY);
+        }
+    }
+
+    private static readonly int[] SpatialToRaster = { 0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15 };
+
+    private static void FillBlockMvds(MacroblockEncoderState state, int bx, int by, int bw, int bh,
+        int listX, int mvdX, int mvdY)
+    {
+        for (int yy = by; yy < by + bh; yy++)
+            for (int xx = bx; xx < bx + bw; xx++)
+            {
+                int idx = SpatialToRaster[yy * 4 + xx];
+                if (listX == 0) { state.MvdL0XBlock[idx] = mvdX; state.MvdL0YBlock[idx] = mvdY; }
+                else { state.MvdL1XBlock[idx] = mvdX; state.MvdL1YBlock[idx] = mvdY; }
+            }
+    }
+
+    /// <summary>absMvdSum computed at the partition's top-left block position. For partition 0 of
+    /// 16x8/8x16 the neighbors lie outside the MB (leftMb / topMb). For partition 1 the in-MB
+    /// neighbor block reads from <paramref name="cur"/>'s MVD arrays — partition 0's emit must run
+    /// first so those slots are populated.</summary>
+    private static int NeighborAbsMvdSumAt(
+        MacroblockEncoderState cur, int bx, int by,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb,
+        int listX, bool xComp)
+    {
+        return AbsMvdAtPos(cur, bx - 1, by, leftMb, topMb, topRightMb, topLeftMb, listX, xComp)
+             + AbsMvdAtPos(cur, bx, by - 1, leftMb, topMb, topRightMb, topLeftMb, listX, xComp);
+    }
+
+    private static int AbsMvdAtPos(
+        MacroblockEncoderState cur, int bx, int by,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb,
+        int listX, bool xComp)
+    {
+        MacroblockEncoderState? mb;
+        int nbBx, nbBy;
+        if (bx >= 0 && by >= 0 && bx <= 3 && by <= 3) { mb = cur; nbBx = bx; nbBy = by; }
+        else if (bx < 0 && by >= 0 && by <= 3) { mb = leftMb; nbBx = 3; nbBy = by; }
+        else if (by < 0 && bx >= 0 && bx <= 3) { mb = topMb; nbBx = bx; nbBy = 3; }
+        else if (bx < 0 && by < 0) { mb = topLeftMb; nbBx = 3; nbBy = 3; }
+        else if (bx > 3 && by < 0) { mb = topRightMb; nbBx = 0; nbBy = 3; }
+        else return 0;
+        if (mb is null) return 0;
+        if (!mb.IsInter && !mb.IsBInter) return 0;
+        if (mb.IsSkipped) return 0;
+        int idx = SpatialToRaster[nbBy * 4 + nbBx];
+        int q = (nbBy >> 1) * 2 + (nbBx >> 1);
+        int refIdx = listX == 0 ? mb.RefIdxL08x8[q] : mb.RefIdxL18x8[q];
+        if (refIdx < 0) return 0;
+        int v = listX == 0
+            ? (xComp ? mb.MvdL0XBlock[idx] : mb.MvdL0YBlock[idx])
+            : (xComp ? mb.MvdL1XBlock[idx] : mb.MvdL1YBlock[idx]);
+        return v < 0 ? -v : v;
     }
 
     /// <summary>Compute neighbor absMvdSum over A (left, block (-1,0)) and B (top, block (0,-1))
