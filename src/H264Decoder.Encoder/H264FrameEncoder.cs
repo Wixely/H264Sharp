@@ -1,5 +1,6 @@
 using H264Decoder.Bitstream;
 using H264Decoder.Encoder.Bitstream;
+using H264Decoder.Encoder.Cabac;
 using H264Decoder.Encoder.Mode;
 using H264Decoder.Encoder.Syntax;
 using H264Decoder.Syntax;
@@ -38,10 +39,10 @@ public static class H264FrameEncoder
         /// <summary>When true (default), Intra-MB mode decision considers Intra_4x4 in addition to
         /// Intra_16x16 and picks the lower-SAD option. Disable to force Intra_16x16 (phase-3 behavior).</summary>
         public bool EnableIntra4x4 { get; init; } = true;
-        /// <summary>When true, use CABAC entropy coding instead of CAVLC. Currently the encoder
-        /// supports CABAC for I-slice Intra_16x16 only — when EnableCabac is true the encoder forces
-        /// Intra_16x16 (EnableIntra4x4 is overridden to false) and P-slice frames fall back to
-        /// EnableInterPrediction=false (I-only).</summary>
+        /// <summary>When true, use CABAC entropy coding instead of CAVLC. Phase 4a enabled CABAC for
+        /// I-slice Intra_16x16. Phase 4b extends CABAC to P-slices (P_Skip, P_L0_16x16, P_L0_L0_16x8,
+        /// P_L0_L0_8x16, P_8x8 with sub_mb_type 0..3). Intra_4x4 in P-slices and inter MB
+        /// transform_8x8 are not yet supported under CABAC.</summary>
         public bool EnableCabac { get; init; } = false;
     }
 
@@ -86,8 +87,8 @@ public static class H264FrameEncoder
         {
             ReadOnlySpan<byte> frame = yuv.Slice(frameIdx * frameBytes, frameBytes);
             bool isFirst = frameIdx == 0;
-            // CABAC is currently I-only — P-slice CABAC isn't wired through.
-            bool asP = !isFirst && options.EnableInterPrediction && !options.EnableCabac;
+            // Phase 4b: CABAC supports P-slices too. Earlier phases gated P off when CABAC was on.
+            bool asP = !isFirst && options.EnableInterPrediction;
             byte[] sliceNal;
             byte[] reconY = new byte[bufferWidth * bufferHeight];
             byte[] reconU = new byte[bufferChromaWidth * bufferChromaHeight];
@@ -235,16 +236,36 @@ public static class H264FrameEncoder
 
         var sliceWriter = new BitWriter(4096);
         var sps = SpsWriter.BuildBaseline(width, height);
-        var pps = PpsWriter.BuildBaseline();
+        var pps = PpsWriter.BuildBaseline(entropyCodingModeFlag: options.EnableCabac);
         int sliceQpDelta = qp - 26 - pps.PicInitQpMinus26;
         SliceHeaderWriter.WritePSlice(sliceWriter, sps, pps,
             frameNum: frameNum,
-            sliceQpDelta: sliceQpDelta, disableDeblockingFilterIdc: 1);
+            sliceQpDelta: sliceQpDelta, disableDeblockingFilterIdc: 1,
+            cabacInitIdc: 0);
 
         int totalMbs = picWidthInMbs * picHeightInMbs;
         var mbStates = new MacroblockEncoderState?[totalMbs];
 
-        // mb_skip_run accumulator: number of skipped MBs since the last emitted (non-skip) MB.
+        // ---- CABAC state (only used when EnableCabac is true) ----
+        H264Decoder.Cabac.CabacEncoder? cabac = null;
+        int prevMbQpDeltaState = 0;
+        if (options.EnableCabac)
+        {
+            // Byte-align before CABAC bytes (cabac_alignment_one_bit padding per §7.3.4).
+            while ((sliceWriter.BitPosition & 7) != 0) sliceWriter.WriteBit(1u);
+            var contexts = new H264Decoder.Cabac.CabacContexts(H264Decoder.Cabac.CabacInitTable.ContextCount);
+            int model = 1; // P-slice with cabac_init_idc=0 maps to model index 1.
+            for (int ctxIdx = 0; ctxIdx < H264Decoder.Cabac.CabacInitTable.ContextCount; ctxIdx++)
+            {
+                sbyte m = H264Decoder.Cabac.CabacInitTable.MN[ctxIdx, model, 0];
+                sbyte n = H264Decoder.Cabac.CabacInitTable.MN[ctxIdx, model, 1];
+                if (m == H264Decoder.Cabac.CabacInitTable.CtxNA) continue;
+                contexts.Initialize(ctxIdx, m, n, qp);
+            }
+            cabac = new H264Decoder.Cabac.CabacEncoder(contexts);
+        }
+
+        // mb_skip_run accumulator (CAVLC only): number of skipped MBs since the last emitted MB.
         int pendingSkipRun = 0;
         Span<byte> srcLuma = stackalloc byte[256];
 
@@ -336,11 +357,6 @@ public static class H264FrameEncoder
 
             if (eligibleSkip)
             {
-                // Emit no syntax — accumulate into mb_skip_run.
-                pendingSkipRun++;
-                MacroblockEncoderInter.StoreReconToPicture(bundle,
-                    reconYOut, reconUOut, reconVOut,
-                    bufferWidth, bufferChromaWidth, mbX, mbY);
                 var skipState = new MacroblockEncoderState
                 {
                     MbAddress = addr,
@@ -360,6 +376,21 @@ public static class H264FrameEncoder
                     skipState.MvL0YBlock[i] = skipMvY;
                 }
                 for (int q = 0; q < 4; q++) skipState.RefIdxL08x8[q] = 0;
+                if (options.EnableCabac)
+                {
+                    // CABAC P_Skip emits mb_skip_flag=1 explicitly, then end_of_slice_flag if last MB.
+                    CabacEncSliceP.EncodeMbSkipFlag(cabac!, isSkip: true, leftMb, topMb);
+                    bool lastMb = addr == totalMbs - 1;
+                    CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMb);
+                }
+                else
+                {
+                    // CAVLC: accumulate into mb_skip_run.
+                    pendingSkipRun++;
+                }
+                MacroblockEncoderInter.StoreReconToPicture(bundle,
+                    reconYOut, reconUOut, reconVOut,
+                    bufferWidth, bufferChromaWidth, mbX, mbY);
                 bundle.ReconY.CopyTo(skipState.ReconY, 0);
                 bundle.ReconU.CopyTo(skipState.ReconU, 0);
                 bundle.ReconV.CopyTo(skipState.ReconV, 0);
@@ -367,40 +398,53 @@ public static class H264FrameEncoder
                 continue;
             }
 
-            // Flush any pending skip run before this coded MB.
-            ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
-            pendingSkipRun = 0;
-
             var state = new MacroblockEncoderState
             {
                 MbAddress = addr,
                 QpY = qp,
             };
-            if (cand.RawMbType == 0)
+
+            if (options.EnableCabac)
             {
-                int mvdX = mvX - predX;
-                int mvdY = mvY - predY;
-                state.IsInter = true;
-                MacroblockEncoderInter.EmitP_L0_16x16(
-                    sliceWriter, bundle, qp,
-                    mvdX, mvdY, mvX, mvY,
-                    refIdxBits: 0,
-                    leftMb, topMb, state);
-                // EmitP_L0_16x16 doesn't fill per-block arrays for non-trivial neighbors — do so.
-                for (int i = 0; i < 16; i++)
-                {
-                    state.MvL0XBlock[i] = mvX;
-                    state.MvL0YBlock[i] = mvY;
-                }
-                for (int qq = 0; qq < 4; qq++) state.RefIdxL08x8[qq] = 0;
-                state.RawMbType = 0;
+                // CABAC: emit mb_skip_flag=0 + mb_type + sub_mb_type + mvds + cbp + qp_delta + residual.
+                CabacMbEncoderP.EncodeNonSkip(
+                    cabac!, cand, bundle, state,
+                    addr, qp,
+                    leftMb, topMb, topRightMb, topLeftMb,
+                    ref prevMbQpDeltaState);
+                bool lastMb = addr == totalMbs - 1;
+                CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMb);
             }
             else
             {
-                MacroblockEncoderPartition.EmitPartitionMb(
-                    sliceWriter, cand, bundle, qp,
-                    leftMb, topMb, topRightMb, topLeftMb,
-                    state);
+                // CAVLC: flush any pending skip run before this coded MB.
+                ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+                pendingSkipRun = 0;
+                if (cand.RawMbType == 0)
+                {
+                    int mvdX = mvX - predX;
+                    int mvdY = mvY - predY;
+                    state.IsInter = true;
+                    MacroblockEncoderInter.EmitP_L0_16x16(
+                        sliceWriter, bundle, qp,
+                        mvdX, mvdY, mvX, mvY,
+                        refIdxBits: 0,
+                        leftMb, topMb, state);
+                    for (int i = 0; i < 16; i++)
+                    {
+                        state.MvL0XBlock[i] = mvX;
+                        state.MvL0YBlock[i] = mvY;
+                    }
+                    for (int qq = 0; qq < 4; qq++) state.RefIdxL08x8[qq] = 0;
+                    state.RawMbType = 0;
+                }
+                else
+                {
+                    MacroblockEncoderPartition.EmitPartitionMb(
+                        sliceWriter, cand, bundle, qp,
+                        leftMb, topMb, topRightMb, topLeftMb,
+                        state);
+                }
             }
             MacroblockEncoderInter.StoreReconToPicture(bundle,
                 reconYOut, reconUOut, reconVOut,
@@ -408,15 +452,22 @@ public static class H264FrameEncoder
             mbStates[addr] = state;
         }
 
-        // Trailing mb_skip_run (only when the slice ends in a skip-run AND mb_skip_run > 0).
-        // Per spec §7.3.4, a skip-run with no following coded MB must still be emitted before
-        // rbsp_trailing_bits — otherwise the decoder loses count of the trailing skipped MBs.
-        if (pendingSkipRun > 0)
+        if (options.EnableCabac)
         {
-            ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+            // Append CABAC bytes after the byte-aligned slice header. No rbsp_trailing_bits — CABAC
+            // ends with end_of_slice_flag, and Finish() produces byte-aligned output.
+            byte[] cabacBytes = cabac!.Finish();
+            foreach (byte b in cabacBytes) sliceWriter.WriteBits(b, 8);
         }
-
-        sliceWriter.WriteRbspTrailingBits();
+        else
+        {
+            // Trailing mb_skip_run for CAVLC P-slice ending in a skip-run.
+            if (pendingSkipRun > 0)
+            {
+                ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
+            }
+            sliceWriter.WriteRbspTrailingBits();
+        }
         byte[] sliceRbsp = sliceWriter.ToByteArray();
         return AnnexBWriter.BuildNalUnit(NalUnitType.SliceNonIdr, nalRefIdc: 2, sliceRbsp);
     }

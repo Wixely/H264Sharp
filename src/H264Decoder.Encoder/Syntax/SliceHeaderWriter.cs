@@ -60,14 +60,17 @@ public static class SliceHeaderWriter
 
     /// <summary>Encode the slice header for a non-IDR P-slice (single L0 reference).
     /// Sets slice_type=5 (all-P), num_ref_idx_active_override_flag=0, no ref list modification,
-    /// no pred_weight_table, no adaptive ref-pic marking. Caller supplies nal_ref_idc != 0.</summary>
+    /// no pred_weight_table, no adaptive ref-pic marking. Caller supplies nal_ref_idc != 0.
+    /// When the PPS has entropy_coding_mode_flag=1, cabac_init_idc is signalled after the
+    /// dec_ref_pic_marking block per spec §7.3.3.</summary>
     public static void WritePSlice(
         BitWriter w,
         SequenceParameterSet sps,
         PictureParameterSet pps,
         uint frameNum,
         int sliceQpDelta,
-        uint disableDeblockingFilterIdc)
+        uint disableDeblockingFilterIdc,
+        uint cabacInitIdc = 0)
     {
         ExpGolombWriter.WriteUe(w, 0); // first_mb_in_slice
         // slice_type = 5 (all-P, "all slices in this picture are P"); spec Table 7-6.
@@ -93,7 +96,11 @@ public static class SliceHeaderWriter
         // pred_weight_table absent (PPS WeightedPredFlag=0).
         // dec_ref_pic_marking for non-IDR ref slice: adaptive_ref_pic_marking_mode_flag = 0 (sliding window).
         w.WriteBit(0);
-        // CABAC: not present (PPS EntropyCodingModeFlag=0).
+        // CABAC P/SP-slice: emit cabac_init_idc when entropy_coding_mode_flag=1 (spec §7.3.3).
+        if (pps.EntropyCodingModeFlag)
+        {
+            ExpGolombWriter.WriteUe(w, cabacInitIdc);
+        }
         ExpGolombWriter.WriteSe(w, sliceQpDelta);
         if (pps.DeblockingFilterControlPresentFlag)
         {

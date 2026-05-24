@@ -54,6 +54,9 @@ internal sealed class MacroblockEncoderState
     /// <summary>Per-4x4-block L0 MV (raster index 0..15) — used as neighbor MV source for the next MB's predictor.</summary>
     public int[] MvL0XBlock = new int[16];
     public int[] MvL0YBlock = new int[16];
+    /// <summary>Per-4x4-block L0 MVD (raster index 0..15) — used as CABAC neighbor absMvdSum context source for the next MB's mvd parsing.</summary>
+    public int[] MvdL0XBlock = new int[16];
+    public int[] MvdL0YBlock = new int[16];
     /// <summary>Per-8x8-quadrant L0 ref idx (raster: 0=TL, 1=TR, 2=BL, 3=BR).</summary>
     public int[] RefIdxL08x8 = new int[4];
 }
