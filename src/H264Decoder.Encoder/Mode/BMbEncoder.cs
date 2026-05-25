@@ -58,13 +58,9 @@ internal static class BMbEncoder
         public bool IsSkip;
 
         // ---- P8x8 fields (Phase 5e). ----
-        /// <summary>For Shape.P8x8: per-quadrant sub_mb_type. 0=B_Direct_8x8, 1=L0_8x8, 2=L1_8x8, 3=Bi_8x8.</summary>
+        /// <summary>For Shape.P8x8: per-quadrant sub_mb_type (0..12 per Table 7-17).</summary>
         public int[]? SubMbTypes;
-        /// <summary>For Shape.P8x8: per-quadrant MVs (one MV pair per direction; quadrant 0..3 in raster).</summary>
-        public int[]? QuadMvL0X;
-        public int[]? QuadMvL0Y;
-        public int[]? QuadMvL1X;
-        public int[]? QuadMvL1Y;
+        // Per-4x4-block MVs for P8x8 live in MvL{0,1}{X,Y}PerBlock (shared with Direct mode).
     }
 
     /// <summary>Run ME against L0 and L1, build L0/L1/Bi candidates plus a Direct candidate (when
@@ -83,7 +79,8 @@ internal static class BMbEncoder
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
         MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb,
         MacroblockEncoderState?[]? colocatedMbStates,
-        int mbsPerRow, int mbAddress)
+        int mbsPerRow, int mbAddress,
+        bool enableP8x8SubPartitions = true)
     {
         var best = ChooseBestInter(
             srcY, srcU, srcV, srcStrideY, srcStrideC,
@@ -144,7 +141,8 @@ internal static class BMbEncoder
             refW, refH, refCw, refCh,
             mbX, mbY, qpY,
             predL0X, predL0Y, predL1X, predL1Y,
-            searchRangePel, maxSadEvalsPerMb, enableSubpel, lambda);
+            searchRangePel, maxSadEvalsPerMb, enableSubpel, lambda,
+            enableSubPartitions: enableP8x8SubPartitions);
         p8x8.TotalCost = p8x8.Bundle.Sad + lambda * EstimatedP8x8Bits(p8x8, predL0X, predL0Y, predL1X, predL1Y);
         if (p8x8.TotalCost < best.TotalCost) best = p8x8;
 
@@ -480,11 +478,49 @@ internal static class BMbEncoder
         };
     }
 
-    /// <summary>Build a B_8x8 candidate. For each of the 4 quadrants: runs ME against L0 and L1,
-    /// evaluates L0/L1/Bi predictions, picks the lowest-cost direction per quadrant. Assembles the
-    /// per-MB prediction (4 × 8x8 luma + 4 × 4x4 chroma) and runs the shared residual pipeline.
-    /// Phase 5e supports sub_mb_types 1..3 (L0_8x8 / L1_8x8 / Bi_8x8); Direct_8x8 (sub_mb_type 0)
-    /// is intentionally not included as a candidate option here — keeping mode decision simpler.</summary>
+    /// <summary>Sub-partition layout for one B_8x8 sub_mb_type, expressed as (px, py, pw, ph)
+    /// rectangles within the 8x8 quadrant. Indexed by sub_mb_type 0..12.</summary>
+    private static readonly (int Px, int Py, int Pw, int Ph)[][] SubMbPartLayouts =
+    {
+        new[] { (0, 0, 8, 8) },                                              // 0: Direct_8x8
+        new[] { (0, 0, 8, 8) },                                              // 1: L0_8x8
+        new[] { (0, 0, 8, 8) },                                              // 2: L1_8x8
+        new[] { (0, 0, 8, 8) },                                              // 3: Bi_8x8
+        new[] { (0, 0, 8, 4), (0, 4, 8, 4) },                                // 4: L0_8x4
+        new[] { (0, 0, 4, 8), (4, 0, 4, 8) },                                // 5: L0_4x8
+        new[] { (0, 0, 8, 4), (0, 4, 8, 4) },                                // 6: L1_8x4
+        new[] { (0, 0, 4, 8), (4, 0, 4, 8) },                                // 7: L1_4x8
+        new[] { (0, 0, 8, 4), (0, 4, 8, 4) },                                // 8: Bi_8x4
+        new[] { (0, 0, 4, 8), (4, 0, 4, 8) },                                // 9: Bi_4x8
+        new[] { (0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4) },    // 10: L0_4x4
+        new[] { (0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4) },    // 11: L1_4x4
+        new[] { (0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4) },    // 12: Bi_4x4
+    };
+
+    /// <summary>Direction for each sub_mb_type (L0/L1/Bi/Direct).</summary>
+    private static readonly Dir[] SubMbTypeDir =
+    {
+        Dir.Direct, // 0
+        Dir.L0, Dir.L1, Dir.Bi,             // 1,2,3
+        Dir.L0, Dir.L0, Dir.L1, Dir.L1,     // 4,5,6,7
+        Dir.Bi, Dir.Bi,                     // 8,9
+        Dir.L0, Dir.L1, Dir.Bi,             // 10,11,12
+    };
+
+    /// <summary>Per-quadrant winning candidate for B_8x8 mode decision.</summary>
+    private struct QuadCandidate
+    {
+        public int SubMbType;
+        public int Cost;
+        public int[] MvL0X; public int[] MvL0Y; // per-sub-partition
+        public int[] MvL1X; public int[] MvL1Y;
+    }
+
+    /// <summary>Build a B_8x8 candidate. Per quadrant, evaluates sub_mb_types 1..3 (8x8 partition
+    /// with L0/L1/Bi direction) plus, when <paramref name="enableSubPartitions"/> is true, the
+    /// sub-8x8 partition variants (sub_mb_types 4..12 — 8x4, 4x8, 4x4). Picks the lowest-cost
+    /// per quadrant and combines into a full-MB prediction. Direct_8x8 (sub_mb_type 0) is not
+    /// yet evaluated as a candidate (no per-quadrant spatial direct on encoder side yet).</summary>
     private static BCandidate BuildP8x8Candidate(
         ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
         int srcStrideY, int srcStrideC,
@@ -494,7 +530,8 @@ internal static class BMbEncoder
         int mbX, int mbY, int qpY,
         int predL0X, int predL0Y, int predL1X, int predL1Y,
         int searchRangePel, int maxSadEvalsPerMb,
-        bool enableSubpel, int lambda)
+        bool enableSubpel, int lambda,
+        bool enableSubPartitions)
     {
         var bundle = new MacroblockEncoderInter.InterEncodeBundle();
         Span<byte> predY = bundle.PredY;
@@ -502,127 +539,170 @@ internal static class BMbEncoder
         Span<byte> predV = bundle.PredV;
 
         int[] subMbType = new int[4];
-        int[] mvL0X = new int[4], mvL0Y = new int[4];
-        int[] mvL1X = new int[4], mvL1Y = new int[4];
+        int[] mvL0XPerBlock = new int[16];
+        int[] mvL0YPerBlock = new int[16];
+        int[] mvL1XPerBlock = new int[16];
+        int[] mvL1YPerBlock = new int[16];
 
-        Span<byte> srcPart = stackalloc byte[64];
+        // Per-quadrant winning sub_mb_type + per-sub-partition MVs.
+        var winners = new QuadCandidate[4];
+
+        // Stack buffers hoisted out of inner loops (avoids CA2014 stack-overflow-in-loop warnings).
+        Span<byte> srcSub = stackalloc byte[64];
         Span<byte> predL0Buf = stackalloc byte[64];
         Span<byte> predL1Buf = stackalloc byte[64];
-        Span<byte> chBuf = stackalloc byte[16];
-        Span<byte> chL1Buf = stackalloc byte[16];
+        Span<byte> tmpL0 = stackalloc byte[64];
+        Span<byte> tmpL1 = stackalloc byte[64];
+        Span<byte> tmpL0c = stackalloc byte[64];
+        Span<byte> tmpL1c = stackalloc byte[64];
 
         for (int q = 0; q < 4; q++)
         {
             int qx = (q & 1) * 8, qy = (q >> 1) * 8;
-            int qcx = qx / 2, qcy = qy / 2; // chroma offset in 4:2:0
-            int pix = 64;
+            int bestCost = int.MaxValue;
+            QuadCandidate bestQ = default;
 
-            // Read source 8x8 luma.
-            for (int yy = 0; yy < 8; yy++)
-                for (int xx = 0; xx < 8; xx++)
-                    srcPart[yy * 8 + xx] = srcY[(qy + yy) * srcStrideY + (qx + xx)];
-
-            var meL0 = MotionEstimator.SearchBlock(
-                refL0Y, refW, refH, srcPart.Slice(0, pix),
-                mbX * 16 + qx, mbY * 16 + qy,
-                predL0X, predL0Y, searchRangePel, maxSadEvalsPerMb,
-                bWidth: 8, bHeight: 8, enableSubpel: enableSubpel);
-            var meL1 = MotionEstimator.SearchBlock(
-                refL1Y, refW, refH, srcPart.Slice(0, pix),
-                mbX * 16 + qx, mbY * 16 + qy,
-                predL1X, predL1Y, searchRangePel, maxSadEvalsPerMb,
-                bWidth: 8, bHeight: 8, enableSubpel: enableSubpel);
-
-            MotionEstimator.LumaPredictBlock(refL0Y, refW, refH,
-                mbX * 16 + qx, mbY * 16 + qy, meL0.MvX, meL0.MvY, 8, 8, predL0Buf.Slice(0, pix));
-            MotionEstimator.LumaPredictBlock(refL1Y, refW, refH,
-                mbX * 16 + qx, mbY * 16 + qy, meL1.MvX, meL1.MvY, 8, 8, predL1Buf.Slice(0, pix));
-
-            int sadL0 = meL0.Sad, sadL1 = meL1.Sad, sadBi = 0;
-            for (int i = 0; i < pix; i++)
-                sadBi += Math.Abs(srcPart[i] - ((predL0Buf[i] + predL1Buf[i] + 1) >> 1));
-
-            int mvdL0X = meL0.MvX - predL0X, mvdL0Y = meL0.MvY - predL0Y;
-            int mvdL1X = meL1.MvX - predL1X, mvdL1Y = meL1.MvY - predL1Y;
-            int costL0 = sadL0 + lambda * (3 + EgBits(mvdL0X) + EgBits(mvdL0Y));
-            int costL1 = sadL1 + lambda * (3 + EgBits(mvdL1X) + EgBits(mvdL1Y));
-            int costBi = sadBi + lambda * (5 + EgBits(mvdL0X) + EgBits(mvdL0Y) + EgBits(mvdL1X) + EgBits(mvdL1Y));
-
-            int sub;
-            if (costL0 <= costL1 && costL0 <= costBi) sub = 1; // L0_8x8
-            else if (costL1 <= costBi) sub = 2;                // L1_8x8
-            else sub = 3;                                       // Bi_8x8
-
-            subMbType[q] = sub;
-            mvL0X[q] = meL0.MvX; mvL0Y[q] = meL0.MvY;
-            mvL1X[q] = meL1.MvX; mvL1Y[q] = meL1.MvY;
-
-            // Write chosen 8x8 prediction into bundle.PredY at the quadrant's position.
-            ReadOnlySpan<byte> chosen = sub == 1 ? predL0Buf.Slice(0, pix)
-                                       : sub == 2 ? predL1Buf.Slice(0, pix)
-                                       : null;
-            if (sub == 3)
+            // Evaluate sub_mb_types 1..3 always; 4..12 only when sub-partition mode is enabled.
+            int subMax = enableSubPartitions ? 12 : 3;
+            for (int sub = 1; sub <= subMax; sub++)
             {
-                for (int i = 0; i < pix; i++)
+                var layout = SubMbPartLayouts[sub];
+                Dir dir = SubMbTypeDir[sub];
+                int n = layout.Length;
+                int[] subMvL0X = new int[n], subMvL0Y = new int[n];
+                int[] subMvL1X = new int[n], subMvL1Y = new int[n];
+                int totalSad = 0;
+                int totalMvdBits = 0;
+
+                for (int sp = 0; sp < n; sp++)
                 {
-                    int outY = qy + i / 8;
-                    int outX = qx + i % 8;
-                    predY[outY * 16 + outX] = (byte)((predL0Buf[i] + predL1Buf[i] + 1) >> 1);
+                    var (spx, spy, spw, sph) = layout[sp];
+                    int absX = mbX * 16 + qx + spx;
+                    int absY = mbY * 16 + qy + spy;
+                    int subPix = spw * sph;
+                    for (int yy = 0; yy < sph; yy++)
+                        for (int xx = 0; xx < spw; xx++)
+                            srcSub[yy * spw + xx] = srcY[(qy + spy + yy) * srcStrideY + (qx + spx + xx)];
+
+                    if (dir == Dir.L0 || dir == Dir.Bi)
+                    {
+                        var meL0 = MotionEstimator.SearchBlock(refL0Y, refW, refH, srcSub.Slice(0, subPix),
+                            absX, absY, predL0X, predL0Y, searchRangePel, maxSadEvalsPerMb,
+                            bWidth: spw, bHeight: sph, enableSubpel: enableSubpel);
+                        subMvL0X[sp] = meL0.MvX; subMvL0Y[sp] = meL0.MvY;
+                        totalMvdBits += EgBits(meL0.MvX - predL0X) + EgBits(meL0.MvY - predL0Y);
+                        if (dir == Dir.L0) totalSad += meL0.Sad;
+                    }
+                    if (dir == Dir.L1 || dir == Dir.Bi)
+                    {
+                        var meL1 = MotionEstimator.SearchBlock(refL1Y, refW, refH, srcSub.Slice(0, subPix),
+                            absX, absY, predL1X, predL1Y, searchRangePel, maxSadEvalsPerMb,
+                            bWidth: spw, bHeight: sph, enableSubpel: enableSubpel);
+                        subMvL1X[sp] = meL1.MvX; subMvL1Y[sp] = meL1.MvY;
+                        totalMvdBits += EgBits(meL1.MvX - predL1X) + EgBits(meL1.MvY - predL1Y);
+                        if (dir == Dir.L1) totalSad += meL1.Sad;
+                    }
+                    if (dir == Dir.Bi)
+                    {
+                        MotionEstimator.LumaPredictBlock(refL0Y, refW, refH,
+                            absX, absY, subMvL0X[sp], subMvL0Y[sp], spw, sph, predL0Buf.Slice(0, subPix));
+                        MotionEstimator.LumaPredictBlock(refL1Y, refW, refH,
+                            absX, absY, subMvL1X[sp], subMvL1Y[sp], spw, sph, predL1Buf.Slice(0, subPix));
+                        int biSad = 0;
+                        for (int i = 0; i < subPix; i++)
+                            biSad += Math.Abs(srcSub[i] - ((predL0Buf[i] + predL1Buf[i] + 1) >> 1));
+                        totalSad += biSad;
+                    }
+                }
+
+                // Cost: sub_mb_type bits (rough) + per-sub-partition mvd bits.
+                int subTypeBits = sub <= 3 ? 3 : sub <= 6 ? 5 : sub <= 10 ? 7 : 5;
+                int cost = totalSad + lambda * (subTypeBits + totalMvdBits);
+                if (cost < bestCost)
+                {
+                    bestCost = cost;
+                    bestQ = new QuadCandidate
+                    {
+                        SubMbType = sub,
+                        Cost = cost,
+                        MvL0X = subMvL0X, MvL0Y = subMvL0Y,
+                        MvL1X = subMvL1X, MvL1Y = subMvL1Y,
+                    };
                 }
             }
-            else
+
+            winners[q] = bestQ;
+            subMbType[q] = bestQ.SubMbType;
+
+            // Fill per-4x4-block MVs based on the winning sub_mb_type's layout.
+            var winLayout = SubMbPartLayouts[bestQ.SubMbType];
+            Dir winDir = SubMbTypeDir[bestQ.SubMbType];
+            bool useL0 = winDir == Dir.L0 || winDir == Dir.Bi;
+            bool useL1 = winDir == Dir.L1 || winDir == Dir.Bi;
+            for (int sp = 0; sp < winLayout.Length; sp++)
             {
-                for (int i = 0; i < pix; i++)
-                {
-                    int outY = qy + i / 8;
-                    int outX = qx + i % 8;
-                    predY[outY * 16 + outX] = chosen[i];
-                }
+                var (spx, spy, spw, sph) = winLayout[sp];
+                int bx0 = (qx + spx) / 4, by0 = (qy + spy) / 4;
+                int bxN = spw / 4, byN = sph / 4;
+                for (int by = by0; by < by0 + byN; by++)
+                    for (int bx = bx0; bx < bx0 + bxN; bx++)
+                    {
+                        int idx = SpatialToRaster[by * 4 + bx];
+                        if (useL0) { mvL0XPerBlock[idx] = bestQ.MvL0X![sp]; mvL0YPerBlock[idx] = bestQ.MvL0Y![sp]; }
+                        if (useL1) { mvL1XPerBlock[idx] = bestQ.MvL1X![sp]; mvL1YPerBlock[idx] = bestQ.MvL1Y![sp]; }
+                    }
             }
 
-            // Chroma: 4x4 per quadrant.
-            int cpix = 16;
-            for (int comp = 0; comp < 2; comp++)
+            // Build the quadrant's luma + chroma prediction using winning sub_mb_type.
+            for (int sp = 0; sp < winLayout.Length; sp++)
             {
-                byte[] refL0 = comp == 0 ? refL0U : refL0V;
-                byte[] refL1 = comp == 0 ? refL1U : refL1V;
-                Span<byte> outPred = comp == 0 ? predU : predV;
+                var (spx, spy, spw, sph) = winLayout[sp];
+                int absX = mbX * 16 + qx + spx;
+                int absY = mbY * 16 + qy + spy;
+                int subPix = spw * sph;
+                if (useL0) MotionEstimator.LumaPredictBlock(refL0Y, refW, refH,
+                    absX, absY, bestQ.MvL0X![sp], bestQ.MvL0Y![sp], spw, sph, tmpL0.Slice(0, subPix));
+                if (useL1) MotionEstimator.LumaPredictBlock(refL1Y, refW, refH,
+                    absX, absY, bestQ.MvL1X![sp], bestQ.MvL1Y![sp], spw, sph, tmpL1.Slice(0, subPix));
+                for (int yy = 0; yy < sph; yy++)
+                    for (int xx = 0; xx < spw; xx++)
+                    {
+                        int outY = qy + spy + yy;
+                        int outX = qx + spx + xx;
+                        int srcIdx = yy * spw + xx;
+                        int v;
+                        if (useL0 && useL1) v = (tmpL0[srcIdx] + tmpL1[srcIdx] + 1) >> 1;
+                        else if (useL0) v = tmpL0[srcIdx];
+                        else v = tmpL1[srcIdx];
+                        predY[outY * 16 + outX] = (byte)v;
+                    }
 
-                if (sub == 1 || sub == 3)
+                // Chroma: half-resolution sub-partition.
+                int cspx = spx / 2, cspy = spy / 2, cspw = spw / 2, csph = sph / 2;
+                int cabsX = mbX * 8 + qx / 2 + cspx;
+                int cabsY = mbY * 8 + qy / 2 + cspy;
+                int cpix = cspw * csph;
+                for (int comp = 0; comp < 2; comp++)
                 {
-                    MotionEstimator.ChromaPredictBlock(refL0, refCw, refCh,
-                        mbX * 8 + qcx, mbY * 8 + qcy, mvL0X[q], mvL0Y[q], 4, 4, chBuf.Slice(0, cpix));
-                }
-                if (sub == 1)
-                {
-                    for (int i = 0; i < cpix; i++)
-                    {
-                        int outY = qcy + i / 4;
-                        int outX = qcx + i % 4;
-                        outPred[outY * 8 + outX] = chBuf[i];
-                    }
-                }
-                else if (sub == 2)
-                {
-                    MotionEstimator.ChromaPredictBlock(refL1, refCw, refCh,
-                        mbX * 8 + qcx, mbY * 8 + qcy, mvL1X[q], mvL1Y[q], 4, 4, chBuf.Slice(0, cpix));
-                    for (int i = 0; i < cpix; i++)
-                    {
-                        int outY = qcy + i / 4;
-                        int outX = qcx + i % 4;
-                        outPred[outY * 8 + outX] = chBuf[i];
-                    }
-                }
-                else // Bi
-                {
-                    MotionEstimator.ChromaPredictBlock(refL1, refCw, refCh,
-                        mbX * 8 + qcx, mbY * 8 + qcy, mvL1X[q], mvL1Y[q], 4, 4, chL1Buf.Slice(0, cpix));
-                    for (int i = 0; i < cpix; i++)
-                    {
-                        int outY = qcy + i / 4;
-                        int outX = qcx + i % 4;
-                        outPred[outY * 8 + outX] = (byte)((chBuf[i] + chL1Buf[i] + 1) >> 1);
-                    }
+                    byte[] refL0 = comp == 0 ? refL0U : refL0V;
+                    byte[] refL1 = comp == 0 ? refL1U : refL1V;
+                    Span<byte> outChromaPred = comp == 0 ? predU : predV;
+                    if (useL0) MotionEstimator.ChromaPredictBlock(refL0, refCw, refCh,
+                        cabsX, cabsY, bestQ.MvL0X![sp], bestQ.MvL0Y![sp], cspw, csph, tmpL0c.Slice(0, cpix));
+                    if (useL1) MotionEstimator.ChromaPredictBlock(refL1, refCw, refCh,
+                        cabsX, cabsY, bestQ.MvL1X![sp], bestQ.MvL1Y![sp], cspw, csph, tmpL1c.Slice(0, cpix));
+                    for (int yy = 0; yy < csph; yy++)
+                        for (int xx = 0; xx < cspw; xx++)
+                        {
+                            int outY = qy / 2 + cspy + yy;
+                            int outX = qx / 2 + cspx + xx;
+                            int srcIdx = yy * cspw + xx;
+                            int v;
+                            if (useL0 && useL1) v = (tmpL0c[srcIdx] + tmpL1c[srcIdx] + 1) >> 1;
+                            else if (useL0) v = tmpL0c[srcIdx];
+                            else v = tmpL1c[srcIdx];
+                            outChromaPred[outY * 8 + outX] = (byte)v;
+                        }
                 }
             }
         }
@@ -637,8 +717,8 @@ internal static class BMbEncoder
             Shape = Shape.P8x8,
             Bundle = bundle,
             SubMbTypes = subMbType,
-            QuadMvL0X = mvL0X, QuadMvL0Y = mvL0Y,
-            QuadMvL1X = mvL1X, QuadMvL1Y = mvL1Y,
+            MvL0XPerBlock = mvL0XPerBlock, MvL0YPerBlock = mvL0YPerBlock,
+            MvL1XPerBlock = mvL1XPerBlock, MvL1YPerBlock = mvL1YPerBlock,
         };
     }
 
@@ -1004,30 +1084,28 @@ internal static class BMbEncoder
         state.RefIdxL1 = (cand.Direction == Dir.L1 || cand.Direction == Dir.Bi) ? 0 : -1;
     }
 
-    /// <summary>For P8x8: fill per-block state from per-quadrant sub_mb_type + MVs.</summary>
+    /// <summary>For P8x8: fill per-block state from per-quadrant sub_mb_type and per-4x4 MVs
+    /// (cand.MvL{0,1}{X,Y}PerBlock). PredFlag is per-quadrant (sub_mb_type determines direction).</summary>
     private static void PopulateP8x8State(BCandidate cand, MacroblockEncoderState state)
     {
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
-            bool useL0 = sub == 1 || sub == 3;
-            bool useL1 = sub == 2 || sub == 3;
+            Dir dir = SubMbTypeDir[sub];
+            bool useL0 = dir == Dir.L0 || dir == Dir.Bi;
+            bool useL1 = dir == Dir.L1 || dir == Dir.Bi;
             int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
-            int mvL0X = useL0 ? cand.QuadMvL0X![q] : 0;
-            int mvL0Y = useL0 ? cand.QuadMvL0Y![q] : 0;
-            int mvL1X = useL1 ? cand.QuadMvL1X![q] : 0;
-            int mvL1Y = useL1 ? cand.QuadMvL1Y![q] : 0;
             for (int by = qBy; by < qBy + 2; by++)
                 for (int bx = qBx; bx < qBx + 2; bx++)
                 {
                     int idx = SpatialToRaster[by * 4 + bx];
                     state.PredFlagL0Block[idx] = useL0 ? (byte)1 : (byte)0;
                     state.PredFlagL1Block[idx] = useL1 ? (byte)1 : (byte)0;
-                    state.MvL0XBlock[idx] = mvL0X;
-                    state.MvL0YBlock[idx] = mvL0Y;
-                    state.MvL1XBlock[idx] = mvL1X;
-                    state.MvL1YBlock[idx] = mvL1Y;
-                    state.MvdL0XBlock[idx] = 0; // filled in emit pass
+                    state.MvL0XBlock[idx] = useL0 ? cand.MvL0XPerBlock![idx] : 0;
+                    state.MvL0YBlock[idx] = useL0 ? cand.MvL0YPerBlock![idx] : 0;
+                    state.MvL1XBlock[idx] = useL1 ? cand.MvL1XPerBlock![idx] : 0;
+                    state.MvL1YBlock[idx] = useL1 ? cand.MvL1YPerBlock![idx] : 0;
+                    state.MvdL0XBlock[idx] = 0;
                     state.MvdL0YBlock[idx] = 0;
                     state.MvdL1XBlock[idx] = 0;
                     state.MvdL1YBlock[idx] = 0;
@@ -1035,13 +1113,14 @@ internal static class BMbEncoder
             state.RefIdxL08x8[q] = useL0 ? 0 : -1;
             state.RefIdxL18x8[q] = useL1 ? 0 : -1;
         }
-        // Convenience scalar MV: take quadrant 0's.
+        // Convenience scalar MV: quadrant 0's first 4x4 block.
         int sub0 = cand.SubMbTypes![0];
-        bool useL00 = sub0 == 1 || sub0 == 3;
-        state.MvL0X = useL00 ? cand.QuadMvL0X![0] : 0;
-        state.MvL0Y = useL00 ? cand.QuadMvL0Y![0] : 0;
+        Dir dir0 = SubMbTypeDir[sub0];
+        bool useL00 = dir0 == Dir.L0 || dir0 == Dir.Bi;
+        state.MvL0X = useL00 ? cand.MvL0XPerBlock![0] : 0;
+        state.MvL0Y = useL00 ? cand.MvL0YPerBlock![0] : 0;
         state.RefIdxL0 = useL00 ? 0 : -1;
-        state.RefIdxL1 = (sub0 == 2 || sub0 == 3) ? 0 : -1;
+        state.RefIdxL1 = (dir0 == Dir.L1 || dir0 == Dir.Bi) ? 0 : -1;
     }
 
     /// <summary>Which 8x8 quadrants (raster: 0=TL, 1=TR, 2=BL, 3=BR) belong to partition p of a
@@ -1214,8 +1293,8 @@ internal static class BMbEncoder
     }
 
     /// <summary>CAVLC emit for a B_8x8 macroblock (mb_type=22). Emits: mb_type, 4× sub_mb_type,
-    /// per-quadrant per-list mvds in spec iteration order (all L0 over quadrants, then all L1),
-    /// CBP + qp_delta + residual.</summary>
+    /// per-quadrant per-sub-partition per-list mvds (spec iteration: all L0 over quadrants/sub-
+    /// partitions then all L1), CBP + qp_delta + residual.</summary>
     private static void EmitBMbP8x8(
         BitWriter w,
         BCandidate cand,
@@ -1232,43 +1311,27 @@ internal static class BMbEncoder
             ExpGolombWriter.WriteUe(w, (uint)cand.SubMbTypes![q]);
         }
 
-        // Populate per-block MVs (state.MvL{0,1}*Block) so partition-level MV predictor sees
-        // them when emitting later partitions' MVDs. PopulateBMbState handles this.
+        // Populate per-block state (MVs / refIdx / predFlags) so the per-sub-partition MV
+        // predictor sees consistent neighbor values for in-MB blocks.
         PopulateBMbState(cand, state, state.MbAddress, qpY, 0, 0, 0, 0);
 
-        // (No ref_idx — num_ref_active = 1.)
-        // mvd_l0 per quadrant (8x8 partition = 1 mvd pair per quadrant where direction uses L0).
+        // ---- mvd_l0 per quadrant, per sub-partition ----
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
-            if (sub != 1 && sub != 3) continue; // not L0 or Bi
-            int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
-            // P8x8 mvd predictor: use rawMbType=0 sentinel (standard median; spec §8.4.1.3.2).
-            (int predX, int predY) = PredictPartitionMvBList(
-                state, rawMbType: 0, partIdx: 0, bx: qBx, by: qBy, bw: 2, bh: 2,
-                curRefIdx: 0, listX: 0,
+            Dir dir = SubMbTypeDir[sub];
+            if (dir != Dir.L0 && dir != Dir.Bi) continue;
+            EmitQuadrantMvdsCavlc(w, cand, state, q, sub, listX: 0,
                 leftMb, topMb, topRightMb, topLeftMb);
-            int mvdX = cand.QuadMvL0X![q] - predX;
-            int mvdY = cand.QuadMvL0Y![q] - predY;
-            ExpGolombWriter.WriteSe(w, mvdX);
-            ExpGolombWriter.WriteSe(w, mvdY);
-            FillBlockMvds(state, qBx, qBy, 2, 2, listX: 0, mvdX, mvdY);
         }
-        // mvd_l1 per quadrant.
+        // ---- mvd_l1 per quadrant, per sub-partition ----
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
-            if (sub != 2 && sub != 3) continue;
-            int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
-            (int predX, int predY) = PredictPartitionMvBList(
-                state, rawMbType: 0, partIdx: 0, bx: qBx, by: qBy, bw: 2, bh: 2,
-                curRefIdx: 0, listX: 1,
+            Dir dir = SubMbTypeDir[sub];
+            if (dir != Dir.L1 && dir != Dir.Bi) continue;
+            EmitQuadrantMvdsCavlc(w, cand, state, q, sub, listX: 1,
                 leftMb, topMb, topRightMb, topLeftMb);
-            int mvdX = cand.QuadMvL1X![q] - predX;
-            int mvdY = cand.QuadMvL1Y![q] - predY;
-            ExpGolombWriter.WriteSe(w, mvdX);
-            ExpGolombWriter.WriteSe(w, mvdY);
-            FillBlockMvds(state, qBx, qBy, 2, 2, listX: 1, mvdX, mvdY);
         }
 
         // CBP + residual.
@@ -1283,6 +1346,38 @@ internal static class BMbEncoder
             ExpGolombWriter.WriteSe(w, 0); // mb_qp_delta
         }
         EmitInterResidualCavlc(w, cand, state, leftMb, topMb);
+    }
+
+    /// <summary>Emit mvds for one direction of one quadrant of a B_8x8 MB. Iterates the sub-
+    /// partitions (1/2/4 depending on sub_mb_type), reading the MV at each sub-partition's
+    /// top-left 4x4 block from <paramref name="cand"/>'s per-block array.</summary>
+    private static void EmitQuadrantMvdsCavlc(
+        BitWriter w, BCandidate cand, MacroblockEncoderState state,
+        int q, int sub, int listX,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb)
+    {
+        int qx = (q & 1) * 8, qy = (q >> 1) * 8;
+        var layout = SubMbPartLayouts[sub];
+        foreach (var (spx, spy, spw, sph) in layout)
+        {
+            int bx0 = (qx + spx) / 4;
+            int by0 = (qy + spy) / 4;
+            int bw = spw / 4, bh = sph / 4;
+            int idx0 = SpatialToRaster[by0 * 4 + bx0];
+            (int predX, int predY) = PredictPartitionMvBList(
+                state, rawMbType: 0, partIdx: 0,
+                bx: bx0, by: by0, bw: bw, bh: bh,
+                curRefIdx: 0, listX: listX,
+                leftMb, topMb, topRightMb, topLeftMb);
+            int mvX = listX == 0 ? cand.MvL0XPerBlock![idx0] : cand.MvL1XPerBlock![idx0];
+            int mvY = listX == 0 ? cand.MvL0YPerBlock![idx0] : cand.MvL1YPerBlock![idx0];
+            int mvdX = mvX - predX;
+            int mvdY = mvY - predY;
+            ExpGolombWriter.WriteSe(w, mvdX);
+            ExpGolombWriter.WriteSe(w, mvdY);
+            FillBlockMvds(state, bx0, by0, bw, bh, listX, mvdX, mvdY);
+        }
     }
 
     /// <summary>CAVLC emit for a 16x8 or 8x16 partitioned B-MB. mb_type code 4..21 (Table 7-14).
@@ -1630,12 +1725,18 @@ internal static class BMbEncoder
         for (int q = 0; q < 4; q++)
         {
             int sub = c.SubMbTypes![q];
-            bool useL0 = sub == 1 || sub == 3;
-            bool useL1 = sub == 2 || sub == 3;
+            Dir dir = SubMbTypeDir[sub];
+            bool useL0 = dir == Dir.L0 || dir == Dir.Bi;
+            bool useL1 = dir == Dir.L1 || dir == Dir.Bi;
+            // Approximate: read MV at the quadrant's top-left 4x4 block. Sub-partitions add a few
+            // extra mvds; this is a coarse estimate for mode-decision ranking only.
+            int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
+            int idx = SpatialToRaster[qBy * 4 + qBx];
+            int numSub = SubMbPartLayouts[sub].Length;
             if (useL0)
-                bits += EgBits(c.QuadMvL0X![q] - predL0X) + EgBits(c.QuadMvL0Y![q] - predL0Y);
+                bits += numSub * (EgBits(c.MvL0XPerBlock![idx] - predL0X) + EgBits(c.MvL0YPerBlock![idx] - predL0Y));
             if (useL1)
-                bits += EgBits(c.QuadMvL1X![q] - predL1X) + EgBits(c.QuadMvL1Y![q] - predL1Y);
+                bits += numSub * (EgBits(c.MvL1XPerBlock![idx] - predL1X) + EgBits(c.MvL1YPerBlock![idx] - predL1Y));
         }
         return bits;
     }

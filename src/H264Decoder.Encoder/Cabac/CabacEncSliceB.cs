@@ -136,19 +136,26 @@ internal static class CabacEncSliceB
     }
 
     /// <summary>Encode one B-slice sub_mb_type for a B_8x8 MB quadrant (spec Table 9-38,
-    /// ctxIdxOffset=36). Phase 5e supports codes 0..3 (B_Direct_8x8 / B_L0_8x8 / B_L1_8x8 /
-    /// B_Bi_8x8) — the four 8x8-partition variants. Sub-8x8 partition codes 4..12 are deferred.
-    /// Bin strings:
-    ///   0 (Direct_8x8) : "0"
-    ///   1 (L0_8x8)     : "1 0 0"
-    ///   2 (L1_8x8)     : "1 0 1"
-    ///   3 (Bi_8x8)     : "1 1 0 0 0"
+    /// ctxIdxOffset=36). Supports all 13 codes (0..12). Bin strings per the decoder tree:
+    ///   0  (Direct_8x8) : "0"
+    ///   1  (L0_8x8)     : "1 0 0"
+    ///   2  (L1_8x8)     : "1 0 1"
+    ///   3  (Bi_8x8)     : "1 1 0 0 0"
+    ///   4  (L0_8x4)     : "1 1 0 0 1"
+    ///   5  (L0_4x8)     : "1 1 0 1 0"
+    ///   6  (L1_8x4)     : "1 1 0 1 1"
+    ///   7  (L1_4x8)     : "1 1 1 0 0 0"
+    ///   8  (Bi_8x4)     : "1 1 1 0 0 1"
+    ///   9  (Bi_4x8)     : "1 1 1 0 1 0"
+    ///   10 (L0_4x4)     : "1 1 1 0 1 1"
+    ///   11 (L1_4x4)     : "1 1 1 1 0"
+    ///   12 (Bi_4x4)     : "1 1 1 1 1"
     /// ctxIdxInc: binIdx 0 = 0 (ctx 36); binIdx 1 = 1 (ctx 37); binIdx 2 = bin1==1 ? 2 (ctx 38) : 3 (ctx 39);
     /// binIdx 3+ = 3 (ctx 39).</summary>
     public static void EncodeSubMbTypeB(CabacEncoder cabac, int subMbType)
     {
-        if (subMbType < 0 || subMbType > 3)
-            throw new NotSupportedException($"CABAC encode: B sub_mb_type {subMbType} not supported in Phase 5e (only 0..3 = 8x8-partition variants)");
+        if (subMbType < 0 || subMbType > 12)
+            throw new NotSupportedException($"CABAC encode: B sub_mb_type {subMbType} out of range (0..12)");
 
         if (subMbType == 0)
         {
@@ -157,25 +164,38 @@ internal static class CabacEncSliceB
         }
         cabac.EncodeBin(36, 1); // bin0 = 1 (not Direct)
 
-        if (subMbType == 1)
+        if (subMbType == 1) { cabac.EncodeBin(37, 0); cabac.EncodeBin(39, 0); return; }
+        if (subMbType == 2) { cabac.EncodeBin(37, 0); cabac.EncodeBin(39, 1); return; }
+
+        // bin1 = 1 from here (prefix "1 1 ...").
+        cabac.EncodeBin(37, 1);
+
+        // Codes 3..6: prefix "1 1 0 b3 b4" where (b3,b4) = code-3 (2 bits).
+        if (subMbType >= 3 && subMbType <= 6)
         {
-            // "1 0 0"
-            cabac.EncodeBin(37, 0);
-            cabac.EncodeBin(39, 0); // b1==0 → ctx 39
+            cabac.EncodeBin(38, 0); // b2 (b1==1 → ctx 38)
+            int idx = subMbType - 3; // 0..3
+            cabac.EncodeBin(39, (idx >> 1) & 1); // b3
+            cabac.EncodeBin(39, idx & 1);        // b4
             return;
         }
-        if (subMbType == 2)
+
+        // b2 = 1 from here.
+        cabac.EncodeBin(38, 1);
+
+        // Codes 11, 12: prefix "1 1 1 1 b4" (b3=1).
+        if (subMbType == 11 || subMbType == 12)
         {
-            // "1 0 1"
-            cabac.EncodeBin(37, 0);
-            cabac.EncodeBin(39, 1);
+            cabac.EncodeBin(39, 1); // b3 = 1
+            cabac.EncodeBin(39, subMbType == 11 ? 0 : 1); // b4
             return;
         }
-        // subMbType == 3 (Bi_8x8): "1 1 0 0 0"
-        cabac.EncodeBin(37, 1);   // b1
-        cabac.EncodeBin(38, 0);   // b2 (b1==1 → ctx 38)
-        cabac.EncodeBin(39, 0);   // b3 (ctx 39)
-        cabac.EncodeBin(39, 0);   // b4 (ctx 39)
+
+        // Codes 7..10: prefix "1 1 1 0 b4 b5" (b3=0); (b4,b5) = code-7.
+        cabac.EncodeBin(39, 0); // b3 = 0
+        int idx2 = subMbType - 7; // 0..3
+        cabac.EncodeBin(39, (idx2 >> 1) & 1); // b4
+        cabac.EncodeBin(39, idx2 & 1);        // b5
     }
 
     /// <summary>Encode the B-slice intra-branch mb_type for an Intra_4x4 (I_NxN) MB. Emits the

@@ -203,49 +203,72 @@ internal static class CabacMbEncoderB
         }
     }
 
-    /// <summary>CABAC mvd emission for a B_8x8 MB. Iterates L0 over quadrants then L1, with each
-    /// quadrant emitting at most one mvd pair (Phase 5e: 8x8-partition only, 1 sub-partition per
-    /// quadrant). Uses the standard-median MV predictor (rawMbType=0 sentinel per spec).</summary>
+    /// <summary>CABAC mvd emission for a B_8x8 MB. Iterates L0 over quadrants/sub-partitions
+    /// then L1, with each sub-partition emitting one mvd pair. Uses the standard-median MV
+    /// predictor (rawMbType=0 sentinel per spec §8.4.1.3.2).</summary>
     private static void EmitMvdsP8x8(
         CabacEncoder cabac, BMbEncoder.BCandidate cand, MacroblockEncoderState state,
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
         MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb)
     {
-        // L0 over quadrants.
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
-            if (sub != 1 && sub != 3) continue;
-            int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
-            (int predX, int predY) = BMbEncoder.PredictPartitionMvBListPublic(
-                state, rawMbType: 0, partIdx: 0, bx: qBx, by: qBy, bw: 2, bh: 2,
-                curRefIdx: 0, listX: 0,
-                leftMb, topMb, topRightMb, topLeftMb);
-            int mvdX = cand.QuadMvL0X![q] - predX;
-            int mvdY = cand.QuadMvL0Y![q] - predY;
-            int sumX = NeighborAbsMvdSumAt(state, qBx, qBy, leftMb, topMb, topRightMb, topLeftMb, listX: 0, xComp: true);
-            int sumY = NeighborAbsMvdSumAt(state, qBx, qBy, leftMb, topMb, topRightMb, topLeftMb, listX: 0, xComp: false);
-            CabacEncSliceP.EncodeMvd(cabac, mvdX, sumX, ctxBase: 40);
-            CabacEncSliceP.EncodeMvd(cabac, mvdY, sumY, ctxBase: 47);
-            FillBlockMvds(state, qBx, qBy, 2, 2, listX: 0, mvdX, mvdY);
+            if (!UsesL0(sub)) continue;
+            EmitQuadrantMvdsCabac(cabac, cand, state, q, sub, listX: 0, leftMb, topMb, topRightMb, topLeftMb);
         }
-        // L1 over quadrants.
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
-            if (sub != 2 && sub != 3) continue;
-            int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
+            if (!UsesL1(sub)) continue;
+            EmitQuadrantMvdsCabac(cabac, cand, state, q, sub, listX: 1, leftMb, topMb, topRightMb, topLeftMb);
+        }
+    }
+
+    private static bool UsesL0(int sub) =>
+        sub == 1 || sub == 3 || sub == 4 || sub == 5 || sub == 8 || sub == 9 || sub == 10 || sub == 12;
+    private static bool UsesL1(int sub) =>
+        sub == 2 || sub == 3 || sub == 6 || sub == 7 || sub == 8 || sub == 9 || sub == 11 || sub == 12;
+
+    private static readonly (int Px, int Py, int Pw, int Ph)[][] SubMbPartLayouts =
+    {
+        new[] { (0, 0, 8, 8) }, new[] { (0, 0, 8, 8) }, new[] { (0, 0, 8, 8) }, new[] { (0, 0, 8, 8) },
+        new[] { (0, 0, 8, 4), (0, 4, 8, 4) }, new[] { (0, 0, 4, 8), (4, 0, 4, 8) },
+        new[] { (0, 0, 8, 4), (0, 4, 8, 4) }, new[] { (0, 0, 4, 8), (4, 0, 4, 8) },
+        new[] { (0, 0, 8, 4), (0, 4, 8, 4) }, new[] { (0, 0, 4, 8), (4, 0, 4, 8) },
+        new[] { (0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4) },
+        new[] { (0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4) },
+        new[] { (0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4) },
+    };
+
+    private static void EmitQuadrantMvdsCabac(
+        CabacEncoder cabac, BMbEncoder.BCandidate cand, MacroblockEncoderState state,
+        int q, int sub, int listX,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
+        MacroblockEncoderState? topRightMb, MacroblockEncoderState? topLeftMb)
+    {
+        int qx = (q & 1) * 8, qy = (q >> 1) * 8;
+        var layout = SubMbPartLayouts[sub];
+        foreach (var (spx, spy, spw, sph) in layout)
+        {
+            int bx0 = (qx + spx) / 4;
+            int by0 = (qy + spy) / 4;
+            int bw = spw / 4, bh = sph / 4;
+            int idx0 = SpatialToRaster[by0 * 4 + bx0];
             (int predX, int predY) = BMbEncoder.PredictPartitionMvBListPublic(
-                state, rawMbType: 0, partIdx: 0, bx: qBx, by: qBy, bw: 2, bh: 2,
-                curRefIdx: 0, listX: 1,
+                state, rawMbType: 0, partIdx: 0,
+                bx: bx0, by: by0, bw: bw, bh: bh,
+                curRefIdx: 0, listX: listX,
                 leftMb, topMb, topRightMb, topLeftMb);
-            int mvdX = cand.QuadMvL1X![q] - predX;
-            int mvdY = cand.QuadMvL1Y![q] - predY;
-            int sumX = NeighborAbsMvdSumAt(state, qBx, qBy, leftMb, topMb, topRightMb, topLeftMb, listX: 1, xComp: true);
-            int sumY = NeighborAbsMvdSumAt(state, qBx, qBy, leftMb, topMb, topRightMb, topLeftMb, listX: 1, xComp: false);
+            int mvX = listX == 0 ? cand.MvL0XPerBlock![idx0] : cand.MvL1XPerBlock![idx0];
+            int mvY = listX == 0 ? cand.MvL0YPerBlock![idx0] : cand.MvL1YPerBlock![idx0];
+            int mvdX = mvX - predX;
+            int mvdY = mvY - predY;
+            int sumX = NeighborAbsMvdSumAt(state, bx0, by0, leftMb, topMb, topRightMb, topLeftMb, listX, xComp: true);
+            int sumY = NeighborAbsMvdSumAt(state, bx0, by0, leftMb, topMb, topRightMb, topLeftMb, listX, xComp: false);
             CabacEncSliceP.EncodeMvd(cabac, mvdX, sumX, ctxBase: 40);
             CabacEncSliceP.EncodeMvd(cabac, mvdY, sumY, ctxBase: 47);
-            FillBlockMvds(state, qBx, qBy, 2, 2, listX: 1, mvdX, mvdY);
+            FillBlockMvds(state, bx0, by0, bw, bh, listX, mvdX, mvdY);
         }
     }
 

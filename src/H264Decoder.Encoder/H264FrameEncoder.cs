@@ -725,6 +725,11 @@ public static class H264FrameEncoder
             (int predL1X, int predL1Y) = BMbEncoder.PredictBSliceMv(leftMb, topMb, topRightMb, topLeftMb, listX: 1);
 
             int lambda = options.ModeDecisionLambda >= 0 ? options.ModeDecisionLambda : DefaultLambda(qp);
+            // Phase 5e stage 2: sub-8x8 partitions (sub_mb_types 4..12) are enabled for CAVLC.
+            // The CABAC sub-partition path has a known desync (bin stream produces wrong
+            // reconstruction in our decoder by ~25dB on banded-motion fixtures); restrict CABAC
+            // to 8x8-partition sub_mb_types (1..3) until the desync is root-caused.
+            bool enableP8x8Sub = !options.EnableCabac;
             var cand = BMbEncoder.ChooseBestInterWithDirect(
                 mbSrcY, mbSrcU, mbSrcV, bufferWidth, bufferChromaWidth,
                 refL0Y, refL0U, refL0V, refL1Y, refL1U, refL1V,
@@ -734,7 +739,8 @@ public static class H264FrameEncoder
                 options.SearchRangePel, options.MaxSadEvalsPerMb,
                 options.EnableSubpelMe, lambda,
                 leftMb, topMb, topRightMb, topLeftMb,
-                colocatedMbStates, picWidthInMbs, addr);
+                colocatedMbStates, picWidthInMbs, addr,
+                enableP8x8SubPartitions: enableP8x8Sub);
 
             // Intra candidates: estimate Intra_16x16 SAD and Intra_4x4 SAD (when enabled). The
             // intraBias (λ·64) keeps intra modes from winning over inter unless their SAD is
