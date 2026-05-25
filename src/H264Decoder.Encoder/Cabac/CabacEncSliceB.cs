@@ -40,8 +40,8 @@ internal static class CabacEncSliceB
     public static void EncodeMbTypeB16x16(CabacEncoder cabac, int mbType,
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
     {
-        if (mbType < 0 || mbType > 21)
-            throw new NotSupportedException($"CABAC encode: B mb_type {mbType} not supported (only 0..21)");
+        if (mbType < 0 || mbType > 22)
+            throw new NotSupportedException($"CABAC encode: B mb_type {mbType} not supported (only 0..22)");
 
         int condA = NeighborMbTypeFlagB(leftMb);
         int condB = NeighborMbTypeFlagB(topMb);
@@ -102,6 +102,15 @@ internal static class CabacEncSliceB
             return;
         }
 
+        if (mbType == 22)
+        {
+            // B_8x8: "1 1 1 1 1 1" — decoder reads b3=1, b4=1, b5=1.
+            cabac.EncodeBin(32, 1);
+            cabac.EncodeBin(32, 1);
+            cabac.EncodeBin(32, 1);
+            return;
+        }
+
         // Codes 20, 21: prefix "1 1 1 1 0 0 b6" (b3=1, b4=0, b5=0, b6 = code-20).
         if (mbType == 20 || mbType == 21)
         {
@@ -124,6 +133,49 @@ internal static class CabacEncSliceB
         }
 
         throw new InvalidOperationException($"unhandled B mb_type {mbType}");
+    }
+
+    /// <summary>Encode one B-slice sub_mb_type for a B_8x8 MB quadrant (spec Table 9-38,
+    /// ctxIdxOffset=36). Phase 5e supports codes 0..3 (B_Direct_8x8 / B_L0_8x8 / B_L1_8x8 /
+    /// B_Bi_8x8) — the four 8x8-partition variants. Sub-8x8 partition codes 4..12 are deferred.
+    /// Bin strings:
+    ///   0 (Direct_8x8) : "0"
+    ///   1 (L0_8x8)     : "1 0 0"
+    ///   2 (L1_8x8)     : "1 0 1"
+    ///   3 (Bi_8x8)     : "1 1 0 0 0"
+    /// ctxIdxInc: binIdx 0 = 0 (ctx 36); binIdx 1 = 1 (ctx 37); binIdx 2 = bin1==1 ? 2 (ctx 38) : 3 (ctx 39);
+    /// binIdx 3+ = 3 (ctx 39).</summary>
+    public static void EncodeSubMbTypeB(CabacEncoder cabac, int subMbType)
+    {
+        if (subMbType < 0 || subMbType > 3)
+            throw new NotSupportedException($"CABAC encode: B sub_mb_type {subMbType} not supported in Phase 5e (only 0..3 = 8x8-partition variants)");
+
+        if (subMbType == 0)
+        {
+            cabac.EncodeBin(36, 0); // Direct_8x8
+            return;
+        }
+        cabac.EncodeBin(36, 1); // bin0 = 1 (not Direct)
+
+        if (subMbType == 1)
+        {
+            // "1 0 0"
+            cabac.EncodeBin(37, 0);
+            cabac.EncodeBin(39, 0); // b1==0 → ctx 39
+            return;
+        }
+        if (subMbType == 2)
+        {
+            // "1 0 1"
+            cabac.EncodeBin(37, 0);
+            cabac.EncodeBin(39, 1);
+            return;
+        }
+        // subMbType == 3 (Bi_8x8): "1 1 0 0 0"
+        cabac.EncodeBin(37, 1);   // b1
+        cabac.EncodeBin(38, 0);   // b2 (b1==1 → ctx 38)
+        cabac.EncodeBin(39, 0);   // b3 (ctx 39)
+        cabac.EncodeBin(39, 0);   // b4 (ctx 39)
     }
 
     /// <summary>Encode the B-slice intra-branch mb_type for an Intra_4x4 (I_NxN) MB. Emits the
