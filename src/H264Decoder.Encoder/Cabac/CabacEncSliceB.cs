@@ -126,6 +126,27 @@ internal static class CabacEncSliceB
         throw new InvalidOperationException($"unhandled B mb_type {mbType}");
     }
 
+    /// <summary>Encode the B-slice intra-branch mb_type for an Intra_4x4 (I_NxN) MB. Emits the
+    /// prefix bins for B mb_type code 23 (1 1 1 1 0 1) followed by the intra body at
+    /// ctxIdxOffset=32 with bin0=0 (I_NxN — no suffix bins). Inverse of decoder's
+    /// <c>DecodeMbTypeB</c> intra branch entering <c>DecodeIntraMbTypeAtOffset(32)</c> returning 0.</summary>
+    public static void EncodeMbTypeBIntra4x4(CabacEncoder cabac,
+        MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb)
+    {
+        int condA = NeighborMbTypeFlagB(leftMb);
+        int condB = NeighborMbTypeFlagB(topMb);
+        // ---- B mb_type prefix for code 23 (intra branch entry): bins "1 1 1 1 0 1". ----
+        cabac.EncodeBin(27 + condA + condB, 1); // bin0
+        cabac.EncodeBin(30, 1);                 // bin1
+        cabac.EncodeBin(31, 1);                 // bin2 (b1==1 → ctx 31)
+        cabac.EncodeBin(32, 1);                 // bin3
+        cabac.EncodeBin(32, 0);                 // bin4
+        cabac.EncodeBin(32, 1);                 // bin5
+
+        // ---- Intra body at ctxIdxOffset=32 — bin0=0 means I_NxN. No further bins for I_NxN. ----
+        cabac.EncodeBin(32, 0);
+    }
+
     /// <summary>Encode the B-slice intra-branch mb_type for an Intra_16x16 MB. Emits the prefix
     /// bins for B mb_type code 23 (1 1 1 1 0 1) followed by the intra body at ctxIdxOffset=32 per
     /// spec Table 9-39 (binIdx 0=0, then +1, +2, +2, +3, +3). <paramref name="iSliceMbType"/> is

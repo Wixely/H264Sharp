@@ -279,7 +279,9 @@ internal static class IntraEncoder4x4
     }
 
     /// <summary>Encode the MB as Intra_4x4 (CAVLC). Writes syntax to <paramref name="w"/> and
-    /// updates the picture reconstruction in <paramref name="picY"/>/U/V.</summary>
+    /// updates the picture reconstruction in <paramref name="picY"/>/U/V. <paramref name="mbTypeOffset"/>
+    /// shifts the emitted mb_type for non-I-slice contexts: 0 for I-slice (I-slice mb_type 0 =
+    /// I_NxN), 23 for B-slice (B mb_type 23 = I_NxN).</summary>
     public static void EncodeIntra4x4(
         BitWriter w,
         ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
@@ -288,7 +290,8 @@ internal static class IntraEncoder4x4
         int picStrideY, int picStrideC,
         int mbX, int mbY, int mbsPerRow,
         int qpY,
-        MacroblockEncoderState?[] mbStates, int mbAddress)
+        MacroblockEncoderState?[] mbStates, int mbAddress,
+        int mbTypeOffset = 0)
     {
         var prep = PrepareIntra4x4(srcY, srcU, srcV, srcStrideY, srcStrideC,
             picY, picU, picV, picStrideY, picStrideC,
@@ -302,7 +305,7 @@ internal static class IntraEncoder4x4
         int cbpChroma = prep.CbpChroma;
         var chroma = prep.Chroma;
 
-        ExpGolombWriter.WriteUe(w, 0); // mb_type = 0
+        ExpGolombWriter.WriteUe(w, (uint)mbTypeOffset); // mb_type: I-slice I_NxN = 0; B-slice I_NxN = 23.
 
         // 16 × (prev_intra4x4_pred_mode_flag, [rem_intra4x4_pred_mode])
         for (int i = 0; i < 16; i++)

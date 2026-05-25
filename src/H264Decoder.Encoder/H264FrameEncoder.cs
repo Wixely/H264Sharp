@@ -736,32 +736,58 @@ public static class H264FrameEncoder
                 leftMb, topMb, topRightMb, topLeftMb,
                 colocatedMbStates, picWidthInMbs, addr);
 
-            // Intra_16x16 candidate: SAD-only estimate against the lowest-cost inter cand. With a
-            // conservative bias (λ·64) intra wins only when its SAD is dramatically lower —
-            // which usually means a new object or scene boundary that the refs can't predict.
-            int intraSad = MacroblockEncoder.EstimateBestIntra16x16Sad(
+            // Intra candidates: estimate Intra_16x16 SAD and Intra_4x4 SAD (when enabled). The
+            // intraBias (λ·64) keeps intra modes from winning over inter unless their SAD is
+            // dramatically lower — typical only when refs can't predict the content. Within intra,
+            // Intra_4x4 vs Intra_16x16 uses the same λ·32 bias as the I-frame mode decision.
+            int intraSad16 = MacroblockEncoder.EstimateBestIntra16x16Sad(
                 mbSrcY, bufferWidth,
                 reconYOut, bufferWidth, mbX, mbY, mbsPerRow: picWidthInMbs,
                 mbStates, addr);
+            int intraSad4 = options.EnableIntra4x4
+                ? IntraEncoder4x4.EstimateMbSad(
+                    mbSrcY, bufferWidth,
+                    reconYOut, bufferWidth, mbX, mbY, mbsPerRow: picWidthInMbs,
+                    mbStates, addr)
+                : int.MaxValue;
+            bool useIntra4x4 = options.EnableIntra4x4 && (intraSad4 + lambda * 32 < intraSad16);
+            int bestIntraSad = useIntra4x4 ? intraSad4 : intraSad16;
             int intraBias = lambda * 64;
-            bool useIntra = intraSad + intraBias < cand.TotalCost;
+            bool useIntra = bestIntraSad + intraBias < cand.TotalCost;
             if (useIntra)
             {
                 // mb_states[addr] is populated inside the intra encoder; bypass the inter emit path.
                 if (options.EnableCabac)
                 {
                     CabacEncSliceB.EncodeMbSkipFlagB(cabac!, isSkip: false, leftMb, topMb);
-                    CabacMbEncoder.EncodeIntra16x16(
-                        cabac!,
-                        mbSrcY, mbSrcU, mbSrcV,
-                        srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
-                        reconYOut, reconUOut, reconVOut,
-                        picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
-                        mbX, mbY, mbsPerRow: picWidthInMbs,
-                        qpY: qp,
-                        mbStates, mbAddress: addr,
-                        ref prevMbQpDeltaState,
-                        bSliceIntra: true);
+                    if (useIntra4x4)
+                    {
+                        CabacMbEncoder.EncodeIntra4x4(
+                            cabac!,
+                            mbSrcY, mbSrcU, mbSrcV,
+                            srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                            reconYOut, reconUOut, reconVOut,
+                            picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                            mbX, mbY, mbsPerRow: picWidthInMbs,
+                            qpY: qp,
+                            mbStates, mbAddress: addr,
+                            ref prevMbQpDeltaState,
+                            bSliceIntra: true);
+                    }
+                    else
+                    {
+                        CabacMbEncoder.EncodeIntra16x16(
+                            cabac!,
+                            mbSrcY, mbSrcU, mbSrcV,
+                            srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                            reconYOut, reconUOut, reconVOut,
+                            picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                            mbX, mbY, mbsPerRow: picWidthInMbs,
+                            qpY: qp,
+                            mbStates, mbAddress: addr,
+                            ref prevMbQpDeltaState,
+                            bSliceIntra: true);
+                    }
                     bool lastMbIntra = addr == totalMbs - 1;
                     CabacEncSlice.EncodeEndOfSliceFlag(cabac!, lastMbIntra);
                 }
@@ -770,16 +796,32 @@ public static class H264FrameEncoder
                     // CAVLC: flush any pending mb_skip_run before the intra MB.
                     ExpGolombWriter.WriteUe(sliceWriter, (uint)pendingSkipRun);
                     pendingSkipRun = 0;
-                    MacroblockEncoder.EncodeIntra16x16(
-                        sliceWriter,
-                        mbSrcY, mbSrcU, mbSrcV,
-                        srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
-                        reconYOut, reconUOut, reconVOut,
-                        picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
-                        mbX, mbY, mbsPerRow: picWidthInMbs,
-                        qpY: qp,
-                        mbStates, mbAddress: addr,
-                        mbTypeOffset: 23); // B-slice: I-slice mb_type 1..24 → B mb_type 24..47.
+                    if (useIntra4x4)
+                    {
+                        IntraEncoder4x4.EncodeIntra4x4(
+                            sliceWriter,
+                            mbSrcY, mbSrcU, mbSrcV,
+                            srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                            reconYOut, reconUOut, reconVOut,
+                            picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                            mbX, mbY, mbsPerRow: picWidthInMbs,
+                            qpY: qp,
+                            mbStates, mbAddress: addr,
+                            mbTypeOffset: 23); // B-slice: I-slice mb_type 0 (I_NxN) → B mb_type 23.
+                    }
+                    else
+                    {
+                        MacroblockEncoder.EncodeIntra16x16(
+                            sliceWriter,
+                            mbSrcY, mbSrcU, mbSrcV,
+                            srcStrideY: bufferWidth, srcStrideC: bufferChromaWidth,
+                            reconYOut, reconUOut, reconVOut,
+                            picStrideY: bufferWidth, picStrideC: bufferChromaWidth,
+                            mbX, mbY, mbsPerRow: picWidthInMbs,
+                            qpY: qp,
+                            mbStates, mbAddress: addr,
+                            mbTypeOffset: 23); // B-slice: I-slice mb_type 1..24 → B mb_type 24..47.
+                    }
                 }
                 continue;
             }

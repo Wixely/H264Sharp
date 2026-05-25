@@ -297,7 +297,9 @@ internal static class CabacMbEncoder
     /// <summary>Encode one I_NxN (Intra_4x4) macroblock as CABAC. The prediction +
     /// transform/quant/reconstruction pipeline is shared with the CAVLC Intra_4x4 path via
     /// <see cref="IntraEncoder4x4.PrepareIntra4x4"/>; only the syntax stage differs. Inverse of
-    /// decoder's <c>CabacSliceI.ParseIntraMbBody</c> Intra_4x4 branch.</summary>
+    /// decoder's <c>CabacSliceI.ParseIntraMbBody</c> Intra_4x4 branch. When
+    /// <paramref name="bSliceIntra"/> is true, emits B-slice intra mb_type (prefix to code 23 +
+    /// intra body at ctxIdxOffset=32 with bin0=0 for I_NxN) instead of I-slice mb_type.</summary>
     public static void EncodeIntra4x4(
         CabacEncoder cabac,
         ReadOnlySpan<byte> srcY, ReadOnlySpan<byte> srcU, ReadOnlySpan<byte> srcV,
@@ -308,7 +310,8 @@ internal static class CabacMbEncoder
         int qpY,
         MacroblockEncoderState?[] mbStates,
         int mbAddress,
-        ref int prevMbQpDeltaState)
+        ref int prevMbQpDeltaState,
+        bool bSliceIntra = false)
     {
         var prep = IntraEncoder4x4.PrepareIntra4x4(
             srcY, srcU, srcV, srcStrideY, srcStrideC,
@@ -321,8 +324,11 @@ internal static class CabacMbEncoder
         int cbpChroma = prep.CbpChroma;
         var chroma = prep.Chroma;
 
-        // ---- Syntax: mb_type=0 (I_NxN) ----
-        CabacEncSlice.EncodeMbTypeI(cabac, mbType: 0, leftMb, topMb);
+        // ---- Syntax: mb_type ----
+        if (bSliceIntra)
+            CabacEncSliceB.EncodeMbTypeBIntra4x4(cabac, leftMb, topMb);
+        else
+            CabacEncSlice.EncodeMbTypeI(cabac, mbType: 0, leftMb, topMb);
 
         // ---- 16 × (prev_intra4x4_pred_mode_flag, [rem_intra4x4_pred_mode]) ----
         // Spec §8.3.1.1: predicted mode = min(neighborLeft, neighborTop) with -1 sentinel
