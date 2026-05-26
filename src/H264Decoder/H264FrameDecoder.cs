@@ -375,7 +375,7 @@ public sealed class H264FrameDecoder
                     // P_Skip: derive MV per spec §8.4.1.1 from neighbors, then treat as
                     // P_L0_16x16 with refIdx=0 + that MV + zero residual.
                     (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
-                    Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
+                    Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY, qpY);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);
@@ -383,7 +383,7 @@ public sealed class H264FrameDecoder
                 else
                 {
                     Macroblock? colMb = GetColocatedMb(refPicListL1, addr);
-                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx, qpY);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
@@ -435,8 +435,10 @@ public sealed class H264FrameDecoder
         return mbs[addr];
     }
 
-    /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.</summary>
-    private static Macroblock SkipPlaceholder(int addr, int mvX, int mvY)
+    /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.
+    /// QpY inherits the running QP (skip MBs have implicit mb_qp_delta == 0; this matters for deblocking
+    /// since adjacent edges average the two MBs' QpYs to look up alpha/beta).</summary>
+    private static Macroblock SkipPlaceholder(int addr, int mvX, int mvY, int qpY)
     {
         var mb = new Macroblock
         {
@@ -446,6 +448,7 @@ public sealed class H264FrameDecoder
             RefIdxL0 = 0,
             MvL0X = mvX,
             MvL0Y = mvY,
+            QpY = qpY,
         };
         for (int i = 0; i < 16; i++) { mb.MvL0XBlock[i] = mvX; mb.MvL0YBlock[i] = mvY; }
         // RefIdxL08x8 left as zeros (correct for P_Skip).
@@ -454,10 +457,10 @@ public sealed class H264FrameDecoder
     }
 
     /// <summary>Placeholder Macroblock for a B_Skip — uses B_Direct_16x16 spatial direct derivation
-    /// to fill MVs; no residual.</summary>
+    /// to fill MVs; no residual. QpY inherits the running QP (see SkipPlaceholder).</summary>
     private static Macroblock BSkipPlaceholder(int addr, SliceHeader header,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
-        Macroblock? colocatedMb, TemporalDirectContext? tdCtx)
+        Macroblock? colocatedMb, TemporalDirectContext? tdCtx, int qpY)
     {
         var mb = new Macroblock
         {
@@ -466,6 +469,7 @@ public sealed class H264FrameDecoder
             IsSkipped = true,
             IsBSkip = true,
             IsBInter = true,
+            QpY = qpY,
         };
         BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
         return mb;
@@ -542,7 +546,7 @@ public sealed class H264FrameDecoder
                 if (isBSlice)
                 {
                     Macroblock? colMbSkip = GetColocatedMb(refPicListL1, addr);
-                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip, tdCtx);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip, tdCtx, qpY);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
@@ -551,7 +555,7 @@ public sealed class H264FrameDecoder
                 else
                 {
                     (int skipMvX, int skipMvY) = MacroblockParser.DerivePSkipMv(leftMb, topMb, topRightMb, topLeftMb);
-                    Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY);
+                    Macroblock skipMb = SkipPlaceholder(addr, skipMvX, skipMvY, qpY);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, null, header.PredWeights);

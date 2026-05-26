@@ -222,6 +222,49 @@ public sealed class CorpusDecodeTests
             "baseline", "cavlc", 0, 1, "i4x4", 0, 7, 18, "testsrc",
             TestSrc(16, 16, 1, 1), ""));
 
+        // ---- iPhone-recording-like clips: deblocking ON, mixed transform sizes ----
+        // 37. High + CABAC + 8x8dct + deblocking on + mixed i4x4/i8x8 + testsrc (mixed transform sizes within MB rows).
+        clips.Add(new Clip("iphone_high_cabac_mixed_deblock_64x48", 64, 48, 1,
+            "high", "cabac", 0, 1, "i4x4,i8x8", 1, 7, 18, "testsrc",
+            TestSrc(64, 48, 1, 1), "8x8dct=1:partitions=i4x4,i8x8"));
+        // 38. Same as above with stronger content (mandelbrot).
+        clips.Add(new Clip("iphone_high_cabac_mixed_deblock_mandel_64x48", 64, 48, 1,
+            "high", "cabac", 0, 1, "i4x4,i8x8", 1, 7, 18, "mandel",
+            Mandel(64, 48), "8x8dct=1:partitions=i4x4,i8x8"));
+        // 39. Apple-VideoToolbox-like: High + CABAC + 8x8dct + bf=2 + ref=3 + deblock on + all partitions.
+        clips.Add(new Clip("iphone_high_cabac_full_64x48", 64, 48, 4,
+            "high", "cabac", 2, 3, "all", 1, 7, 23, "testsrc",
+            TestSrc(64, 48, 1, 4), "8x8dct=1:partitions=all"));
+        // 40. iPhone-like with smptebars (high-contrast edges, hits deblocking strength branches).
+        clips.Add(new Clip("iphone_high_cabac_smpte_deblock_64x48", 64, 48, 1,
+            "high", "cabac", 0, 1, "i4x4,i8x8", 1, 7, 18, "smpte",
+            Smpte(64, 48, 1, 1), "8x8dct=1:partitions=i4x4,i8x8"));
+        // 41. Larger mixed-transform-size iPhone-like clip for cumulative drift testing.
+        clips.Add(new Clip("iphone_high_cabac_mixed_deblock_128x96", 128, 96, 2,
+            "high", "cabac", 1, 2, "all", 1, 7, 23, "shifted",
+            Shifted(128, 96), "8x8dct=1:partitions=all"));
+        // 42. VideoToolbox-like with non-zero deblock offsets (Apple often uses alpha/beta != 0).
+        clips.Add(new Clip("apple_vt_deblock_offset_64x48", 64, 48, 2,
+            "high", "cabac", 1, 2, "all", 1, 7, 23, "shifted",
+            Shifted(64, 48), "8x8dct=1:partitions=all:deblock=-1,-1"));
+        // 43. Apple-like with stronger deblock offsets.
+        clips.Add(new Clip("apple_vt_deblock_strong_64x48", 64, 48, 2,
+            "high", "cabac", 1, 2, "all", 1, 7, 23, "testsrc",
+            TestSrc(64, 48, 1, 2), "8x8dct=1:partitions=all:deblock=-2,-2"));
+        // 44. VideoToolbox-like: chroma_qp_index_offset != 0 (Apple uses -2 sometimes).
+        clips.Add(new Clip("apple_vt_chroma_qp_offset_64x48", 64, 48, 2,
+            "high", "cabac", 1, 2, "all", 1, 7, 23, "shifted",
+            Shifted(64, 48), "8x8dct=1:partitions=all:chroma-qp-offset=-2"));
+        // 45. Higher QP variance: cqm/aq enabled (forces per-MB qp_delta).
+        clips.Add(new Clip("apple_vt_aq_qp_var_128x96", 128, 96, 2,
+            "high", "cabac", 1, 2, "all", 1, 7, 28, "shifted",
+            Shifted(128, 96), "8x8dct=1:partitions=all:aq-mode=1:aq-strength=1.5"));
+        // 46. Mixed 8x8 + 4x4 transform sizes on adjacent MBs: deblocking at MB boundary
+        //   between transform_size_8x8_flag=1 and =0 MBs is a specific edge case.
+        clips.Add(new Clip("mixed_xform_boundary_128x96", 128, 96, 1,
+            "high", "cabac", 0, 1, "i4x4,i8x8", 1, 7, 28, "smpte",
+            Smpte(128, 96, 1, 1), "8x8dct=1:partitions=i4x4,i8x8"));
+
         return clips;
     }
 
