@@ -47,7 +47,8 @@ public static class DeblockingFilter
         int chromaQpIndexOffset,
         int sliceAlphaC0OffsetDiv2,
         int sliceBetaOffsetDiv2,
-        bool filterMbEdges)
+        bool filterMbEdges,
+        bool mbaff = false)
     {
         int totalMbs = mbs.Length;
         for (int addr = 0; addr < totalMbs; addr++)
@@ -56,11 +57,33 @@ public static class DeblockingFilter
             if (mb is null) continue;
             // I_PCM MBs are not filtered (spec §8.7.5: samples bypass the in-loop filter).
             if (mb.IsPcm) continue;
-            int mbX = addr % mbsPerRow;
-            int mbY = addr / mbsPerRow;
+            int mbX, mbY;
+            int leftAddr, topAddr;
+            if (!mbaff)
+            {
+                mbX = addr % mbsPerRow;
+                mbY = addr / mbsPerRow;
+                leftAddr = addr - 1;
+                topAddr = addr - mbsPerRow;
+            }
+            else
+            {
+                // MBAFF iterates in MB-pair raster order. Convert addr↔(mbX,mbY) accordingly.
+                int pairIdx = addr >> 1;
+                int inPair = addr & 1;
+                mbX = pairIdx % mbsPerRow;
+                mbY = (pairIdx / mbsPerRow) * 2 + inPair;
+                // Left neighbor (mbX-1, mbY) lives in a different MB pair, same inPair.
+                leftAddr = mbX > 0 ? (((mbY >> 1) * mbsPerRow + (mbX - 1)) << 1) + inPair : -1;
+                // Top neighbor (mbX, mbY-1): if current is bottom of pair, top is same-pair top
+                // (addr-1); if current is top of pair, top is bottom of pair above.
+                if (mbY == 0) topAddr = -1;
+                else if (inPair == 1) topAddr = addr - 1;
+                else topAddr = ((((mbY >> 1) - 1) * mbsPerRow + mbX) << 1) + 1;
+            }
 
-            Macroblock? leftMb = mbX > 0 ? mbs[addr - 1] : null;
-            Macroblock? topMb = mbY > 0 ? mbs[addr - mbsPerRow] : null;
+            Macroblock? leftMb = mbX > 0 ? mbs[leftAddr] : null;
+            Macroblock? topMb = mbY > 0 ? mbs[topAddr] : null;
             int qPLeft = leftMb is not null ? leftMb.QpY : mb.QpY;
             int qPTop = topMb is not null ? topMb.QpY : mb.QpY;
             bool leftIsPcm = leftMb is not null && leftMb.IsPcm;

@@ -116,20 +116,28 @@ public sealed class H264FrameDecoder
                     // Parse the full slice header. Cheap and re-used for both AU
                     // boundary detection (first_mb_in_slice) and the actual MB decode.
                     SliceHeader header = SliceHeader.Parse(n.Rbsp.Span, n, sps, pps);
-                    // Interlaced gate: parsing succeeds for frame_mbs_only_flag=0 streams
-                    // (so callers can introspect SPS/slice metadata), but actual decode of
-                    // field pictures and MBAFF is not yet implemented. Reject with a clear,
-                    // parameterized error that identifies which interlaced mode was detected.
+                    // Interlaced gate: MBAFF I-slice CAVLC with all-frame-coded MB pairs is
+                    // supported (Stage 3a). PAFF (field_pic_flag=1, or PAFF frame pictures) and
+                    // MBAFF for P/B slices / CABAC / field-coded pairs are not yet implemented
+                    // — those are rejected with parameterized errors at the slice_data layer
+                    // or here at dispatch.
                     if (!sps.FrameMbsOnlyFlag)
                     {
-                        if (sps.MbAdaptiveFrameFieldFlag)
-                            throw new NotSupportedException(
-                                "MBAFF (SPS mb_adaptive_frame_field_flag=1) decode not yet supported");
                         if (header.FieldPicFlag)
                             throw new NotSupportedException(
                                 $"PAFF field picture (slice field_pic_flag=1, bottom_field_flag={header.BottomFieldFlag}) decode not yet supported");
-                        throw new NotSupportedException(
-                            "PAFF frame picture (SPS frame_mbs_only_flag=0, slice field_pic_flag=0) decode not yet supported");
+                        if (!sps.MbAdaptiveFrameFieldFlag)
+                            throw new NotSupportedException(
+                                "PAFF frame picture (SPS frame_mbs_only_flag=0, mb_adaptive_frame_field_flag=0) decode not yet supported");
+                        // MBAFF (mb_adaptive_frame_field_flag=1, !field_pic_flag): Stage 3a allows
+                        // only I-slice + CAVLC; the slice_data loop additionally rejects any
+                        // field-coded MB pair (mb_field_decoding_flag=1) it encounters.
+                        if (header.SliceType != SliceType.I)
+                            throw new NotSupportedException(
+                                $"MBAFF {header.SliceType}-slice decode not yet supported (only I-slice in stage 3a)");
+                        if (pps.EntropyCodingModeFlag)
+                            throw new NotSupportedException(
+                                "MBAFF CABAC decode not yet supported (only CAVLC in stage 3a)");
                     }
                     // Access-unit boundary rule (spec §7.4.1.2, simplified): a slice
                     // with first_mb_in_slice == 0 starts a new coded picture; any
@@ -295,11 +303,13 @@ public sealed class H264FrameDecoder
         if (header.DisableDeblockingFilterIdc != 1)
         {
             bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
+            bool mbaff = !sps.FrameMbsOnlyFlag && sps.MbAdaptiveFrameFieldFlag && !header.FieldPicFlag;
             DeblockingFilter.Apply(ctx.Picture, ctx.Mbs, ctx.MbsPerRow,
                 pps.ChromaQpIndexOffset,
                 header.SliceAlphaC0OffsetDiv2 * 2,
                 header.SliceBetaOffsetDiv2 * 2,
-                filterMbEdges);
+                filterMbEdges,
+                mbaff);
         }
         LastMacroblocks = ctx.Mbs;
         ctx.Picture.Macroblocks = ctx.Mbs;
@@ -351,6 +361,9 @@ public sealed class H264FrameDecoder
         }
 
         int addr = (int)header.FirstMbInSlice;
+        // Spec §7.4.1.5: MbaffFrameFlag = (mb_adaptive_frame_field_flag && !field_pic_flag).
+        // Drives MB-pair iteration order and per-pair mb_field_decoding_flag parsing.
+        bool mbaffFrameFlag = !sps.FrameMbsOnlyFlag && sps.MbAdaptiveFrameFieldFlag && !header.FieldPicFlag;
 
         // ---- Branch on entropy coding mode ----
         if (pps.EntropyCodingModeFlag)
@@ -414,14 +427,27 @@ public sealed class H264FrameDecoder
 
             // Parse one coded MB.
             {
-                int mbX = addr % mbsPerRow;
-                int mbY = addr / mbsPerRow;
-                Macroblock? leftMb = GetNeighborInSlice(mbs, mbX > 0 ? addr - 1 : -1, firstMbInSlice);
-                Macroblock? topMb = GetNeighborInSlice(mbs, mbY > 0 ? addr - mbsPerRow : -1, firstMbInSlice);
+                // MBAFF: parse mb_field_decoding_flag before the top MB of every pair (and
+                // before the bottom MB if the top was skipped; for I-slice no skips apply).
+                if (mbaffFrameFlag && (addr & 1) == 0)
+                {
+                    int mbFieldDecodingFlag = (int)reader.ReadBit();
+                    if (mbFieldDecodingFlag != 0)
+                    {
+                        int pairIdx = addr >> 1;
+                        throw new NotSupportedException(
+                            $"MBAFF field-coded MB pair (mb_field_decoding_flag=1 at pair index {pairIdx}) decode not yet supported");
+                    }
+                }
+                (int mbX, int mbY) = MbAddrToCoords(addr, mbsPerRow, mbaffFrameFlag);
+                Macroblock? leftMb = GetNeighborInSlice(mbs,
+                    mbX > 0 ? MbAddrFromCoords(mbX - 1, mbY, mbsPerRow, mbaffFrameFlag) : -1, firstMbInSlice);
+                Macroblock? topMb = GetNeighborInSlice(mbs,
+                    mbY > 0 ? MbAddrFromCoords(mbX, mbY - 1, mbsPerRow, mbaffFrameFlag) : -1, firstMbInSlice);
                 Macroblock? topRightMb = GetNeighborInSlice(mbs,
-                    (mbY > 0 && mbX + 1 < mbsPerRow) ? addr - mbsPerRow + 1 : -1, firstMbInSlice);
+                    (mbY > 0 && mbX + 1 < mbsPerRow) ? MbAddrFromCoords(mbX + 1, mbY - 1, mbsPerRow, mbaffFrameFlag) : -1, firstMbInSlice);
                 Macroblock? topLeftMb = GetNeighborInSlice(mbs,
-                    (mbY > 0 && mbX > 0) ? addr - mbsPerRow - 1 : -1, firstMbInSlice);
+                    (mbY > 0 && mbX > 0) ? MbAddrFromCoords(mbX - 1, mbY - 1, mbsPerRow, mbaffFrameFlag) : -1, firstMbInSlice);
                 Macroblock? colMbInter = isBSlice ? GetColocatedMb(refPicListL1, addr) : null;
                 Macroblock mb = MacroblockParser.Parse(
                     ref reader, sps, pps, header,
@@ -448,6 +474,27 @@ public sealed class H264FrameDecoder
     {
         if (addr < 0 || addr < firstMbInSlice) return null;
         return mbs[addr];
+    }
+
+    /// <summary>Map a CurrMbAddr to its (mbX, mbY) spatial coordinates. For MBAFF, MBs are
+    /// decoded in pair raster order (pair=top+bottom stacked vertically), so address-to-coords
+    /// differs from the simple non-MBAFF mapping.</summary>
+    private static (int mbX, int mbY) MbAddrToCoords(int addr, int mbsPerRow, bool mbaff)
+    {
+        if (!mbaff) return (addr % mbsPerRow, addr / mbsPerRow);
+        int pairIdx = addr >> 1;
+        int inPair = addr & 1;
+        return (pairIdx % mbsPerRow, (pairIdx / mbsPerRow) * 2 + inPair);
+    }
+
+    /// <summary>Inverse of <see cref="MbAddrToCoords"/>: spatial (mbX, mbY) → CurrMbAddr.
+    /// Used to look up neighbor MBs that were decoded earlier in the slice.</summary>
+    private static int MbAddrFromCoords(int mbX, int mbY, int mbsPerRow, bool mbaff)
+    {
+        if (!mbaff) return mbY * mbsPerRow + mbX;
+        int pairIdx = (mbY >> 1) * mbsPerRow + mbX;
+        int inPair = mbY & 1;
+        return pairIdx * 2 + inPair;
     }
 
     /// <summary>Placeholder Macroblock for a P_Skip — treated as PredL0 with refIdx=0 and MV derived per §8.4.1.1.
