@@ -725,11 +725,13 @@ public static class H264FrameEncoder
             (int predL1X, int predL1Y) = BMbEncoder.PredictBSliceMv(leftMb, topMb, topRightMb, topLeftMb, listX: 1);
 
             int lambda = options.ModeDecisionLambda >= 0 ? options.ModeDecisionLambda : DefaultLambda(qp);
-            // Phase 5e stage 2: sub-8x8 partitions (sub_mb_types 4..12) are enabled for CAVLC.
-            // The CABAC sub-partition path has a known desync (bin stream produces wrong
-            // reconstruction in our decoder by ~25dB on banded-motion fixtures); restrict CABAC
-            // to 8x8-partition sub_mb_types (1..3) until the desync is root-caused.
-            bool enableP8x8Sub = !options.EnableCabac;
+            // Phase 5e stage 2: sub-8x8 partitions (sub_mb_types 4..12) enabled for both CAVLC
+            // and CABAC. Earlier the CABAC path was restricted because the encoder pre-filled
+            // state.MvL{0,1}XBlock with the final candidate MVs *before* mvd emission, while the
+            // decoder fills them progressively — so when a sub-partition's MV predictor C-neighbor
+            // landed in a not-yet-emitted quadrant, encoder and decoder disagreed. The emitters
+            // now fill state's MV blocks progressively (matching the decoder); see EmitQuadrant*.
+            bool enableP8x8Sub = true;
             var cand = BMbEncoder.ChooseBestInterWithDirect(
                 mbSrcY, mbSrcU, mbSrcV, bufferWidth, bufferChromaWidth,
                 refL0Y, refL0U, refL0V, refL1Y, refL1U, refL1V,

@@ -1084,32 +1084,31 @@ internal static class BMbEncoder
         state.RefIdxL1 = (cand.Direction == Dir.L1 || cand.Direction == Dir.Bi) ? 0 : -1;
     }
 
-    /// <summary>For P8x8: fill per-block state from per-quadrant sub_mb_type and per-4x4 MVs
-    /// (cand.MvL{0,1}{X,Y}PerBlock). PredFlag is per-quadrant (sub_mb_type determines direction).</summary>
+    /// <summary>For P8x8: set per-quadrant refIdx; zero all per-block arrays (MV / MVD / PredFlag).
+    /// The CAVLC and CABAC emit paths fill these progressively per sub-partition so neighbor
+    /// reads in MV prediction match the decoder. (CABAC additionally bulk-sets PredFlag per
+    /// quadrant before its MV emit phase to mirror the decoder's refIdx → PredFlag pattern.)</summary>
     private static void PopulateP8x8State(BCandidate cand, MacroblockEncoderState state)
     {
+        for (int i = 0; i < 16; i++)
+        {
+            state.PredFlagL0Block[i] = 0;
+            state.PredFlagL1Block[i] = 0;
+            state.MvL0XBlock[i] = 0;
+            state.MvL0YBlock[i] = 0;
+            state.MvL1XBlock[i] = 0;
+            state.MvL1YBlock[i] = 0;
+            state.MvdL0XBlock[i] = 0;
+            state.MvdL0YBlock[i] = 0;
+            state.MvdL1XBlock[i] = 0;
+            state.MvdL1YBlock[i] = 0;
+        }
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
             Dir dir = SubMbTypeDir[sub];
             bool useL0 = dir == Dir.L0 || dir == Dir.Bi;
             bool useL1 = dir == Dir.L1 || dir == Dir.Bi;
-            int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
-            for (int by = qBy; by < qBy + 2; by++)
-                for (int bx = qBx; bx < qBx + 2; bx++)
-                {
-                    int idx = SpatialToRaster[by * 4 + bx];
-                    state.PredFlagL0Block[idx] = useL0 ? (byte)1 : (byte)0;
-                    state.PredFlagL1Block[idx] = useL1 ? (byte)1 : (byte)0;
-                    state.MvL0XBlock[idx] = useL0 ? cand.MvL0XPerBlock![idx] : 0;
-                    state.MvL0YBlock[idx] = useL0 ? cand.MvL0YPerBlock![idx] : 0;
-                    state.MvL1XBlock[idx] = useL1 ? cand.MvL1XPerBlock![idx] : 0;
-                    state.MvL1YBlock[idx] = useL1 ? cand.MvL1YPerBlock![idx] : 0;
-                    state.MvdL0XBlock[idx] = 0;
-                    state.MvdL0YBlock[idx] = 0;
-                    state.MvdL1XBlock[idx] = 0;
-                    state.MvdL1YBlock[idx] = 0;
-                }
             state.RefIdxL08x8[q] = useL0 ? 0 : -1;
             state.RefIdxL18x8[q] = useL1 ? 0 : -1;
         }
@@ -1122,6 +1121,51 @@ internal static class BMbEncoder
         state.RefIdxL0 = useL00 ? 0 : -1;
         state.RefIdxL1 = (dir0 == Dir.L1 || dir0 == Dir.Bi) ? 0 : -1;
     }
+
+    /// <summary>Companion to <see cref="FillBlockMvds"/>: writes the final per-block MV after a
+    /// sub-partition's mvd has been emitted so subsequent sub-partitions' MV predictors see this
+    /// quadrant's MVs (matching the decoder, which fills these progressively too).</summary>
+    private static void FillBlockMvs(MacroblockEncoderState state, int bx, int by, int bw, int bh,
+        int listX, int mvX, int mvY)
+    {
+        for (int yy = by; yy < by + bh; yy++)
+            for (int xx = bx; xx < bx + bw; xx++)
+            {
+                int idx = SpatialToRaster[yy * 4 + xx];
+                if (listX == 0) { state.MvL0XBlock[idx] = mvX; state.MvL0YBlock[idx] = mvY; }
+                else { state.MvL1XBlock[idx] = mvX; state.MvL1YBlock[idx] = mvY; }
+            }
+    }
+
+    /// <summary>Set PredFlag bytes for a sub-partition's 4x4 blocks.</summary>
+    private static void FillBlockPredFlags(MacroblockEncoderState state, int bx, int by, int bw, int bh, int listX)
+    {
+        for (int yy = by; yy < by + bh; yy++)
+            for (int xx = bx; xx < bx + bw; xx++)
+            {
+                int idx = SpatialToRaster[yy * 4 + xx];
+                if (listX == 0) state.PredFlagL0Block[idx] = 1;
+                else state.PredFlagL1Block[idx] = 1;
+            }
+    }
+
+    /// <summary>Set PredFlag bytes for an 8x8 quadrant (CABAC: bulk-set per quadrant in the
+    /// refIdx phase of its decoder, before MV prediction reads neighbor PredFlag).</summary>
+    internal static void SetQuadrantPredFlag(MacroblockEncoderState state, int q, int listX)
+    {
+        int qBx = (q & 1) * 2, qBy = (q >> 1) * 2;
+        for (int by = qBy; by < qBy + 2; by++)
+            for (int bx = qBx; bx < qBx + 2; bx++)
+            {
+                int idx = SpatialToRaster[by * 4 + bx];
+                if (listX == 0) state.PredFlagL0Block[idx] = 1;
+                else state.PredFlagL1Block[idx] = 1;
+            }
+    }
+
+    /// <summary>Expose <see cref="FillBlockMvs"/> and <see cref="FillBlockPredFlags"/> to CabacMbEncoderB.</summary>
+    internal static void FillBlockMvsPublic(MacroblockEncoderState state, int bx, int by, int bw, int bh,
+        int listX, int mvX, int mvY) => FillBlockMvs(state, bx, by, bw, bh, listX, mvX, mvY);
 
     /// <summary>Which 8x8 quadrants (raster: 0=TL, 1=TR, 2=BL, 3=BR) belong to partition p of a
     /// given shape. 16x8 part0 = TL+TR (0,1); part1 = BL+BR (2,3). 8x16 part0 = TL+BL (0,2);
@@ -1377,6 +1421,8 @@ internal static class BMbEncoder
             ExpGolombWriter.WriteSe(w, mvdX);
             ExpGolombWriter.WriteSe(w, mvdY);
             FillBlockMvds(state, bx0, by0, bw, bh, listX, mvdX, mvdY);
+            FillBlockMvs(state, bx0, by0, bw, bh, listX, mvX, mvY);
+            FillBlockPredFlags(state, bx0, by0, bw, bh, listX);
         }
     }
 

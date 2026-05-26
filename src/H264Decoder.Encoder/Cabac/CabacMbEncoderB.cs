@@ -205,7 +205,10 @@ internal static class CabacMbEncoderB
 
     /// <summary>CABAC mvd emission for a B_8x8 MB. Iterates L0 over quadrants/sub-partitions
     /// then L1, with each sub-partition emitting one mvd pair. Uses the standard-median MV
-    /// predictor (rawMbType=0 sentinel per spec §8.4.1.3.2).</summary>
+    /// predictor (rawMbType=0 sentinel per spec §8.4.1.3.2). Before the L0 MV loop we bulk-set
+    /// PredFlagL0 for every L0-using 8x8 quadrant — matching the CABAC decoder, which sets
+    /// PredFlag during its refIdx phase so that in-MB neighbor reads in MV prediction see a
+    /// valid (refIdx, MV=0) for not-yet-decoded sub-partitions of the same MB. Symmetric for L1.</summary>
     private static void EmitMvdsP8x8(
         CabacEncoder cabac, BMbEncoder.BCandidate cand, MacroblockEncoderState state,
         MacroblockEncoderState? leftMb, MacroblockEncoderState? topMb,
@@ -214,8 +217,18 @@ internal static class CabacMbEncoderB
         for (int q = 0; q < 4; q++)
         {
             int sub = cand.SubMbTypes![q];
+            if (UsesL0(sub)) BMbEncoder.SetQuadrantPredFlag(state, q, listX: 0);
+        }
+        for (int q = 0; q < 4; q++)
+        {
+            int sub = cand.SubMbTypes![q];
             if (!UsesL0(sub)) continue;
             EmitQuadrantMvdsCabac(cabac, cand, state, q, sub, listX: 0, leftMb, topMb, topRightMb, topLeftMb);
+        }
+        for (int q = 0; q < 4; q++)
+        {
+            int sub = cand.SubMbTypes![q];
+            if (UsesL1(sub)) BMbEncoder.SetQuadrantPredFlag(state, q, listX: 1);
         }
         for (int q = 0; q < 4; q++)
         {
@@ -269,6 +282,7 @@ internal static class CabacMbEncoderB
             CabacEncSliceP.EncodeMvd(cabac, mvdX, sumX, ctxBase: 40);
             CabacEncSliceP.EncodeMvd(cabac, mvdY, sumY, ctxBase: 47);
             FillBlockMvds(state, bx0, by0, bw, bh, listX, mvdX, mvdY);
+            BMbEncoder.FillBlockMvsPublic(state, bx0, by0, bw, bh, listX, mvX, mvY);
         }
     }
 
