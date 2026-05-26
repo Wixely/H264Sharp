@@ -9,11 +9,14 @@ namespace H264Decoder.Bitstream;
 ///   - All video samples from mdat, sliced per the stbl sample table (non-fragmented)
 ///     OR from moof/traf/trun runs (fragmented MP4, fMP4).
 ///
-/// Streams the file: only the moov atom (and each individual moof) is loaded into
-/// memory, so arbitrary-size inputs are supported as long as moov itself fits in
-/// a byte[] (~2 GiB) and each moof fits in ~10 MiB.
-/// Out of scope: edit lists, multiple stsd entries, audio tracks. We accept 32-bit
-/// and 64-bit chunk offsets (stco / co64).
+/// Streams the file: container boxes (moov, trak, mdia, minf, stbl, edts, mvex) are
+/// navigated by file-position seeks without loading their payloads; only the leaf
+/// boxes (mvhd, tkhd, mdhd, hdlr, elst, stsd, stts, ctts, stss, stsc, stsz, stco/co64,
+/// trex) are read into byte[]s. moov payload may exceed 2 GiB; each individual leaf
+/// box still must fit in an int-indexed byte[] (stsz @ 4 B/sample tolerates ~500M
+/// samples). Each moof must fit in ~10 MiB.
+/// Out of scope: multiple stsd entries, audio tracks. We accept 32-bit and 64-bit
+/// chunk offsets (stco / co64).
 /// </summary>
 public static class Mp4Reader
 {
@@ -59,8 +62,9 @@ public static class Mp4Reader
         if (!stream.CanSeek) throw new ArgumentException("MP4: stream must be seekable", nameof(stream));
         if (!stream.CanRead) throw new ArgumentException("MP4: stream must be readable", nameof(stream));
 
-        // Walk top-level boxes once: pull moov into memory and remember positions of moof atoms.
-        byte[]? moovBytes = null;
+        // Walk top-level boxes once: remember moov's payload range (without loading) and the
+        // file positions of moof atoms. Streaming the moov payload supports >2 GiB metadata.
+        long moovPayloadStart = -1, moovPayloadEnd = -1;
         var moofRegions = new List<(long Start, long PayloadStart, long PayloadEnd)>();
         long fileLength = stream.Length;
         long pos = 0;
@@ -94,15 +98,10 @@ public static class Mp4Reader
 
             if (boxSize < 8 || pos + boxSize > fileLength) break;
 
-            if (ty == "moov" && moovBytes is null)
+            if (ty == "moov" && moovPayloadStart < 0)
             {
-                long payloadLen = pos + boxSize - payloadStart;
-                if (payloadLen > int.MaxValue)
-                    throw new InvalidDataException("MP4: moov atom too large to load (>2 GiB)");
-                moovBytes = new byte[(int)payloadLen];
-                stream.Position = payloadStart;
-                if (ReadExact(stream, moovBytes) != moovBytes.Length)
-                    throw new InvalidDataException("MP4: truncated moov atom");
+                moovPayloadStart = payloadStart;
+                moovPayloadEnd = pos + boxSize;
             }
             else if (ty == "moof")
             {
@@ -111,51 +110,48 @@ public static class Mp4Reader
             pos += boxSize;
         }
 
-        if (moovBytes is null) throw new InvalidDataException("MP4: no 'moov' box");
-        return ParseMoov(moovBytes, stream, moofRegions, stderr);
+        if (moovPayloadStart < 0) throw new InvalidDataException("MP4: no 'moov' box");
+        return ParseMoov(stream, moovPayloadStart, moovPayloadEnd, moofRegions, stderr);
     }
 
-    private static Mp4SampleStream ParseMoov(byte[] moovBytes, Stream source,
+    private static Mp4SampleStream ParseMoov(Stream source,
+        long moovPayloadStart, long moovPayloadEnd,
         List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions, TextWriter? stderr)
     {
-        ReadOnlySpan<byte> moov = moovBytes;
+        // Movie header — small (~108 B); read into a buffer and parse.
+        (uint movieTimescale, ulong movieDuration) = TryReadLeaf(source, moovPayloadStart, moovPayloadEnd, "mvhd", out var mvhdBuf)
+            ? ReadMvhd(mvhdBuf) : (0u, 0ul);
 
-        // Movie header — global timescale + duration on the master timeline.
-        (uint movieTimescale, ulong movieDuration) = ReadMvhd(moov);
-
-        if (!TryFindVideoTrak(moov, out int trakStart, out int trakLen))
+        if (!TryFindVideoTrakInStream(source, moovPayloadStart, moovPayloadEnd, out long trakStart, out long trakEnd))
             throw new InvalidDataException("MP4: no video track");
-        var trak = moov.Slice(trakStart, trakLen);
-        uint videoTrackId = ReadTkhdTrackId(trak);
 
-        // Track header — width/height (16.16 fixed point) for the video track.
-        (int tkhdWidth, int tkhdHeight) = ReadTkhdSize(trak);
+        // Track header — small (~92 B): track_id, width/height.
+        byte[] tkhdBuf = ReadLeafBoxOrThrow(source, trakStart, trakEnd, "tkhd");
+        uint videoTrackId = ReadTkhdTrackId(tkhdBuf);
+        (int tkhdWidth, int tkhdHeight) = ReadTkhdSize(tkhdBuf);
 
-        if (!TryFindChildBox(trak, "mdia", out int mdiaS, out int mdiaL))
+        // Edit list — small; optional. Sits inside trak/edts/elst.
+        long editMediaTimeOffset = ReadElstMediaTimeOffsetStream(source, trakStart, trakEnd, movieTimescale, stderr);
+
+        if (!TryFindChildBoxStream(source, trakStart, trakEnd, "mdia", out long mdiaStart, out long mdiaEnd))
             throw new InvalidDataException("MP4: no mdia");
-        var mdia = trak.Slice(mdiaS, mdiaL);
 
-        // Media header — per-track timescale (used for stts/ctts deltas).
-        uint mediaTimescale = ReadMdhdTimescale(mdia);
+        // Media header — small (~32 B).
+        byte[] mdhdBuf = ReadLeafBoxOrThrow(source, mdiaStart, mdiaEnd, "mdhd");
+        uint mediaTimescale = ReadMdhdTimescale(mdhdBuf);
 
-        // Edit list — most commonly a single non-empty edit with media_time>0 that shifts
-        // composition times so the displayed timeline starts at 0 (B-pyramid compensation).
-        // We support that common case; anything more elaborate falls back to no offset.
-        long editMediaTimeOffset = ReadElstMediaTimeOffset(trak, movieTimescale, mediaTimescale, stderr);
-
-        if (!TryFindChildBox(mdia, "minf", out int minfS, out int minfL))
+        if (!TryFindChildBoxStream(source, mdiaStart, mdiaEnd, "minf", out long minfStart, out long minfEnd))
             throw new InvalidDataException("MP4: no minf");
-        var minf = mdia.Slice(minfS, minfL);
-        if (!TryFindChildBox(minf, "stbl", out int stblS, out int stblL))
+        if (!TryFindChildBoxStream(source, minfStart, minfEnd, "stbl", out long stblStart, out long stblEnd))
             throw new InvalidDataException("MP4: no stbl");
-        var stbl = minf.Slice(stblS, stblL);
 
-        var (sps, pps, lengthSize) = ReadAvcConfigFromStbl(stbl);
+        byte[] stsdBuf = ReadLeafBoxOrThrow(source, stblStart, stblEnd, "stsd");
+        var (sps, pps, lengthSize) = ParseStsdAvcc(stsdBuf);
         if (sps.Count == 0 || pps.Count == 0)
             throw new InvalidDataException("MP4: avcC missing SPS or PPS");
 
-        // Read trex defaults for the video track (used by fragmented MP4).
-        var trex = ReadTrexForTrack(moov, videoTrackId);
+        // Read trex defaults for the video track (used by fragmented MP4). Lives in moov/mvex.
+        var trex = ReadTrexForTrackStream(source, moovPayloadStart, moovPayloadEnd, videoTrackId);
 
         var avcConfig = new List<NalUnit>(sps.Count + pps.Count);
         avcConfig.AddRange(sps);
@@ -165,11 +161,22 @@ public static class Mp4Reader
         List<Mp4Sample> samples;
 
         // Build samples from stbl as before — may be empty for fragmented (empty_moov) files.
-        var sampleOffsets = BuildSampleOffsetTable(stbl);
+        // Read each large table into its own byte[]; missing tables yield empty arrays.
+        byte[] stszBuf = ReadLeafBoxOrThrow(source, stblStart, stblEnd, "stsz");
+        byte[] stscBuf = ReadLeafBoxOrThrow(source, stblStart, stblEnd, "stsc");
+        bool hasCo64 = TryReadLeaf(source, stblStart, stblEnd, "co64", out byte[]? co64Buf);
+        byte[]? stcoBuf = null;
+        if (!hasCo64 && !TryReadLeaf(source, stblStart, stblEnd, "stco", out stcoBuf))
+            throw new InvalidDataException("MP4: no stco/co64");
+        byte[] sttsBuf = TryReadLeaf(source, stblStart, stblEnd, "stts", out var b) ? b : Array.Empty<byte>();
+        byte[] cttsBuf = TryReadLeaf(source, stblStart, stblEnd, "ctts", out b) ? b : Array.Empty<byte>();
+        byte[] stssBuf = TryReadLeaf(source, stblStart, stblEnd, "stss", out b) ? b : Array.Empty<byte>();
+
+        var sampleOffsets = BuildSampleOffsetTable(stszBuf, stscBuf, hasCo64 ? co64Buf! : stcoBuf!, isCo64: hasCo64);
         int sampleCount = sampleOffsets.Count;
-        uint[] sttsDeltas = ReadStts(stbl, sampleCount);
-        int[] cttsOffsets = ReadCtts(stbl, sampleCount);
-        bool[] isSync = ReadStss(stbl, sampleCount);
+        uint[] sttsDeltas = ReadStts(sttsBuf, sampleCount);
+        int[] cttsOffsets = ReadCtts(cttsBuf, sampleCount);
+        bool[] isSync = ReadStss(stssBuf, sampleCount, anyStss: stssBuf.Length > 0);
 
         samples = new List<Mp4Sample>(sampleCount);
         long cumulativeDt = 0;
@@ -210,12 +217,188 @@ public static class Mp4Reader
             (byte)(lengthSize - 1), source);
     }
 
+    // ---------- stream-based box walker ----------
+
+    /// <summary>Stream-walk a parent container box's children looking for the first match by
+    /// fourcc. On hit, returns the matched child's PAYLOAD range (header excluded), as file
+    /// positions. Walks every child via stream Read; never materializes the parent's bytes.</summary>
+    private static bool TryFindChildBoxStream(Stream stream, long parentStart, long parentEnd,
+        string fourcc, out long childPayloadStart, out long childPayloadEnd)
+    {
+        long p = parentStart;
+        Span<byte> hdr = stackalloc byte[16];
+        while (p + 8 <= parentEnd)
+        {
+            stream.Position = p;
+            if (ReadExact(stream, hdr[..8]) < 8) break;
+            uint sz32 = BinaryPrimitives.ReadUInt32BigEndian(hdr[..4]);
+            string ty = AsFourcc(hdr[4..8]);
+            long boxSize;
+            long payloadStart;
+            if (sz32 == 1)
+            {
+                if (ReadExact(stream, hdr[8..16]) < 8) break;
+                boxSize = (long)BinaryPrimitives.ReadUInt64BigEndian(hdr[8..16]);
+                payloadStart = p + 16;
+            }
+            else if (sz32 == 0)
+            {
+                boxSize = parentEnd - p;
+                payloadStart = p + 8;
+            }
+            else
+            {
+                boxSize = sz32;
+                payloadStart = p + 8;
+            }
+            if (boxSize < 8 || p + boxSize > parentEnd) break;
+            if (ty == fourcc)
+            {
+                childPayloadStart = payloadStart;
+                childPayloadEnd = p + boxSize;
+                return true;
+            }
+            p += boxSize;
+        }
+        childPayloadStart = 0; childPayloadEnd = 0;
+        return false;
+    }
+
+    /// <summary>Read the payload of a leaf box [<paramref name="payloadStart"/>, <paramref name="payloadEnd"/>)
+    /// from <paramref name="stream"/> into a freshly allocated byte[]. Throws if the leaf exceeds the
+    /// .NET byte[] size limit (~2 GiB); this is acceptable for stbl tables (~4 B per sample so ~500M
+    /// samples) but the only practical wall remaining.</summary>
+    private static byte[] ReadLeafPayload(Stream stream, long payloadStart, long payloadEnd)
+    {
+        long len = payloadEnd - payloadStart;
+        if (len < 0 || len > int.MaxValue)
+            throw new InvalidDataException($"MP4: leaf box payload too large to load ({len} bytes > 2 GiB)");
+        byte[] buf = new byte[(int)len];
+        stream.Position = payloadStart;
+        if (ReadExact(stream, buf) != buf.Length)
+            throw new InvalidDataException("MP4: truncated leaf box");
+        return buf;
+    }
+
+    /// <summary>Find leaf box by fourcc under a parent, return false if absent.</summary>
+    private static bool TryReadLeaf(Stream stream, long parentStart, long parentEnd,
+        string fourcc, out byte[] payload)
+    {
+        if (TryFindChildBoxStream(stream, parentStart, parentEnd, fourcc, out long ls, out long le))
+        {
+            payload = ReadLeafPayload(stream, ls, le);
+            return true;
+        }
+        payload = Array.Empty<byte>();
+        return false;
+    }
+
+    /// <summary>Required leaf — throws if absent.</summary>
+    private static byte[] ReadLeafBoxOrThrow(Stream stream, long parentStart, long parentEnd, string fourcc)
+    {
+        if (!TryFindChildBoxStream(stream, parentStart, parentEnd, fourcc, out long ls, out long le))
+            throw new InvalidDataException($"MP4: missing required box '{fourcc}'");
+        return ReadLeafPayload(stream, ls, le);
+    }
+
+    private static bool TryFindVideoTrakInStream(Stream stream, long moovStart, long moovEnd,
+        out long trakPayloadStart, out long trakPayloadEnd)
+    {
+        long p = moovStart;
+        Span<byte> hdr = stackalloc byte[16];
+        while (p + 8 <= moovEnd)
+        {
+            stream.Position = p;
+            if (ReadExact(stream, hdr[..8]) < 8) break;
+            uint sz32 = BinaryPrimitives.ReadUInt32BigEndian(hdr[..4]);
+            string ty = AsFourcc(hdr[4..8]);
+            long boxSize;
+            long payloadStart;
+            if (sz32 == 1)
+            {
+                if (ReadExact(stream, hdr[8..16]) < 8) break;
+                boxSize = (long)BinaryPrimitives.ReadUInt64BigEndian(hdr[8..16]);
+                payloadStart = p + 16;
+            }
+            else if (sz32 == 0) { boxSize = moovEnd - p; payloadStart = p + 8; }
+            else { boxSize = sz32; payloadStart = p + 8; }
+            if (boxSize < 8 || p + boxSize > moovEnd) break;
+            if (ty == "trak")
+            {
+                long trakS = payloadStart, trakE = p + boxSize;
+                if (IsVideoTrakStream(stream, trakS, trakE))
+                {
+                    trakPayloadStart = trakS;
+                    trakPayloadEnd = trakE;
+                    return true;
+                }
+            }
+            p += boxSize;
+        }
+        trakPayloadStart = 0; trakPayloadEnd = 0;
+        return false;
+    }
+
+    private static bool IsVideoTrakStream(Stream stream, long trakStart, long trakEnd)
+    {
+        if (!TryFindChildBoxStream(stream, trakStart, trakEnd, "mdia", out long mdiaS, out long mdiaE)) return false;
+        if (!TryFindChildBoxStream(stream, mdiaS, mdiaE, "hdlr", out long hdlrS, out long hdlrE)) return false;
+        byte[] hdlr = ReadLeafPayload(stream, hdlrS, hdlrE);
+        return hdlr.Length >= 12 && AsFourcc(hdlr.AsSpan(8, 4)) == "vide";
+    }
+
+    private static long ReadElstMediaTimeOffsetStream(Stream source, long trakStart, long trakEnd,
+        uint movieTimescale, TextWriter? stderr)
+    {
+        if (!TryFindChildBoxStream(source, trakStart, trakEnd, "edts", out long edtsS, out long edtsE)) return 0;
+        if (!TryReadLeaf(source, edtsS, edtsE, "elst", out byte[] elstBuf)) return 0;
+        return ReadElstMediaTimeOffset(elstBuf, movieTimescale, stderr);
+    }
+
+    private static TrexDefaults ReadTrexForTrackStream(Stream source, long moovStart, long moovEnd, uint trackId)
+    {
+        if (!TryFindChildBoxStream(source, moovStart, moovEnd, "mvex", out long mvexS, out long mvexE)) return default;
+        // Iterate trex children inside mvex.
+        long p = mvexS;
+        Span<byte> hdr = stackalloc byte[16];
+        while (p + 8 <= mvexE)
+        {
+            source.Position = p;
+            if (ReadExact(source, hdr[..8]) < 8) break;
+            uint sz32 = BinaryPrimitives.ReadUInt32BigEndian(hdr[..4]);
+            string ty = AsFourcc(hdr[4..8]);
+            long boxSize, payloadStart;
+            if (sz32 == 1)
+            {
+                if (ReadExact(source, hdr[8..16]) < 8) break;
+                boxSize = (long)BinaryPrimitives.ReadUInt64BigEndian(hdr[8..16]);
+                payloadStart = p + 16;
+            }
+            else if (sz32 == 0) { boxSize = mvexE - p; payloadStart = p + 8; }
+            else { boxSize = sz32; payloadStart = p + 8; }
+            if (boxSize < 8 || p + boxSize > mvexE) break;
+            if (ty == "trex" && boxSize - (payloadStart - p) >= 24)
+            {
+                byte[] trexBuf = ReadLeafPayload(source, payloadStart, p + boxSize);
+                uint tid = BinaryPrimitives.ReadUInt32BigEndian(trexBuf.AsSpan(4, 4));
+                if (tid == trackId)
+                {
+                    return new TrexDefaults(
+                        BinaryPrimitives.ReadUInt32BigEndian(trexBuf.AsSpan(8, 4)),
+                        BinaryPrimitives.ReadUInt32BigEndian(trexBuf.AsSpan(12, 4)),
+                        BinaryPrimitives.ReadUInt32BigEndian(trexBuf.AsSpan(16, 4)),
+                        BinaryPrimitives.ReadUInt32BigEndian(trexBuf.AsSpan(20, 4)));
+                }
+            }
+            p += boxSize;
+        }
+        return default;
+    }
+
     // ---------- timing atoms ----------
 
-    private static (uint timescale, ulong duration) ReadMvhd(ReadOnlySpan<byte> moov)
+    private static (uint timescale, ulong duration) ReadMvhd(ReadOnlySpan<byte> b)
     {
-        if (!TryFindChildBox(moov, "mvhd", out int s, out int l)) return (0, 0);
-        var b = moov.Slice(s, l);
         byte version = b[0];
         if (version == 1)
         {
@@ -231,16 +414,12 @@ public static class Mp4Reader
         }
     }
 
-    // ISO/IEC 14496-12 §8.6.6: edts/elst. Returns the media_time offset (in media-timescale units)
+    // ISO/IEC 14496-12 §8.6.6: elst. Returns the media_time offset (in media-timescale units)
     // to subtract from every sample's decode/composition time so the timeline starts at 0.
     // Empty edits (media_time == -1) are ignored. We support the common case of a single non-empty
     // edit with media_rate == 1.0; anything more elaborate emits a warning and returns 0.
-    private static long ReadElstMediaTimeOffset(ReadOnlySpan<byte> trak, uint movieTimescale, uint mediaTimescale, TextWriter? stderr)
+    private static long ReadElstMediaTimeOffset(ReadOnlySpan<byte> b, uint movieTimescale, TextWriter? stderr)
     {
-        if (!TryFindChildBox(trak, "edts", out int edtsS, out int edtsL)) return 0;
-        var edts = trak.Slice(edtsS, edtsL);
-        if (!TryFindChildBox(edts, "elst", out int elstS, out int elstL)) return 0;
-        var b = edts.Slice(elstS, elstL);
         if (b.Length < 8) return 0;
         byte version = b[0];
         int entryCount = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
@@ -285,19 +464,15 @@ public static class Mp4Reader
         return firstMediaTime;
     }
 
-    private static uint ReadMdhdTimescale(ReadOnlySpan<byte> mdia)
+    private static uint ReadMdhdTimescale(ReadOnlySpan<byte> b)
     {
-        if (!TryFindChildBox(mdia, "mdhd", out int s, out int l)) return 0;
-        var b = mdia.Slice(s, l);
         byte version = b[0];
         if (version == 1) return BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 8 + 8, 4));
         return BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4, 4));
     }
 
-    private static (int w, int h) ReadTkhdSize(ReadOnlySpan<byte> trak)
+    private static (int w, int h) ReadTkhdSize(ReadOnlySpan<byte> b)
     {
-        if (!TryFindChildBox(trak, "tkhd", out int s, out int l)) return (0, 0);
-        var b = trak.Slice(s, l);
         byte version = b[0];
         int offToWH = version == 1 ? (4 + 8 + 8 + 4 + 4 + 8 + 8 + 2 + 2 + 2 + 2 + 36) : (4 + 4 + 4 + 4 + 4 + 4 + 8 + 2 + 2 + 2 + 2 + 36);
         if (b.Length < offToWH + 8) return (0, 0);
@@ -307,21 +482,18 @@ public static class Mp4Reader
     }
 
     // tkhd track_ID lives right after version+flags(4) + creation/modification times.
-    private static uint ReadTkhdTrackId(ReadOnlySpan<byte> trak)
+    private static uint ReadTkhdTrackId(ReadOnlySpan<byte> b)
     {
-        if (!TryFindChildBox(trak, "tkhd", out int s, out int l)) return 0;
-        var b = trak.Slice(s, l);
         byte version = b[0];
         int off = version == 1 ? (4 + 8 + 8) : (4 + 4 + 4);
         if (b.Length < off + 4) return 0;
         return BinaryPrimitives.ReadUInt32BigEndian(b.Slice(off, 4));
     }
 
-    private static uint[] ReadStts(ReadOnlySpan<byte> stbl, int sampleCount)
+    private static uint[] ReadStts(ReadOnlySpan<byte> b, int sampleCount)
     {
         var deltas = new uint[sampleCount];
-        if (!TryFindChildBox(stbl, "stts", out int s, out int l)) return deltas;
-        var b = stbl.Slice(s, l);
+        if (b.Length < 8) return deltas;
         int entries = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         int idx = 0;
         for (int e = 0; e < entries && idx < sampleCount; e++)
@@ -333,11 +505,10 @@ public static class Mp4Reader
         return deltas;
     }
 
-    private static int[] ReadCtts(ReadOnlySpan<byte> stbl, int sampleCount)
+    private static int[] ReadCtts(ReadOnlySpan<byte> b, int sampleCount)
     {
         var offsets = new int[sampleCount];
-        if (!TryFindChildBox(stbl, "ctts", out int s, out int l)) return offsets;
-        var b = stbl.Slice(s, l);
+        if (b.Length < 8) return offsets;
         int entries = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         int idx = 0;
         for (int e = 0; e < entries && idx < sampleCount; e++)
@@ -349,15 +520,17 @@ public static class Mp4Reader
         return offsets;
     }
 
-    private static bool[] ReadStss(ReadOnlySpan<byte> stbl, int sampleCount)
+    /// <summary>Parse stss; when no stss is present, every sample is a sync sample. The
+    /// <paramref name="anyStss"/> flag distinguishes "absent" (everything sync) from "empty box".</summary>
+    private static bool[] ReadStss(ReadOnlySpan<byte> b, int sampleCount, bool anyStss)
     {
         var flags = new bool[sampleCount];
-        if (!TryFindChildBox(stbl, "stss", out int s, out int l))
+        if (!anyStss)
         {
             for (int i = 0; i < sampleCount; i++) flags[i] = true;
             return flags;
         }
-        var b = stbl.Slice(s, l);
+        if (b.Length < 8) return flags;
         int entries = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         for (int e = 0; e < entries; e++)
         {
@@ -416,12 +589,8 @@ public static class Mp4Reader
 
     // ---------- avcC ----------
 
-    private static (List<NalUnit> sps, List<NalUnit> pps, int lengthSize) ReadAvcConfigFromStbl(ReadOnlySpan<byte> stbl)
+    private static (List<NalUnit> sps, List<NalUnit> pps, int lengthSize) ParseStsdAvcc(ReadOnlySpan<byte> stsd)
     {
-        if (!TryFindChildBox(stbl, "stsd", out int stsdS, out int stsdL))
-            return (new(), new(), 4);
-        var stsd = stbl.Slice(stsdS, stsdL);
-
         int entries = BinaryPrimitives.ReadInt32BigEndian(stsd.Slice(4, 4));
         int p = 8;
         for (int e = 0; e < entries && p + 8 <= stsd.Length; e++)
@@ -473,18 +642,9 @@ public static class Mp4Reader
 
     // ---------- sample table ----------
 
-    private static List<(long Offset, int Size)> BuildSampleOffsetTable(ReadOnlySpan<byte> stbl)
+    private static List<(long Offset, int Size)> BuildSampleOffsetTable(
+        ReadOnlySpan<byte> stsz, ReadOnlySpan<byte> stsc, ReadOnlySpan<byte> stco, bool isCo64)
     {
-        if (!TryFindChildBox(stbl, "stsz", out int stszS, out int stszL)) throw new InvalidDataException("MP4: no stsz");
-        if (!TryFindChildBox(stbl, "stsc", out int stscS, out int stscL)) throw new InvalidDataException("MP4: no stsc");
-        bool isCo64 = TryFindChildBox(stbl, "co64", out int co64S, out int co64L);
-        bool isCo32 = TryFindChildBox(stbl, "stco", out int stcoS, out int stcoL);
-        if (!isCo64 && !isCo32) throw new InvalidDataException("MP4: no stco/co64");
-
-        var stsz = stbl.Slice(stszS, stszL);
-        var stsc = stbl.Slice(stscS, stscL);
-        var stco = isCo64 ? stbl.Slice(co64S, co64L) : stbl.Slice(stcoS, stcoL);
-
         int defaultSize = BinaryPrimitives.ReadInt32BigEndian(stsz.Slice(4, 4));
         int sampleCount = BinaryPrimitives.ReadInt32BigEndian(stsz.Slice(8, 4));
         int[] sampleSizes = new int[sampleCount];
