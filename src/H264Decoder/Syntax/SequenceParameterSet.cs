@@ -24,6 +24,9 @@ public sealed class SequenceParameterSet
     public required uint PicWidthInMbsMinus1 { get; init; }
     public required uint PicHeightInMapUnitsMinus1 { get; init; }
     public required bool FrameMbsOnlyFlag { get; init; }
+    /// <summary>Only present when <see cref="FrameMbsOnlyFlag"/> is false. When true, the bitstream
+    /// uses MBAFF (mb_adaptive_frame_field_flag = 1) — per-MB-pair frame/field coding.</summary>
+    public bool MbAdaptiveFrameFieldFlag { get; init; }
     public required bool Direct8x8InferenceFlag { get; init; }
 
     public required bool FrameCroppingFlag { get; init; }
@@ -120,9 +123,13 @@ public sealed class SequenceParameterSet
         uint picWidthInMbsMinus1 = ExpGolomb.ReadUe(ref r);
         uint picHeightInMapUnitsMinus1 = ExpGolomb.ReadUe(ref r);
         bool frameMbsOnly = r.ReadBit() == 1;
+        // mb_adaptive_frame_field_flag is only present when frame_mbs_only_flag == 0 (spec §7.3.2.1.1).
+        // Stage 1 of interlaced support: we parse the field but the decoder still rejects field
+        // pictures and MBAFF at decode dispatch with a clear, parameterized error.
+        bool mbAdaptiveFrameField = false;
         if (!frameMbsOnly)
         {
-            throw new NotSupportedException("SPS frame_mbs_only_flag=0 (interlaced) is not supported");
+            mbAdaptiveFrameField = r.ReadBit() == 1;
         }
         bool direct8x8 = r.ReadBit() == 1;
         bool cropFlag = r.ReadBit() == 1;
@@ -154,6 +161,7 @@ public sealed class SequenceParameterSet
             PicWidthInMbsMinus1 = picWidthInMbsMinus1,
             PicHeightInMapUnitsMinus1 = picHeightInMapUnitsMinus1,
             FrameMbsOnlyFlag = frameMbsOnly,
+            MbAdaptiveFrameFieldFlag = mbAdaptiveFrameField,
             Direct8x8InferenceFlag = direct8x8,
             FrameCroppingFlag = cropFlag,
             FrameCropLeftOffset = cropL,

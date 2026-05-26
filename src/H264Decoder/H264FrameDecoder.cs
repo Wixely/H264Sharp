@@ -116,6 +116,21 @@ public sealed class H264FrameDecoder
                     // Parse the full slice header. Cheap and re-used for both AU
                     // boundary detection (first_mb_in_slice) and the actual MB decode.
                     SliceHeader header = SliceHeader.Parse(n.Rbsp.Span, n, sps, pps);
+                    // Interlaced gate: parsing succeeds for frame_mbs_only_flag=0 streams
+                    // (so callers can introspect SPS/slice metadata), but actual decode of
+                    // field pictures and MBAFF is not yet implemented. Reject with a clear,
+                    // parameterized error that identifies which interlaced mode was detected.
+                    if (!sps.FrameMbsOnlyFlag)
+                    {
+                        if (sps.MbAdaptiveFrameFieldFlag)
+                            throw new NotSupportedException(
+                                "MBAFF (SPS mb_adaptive_frame_field_flag=1) decode not yet supported");
+                        if (header.FieldPicFlag)
+                            throw new NotSupportedException(
+                                $"PAFF field picture (slice field_pic_flag=1, bottom_field_flag={header.BottomFieldFlag}) decode not yet supported");
+                        throw new NotSupportedException(
+                            "PAFF frame picture (SPS frame_mbs_only_flag=0, slice field_pic_flag=0) decode not yet supported");
+                    }
                     // Access-unit boundary rule (spec §7.4.1.2, simplified): a slice
                     // with first_mb_in_slice == 0 starts a new coded picture; any
                     // other slice is a continuation of the current picture.
@@ -614,11 +629,18 @@ public sealed class H264FrameDecoder
         var sliceType = (SliceType)(sliceTypeRaw % 5);
         _ = ExpGolomb.ReadUe(ref r);                              // pic_parameter_set_id
         _ = r.ReadBits((int)sps.Log2MaxFrameNumMinus4 + 4);       // frame_num
+        // field_pic_flag / bottom_field_flag — only when frame_mbs_only_flag == 0.
+        bool fieldPicFlag = false;
+        if (!sps.FrameMbsOnlyFlag)
+        {
+            fieldPicFlag = r.ReadBit() == 1;
+            if (fieldPicFlag) _ = r.ReadBit();                    // bottom_field_flag
+        }
         if (idrPicFlag) _ = ExpGolomb.ReadUe(ref r);
         if (sps.PicOrderCntType == 0)
         {
             _ = r.ReadBits((int)sps.Log2MaxPicOrderCntLsbMinus4 + 4);
-            if (pps.BottomFieldPicOrderInFramePresentFlag) _ = ExpGolomb.ReadSe(ref r);
+            if (pps.BottomFieldPicOrderInFramePresentFlag && !fieldPicFlag) _ = ExpGolomb.ReadSe(ref r);
         }
         if (pps.RedundantPicCntPresentFlag) _ = ExpGolomb.ReadUe(ref r);
         uint effectiveNumRefL0 = pps.NumRefIdxL0DefaultActiveMinus1;

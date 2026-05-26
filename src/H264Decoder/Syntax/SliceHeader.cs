@@ -60,6 +60,14 @@ public sealed class SliceHeader
     public required uint PicOrderCntLsb { get; init; }
     public required int DeltaPicOrderCntBottom { get; init; }
 
+    /// <summary>Interlaced: when true, this coded picture represents a single field rather than
+    /// a complete frame (spec §7.3.3, parsed only when SPS.FrameMbsOnlyFlag == false). Stage 1
+    /// of interlaced support: parsed but decode dispatch rejects field_pic_flag == 1.</summary>
+    public bool FieldPicFlag { get; init; }
+    /// <summary>Interlaced: when <see cref="FieldPicFlag"/> is true, distinguishes the bottom
+    /// (true) from the top (false) field within a complementary pair.</summary>
+    public bool BottomFieldFlag { get; init; }
+
     // dec_ref_pic_marking — IDR variant only
     public required bool NoOutputOfPriorPicsFlag { get; init; }
     public required bool LongTermReferenceFlag { get; init; }
@@ -171,8 +179,18 @@ public sealed class SliceHeader
         int frameNumBits = (int)sps.Log2MaxFrameNumMinus4 + 4;
         uint frameNum = r.ReadBits(frameNumBits);
 
-        // separate_colour_plane_flag is 0 for Baseline (no colour_plane_id)
-        // frame_mbs_only_flag=1 so no field_pic_flag / bottom_field_flag
+        // separate_colour_plane_flag is 0 for our supported profiles.
+        // field_pic_flag / bottom_field_flag are present only when SPS.frame_mbs_only_flag == 0.
+        bool fieldPicFlag = false;
+        bool bottomFieldFlag = false;
+        if (!sps.FrameMbsOnlyFlag)
+        {
+            fieldPicFlag = r.ReadBit() == 1;
+            if (fieldPicFlag)
+            {
+                bottomFieldFlag = r.ReadBit() == 1;
+            }
+        }
 
         uint idrPicId = 0;
         if (idrPicFlag)
@@ -186,7 +204,9 @@ public sealed class SliceHeader
         {
             int lsbBits = (int)sps.Log2MaxPicOrderCntLsbMinus4 + 4;
             picOrderCntLsb = r.ReadBits(lsbBits);
-            if (pps.BottomFieldPicOrderInFramePresentFlag)
+            // Spec §7.3.3: delta_pic_order_cnt_bottom appears only for frame pictures
+            // (i.e., when !field_pic_flag).
+            if (pps.BottomFieldPicOrderInFramePresentFlag && !fieldPicFlag)
             {
                 deltaPicOrderCntBottom = ExpGolomb.ReadSe(ref r);
             }
@@ -331,6 +351,8 @@ public sealed class SliceHeader
             IdrPicId = idrPicId,
             PicOrderCntLsb = picOrderCntLsb,
             DeltaPicOrderCntBottom = deltaPicOrderCntBottom,
+            FieldPicFlag = fieldPicFlag,
+            BottomFieldFlag = bottomFieldFlag,
             NoOutputOfPriorPicsFlag = noOutputPriorPics,
             LongTermReferenceFlag = longTermRef,
             SliceQpDelta = sliceQpDelta,
