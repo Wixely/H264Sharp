@@ -187,30 +187,30 @@ public static class DeblockingFilter
     }
 
     // Chroma edges: 8x8 plane, 2x2 grid of 4x4 chroma blocks. bS derives from the *corresponding*
-    // luma block pair: chroma edge at (xC, yC) corresponds to luma edge at (2xC, 2yC). Each chroma
-    // 4-segment maps to one luma 4-segment (chroma has only 2 segments per edge, each covering 2
-    // luma segments — but since both luma segments share an MB they have a single bS).
+    // luma block pair: chroma edge at (xC, yC) corresponds to luma edge at (2xC, 2yC). Per spec
+    // §8.7.2.2 the bS used at chroma row 2k is the bS of the luma edge at luma row 2k — so within
+    // a single chroma 4-row segment the top two and bottom two rows draw bS from two *different*
+    // luma 4x4 block rows. With sub-MB partitions (e.g. B_8x8) those can disagree, so iterate per
+    // 2-row "half-segment" rather than once per full 4-row chroma segment.
     private static void FilterChromaVerticalEdge(byte[] plane, int stride, Macroblock mbQ, Macroblock? pSide, Macroblock qSide,
         int xC, int mbY0C, int qP, bool isMbEdge, int aOff, int bOff, int mbX0C)
     {
         (int alpha, int beta, int indexA) = GetAlphaBeta(qP, aOff, bOff);
         if (alpha == 0 && beta == 0) return;
-        // Two 4-row chroma segments. Each maps to luma block-row 0/1 and 2/3 respectively;
-        // bS is taken from the luma block at the top of each chroma segment.
-        for (int seg = 0; seg < 2; seg++)
+        int qBlkX = (xC / 4) * 2;          // luma x-block index (0 or 2)
+        int pBlkX = isMbEdge ? 2 : (qBlkX - 2);
+        // 4 half-segments of 2 chroma rows each, mapping to the 4 luma 4x4 block rows.
+        for (int halfSeg = 0; halfSeg < 4; halfSeg++)
         {
-            int qBlkX = (xC / 4) * 2;          // luma x-block index (0 or 2)
-            int qBlkY = seg * 2;
-            int pBlkX = isMbEdge ? 2 : (qBlkX - 2); // left neighbor's right-side luma column
+            int qBlkY = halfSeg;
             int pBlkY = qBlkY;
-            // Use the top luma block of this chroma segment to derive bS.
             int bS = DeriveBsLuma(pSide, qSide,
                                   isMbEdge ? 3 : pBlkX + 1, pBlkY,
                                   qBlkX, qBlkY, isMbEdge, vertical: true);
             if (bS == 0) continue;
-            for (int row = 0; row < 4; row++)
+            for (int row = 0; row < 2; row++)
             {
-                int y = mbY0C + seg * 4 + row;
+                int y = mbY0C + halfSeg * 2 + row;
                 int b = y * stride + mbX0C + xC;
                 FilterEdge1D(plane, p3: b - 4, p2: b - 3, p1: b - 2, p0: b - 1,
                                     q0: b, q1: b + 1, q2: b + 2, q3: b + 3,
@@ -224,19 +224,19 @@ public static class DeblockingFilter
     {
         (int alpha, int beta, int indexA) = GetAlphaBeta(qP, aOff, bOff);
         if (alpha == 0 && beta == 0) return;
-        for (int seg = 0; seg < 2; seg++)
+        int qBlkY = (yC / 4) * 2;
+        int pBlkY = isMbEdge ? 2 : (qBlkY - 2);
+        for (int halfSeg = 0; halfSeg < 4; halfSeg++)
         {
-            int qBlkY = (yC / 4) * 2;
-            int qBlkX = seg * 2;
-            int pBlkY = isMbEdge ? 2 : (qBlkY - 2);
+            int qBlkX = halfSeg;
             int pBlkX = qBlkX;
             int bS = DeriveBsLuma(pSide, qSide,
                                   pBlkX, isMbEdge ? 3 : pBlkY + 1,
                                   qBlkX, qBlkY, isMbEdge, vertical: false);
             if (bS == 0) continue;
-            for (int col = 0; col < 4; col++)
+            for (int col = 0; col < 2; col++)
             {
-                int x = mbX0C + seg * 4 + col;
+                int x = mbX0C + halfSeg * 2 + col;
                 int b = (mbY0C + yC) * stride + x;
                 FilterEdge1D(plane, p3: b - 4 * stride, p2: b - 3 * stride, p1: b - 2 * stride, p0: b - stride,
                                     q0: b, q1: b + stride, q2: b + 2 * stride, q3: b + 3 * stride,
