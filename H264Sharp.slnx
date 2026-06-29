@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/H264Sharp.Cli/H264Sharp.Cli.csproj" />
+    <Project Path="src/H264Sharp.Encoder/H264Sharp.Encoder.csproj" />
+    <Project Path="src/H264Sharp.Decoder/H264Sharp.Decoder.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/H264Sharp.Tests/H264Sharp.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/BinTrace/BinTrace.csproj" />
+  </Folder>
+</Solution>

@@ -5,11 +5,11 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <RootNamespace>H264Decoder.Tools.BinTrace</RootNamespace>
+    <RootNamespace>H264Sharp.Tools.BinTrace</RootNamespace>
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\H264Decoder\H264Decoder.csproj" />
+    <ProjectReference Include="..\..\src\H264Sharp.Decoder\H264Sharp.Decoder.csproj" />
   </ItemGroup>
 
 </Project>

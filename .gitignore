@@ -2,7 +2,7 @@ bin/
 obj/
 *.user
 .vs/
-tests/H264Decoder.Tests/Fixtures/Samples/
+tests/H264Sharp.Tests/Fixtures/Samples/
 *.yuv
 *.h264
 !tests/**/Samples/.gitkeep

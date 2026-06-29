@@ -1,6 +1,6 @@
 // One-shot generator. Reads reference/openh264_data_tables.cpp,
-// extracts CAVLC lookup arrays, and emits src/H264Decoder/Cavlc/CavlcTables.cs.
-// Not part of the H264Decoder solution. Run via: dotnet run --project tools/CavlcGen
+// extracts CAVLC lookup arrays, and emits src/H264Sharp.Decoder/Cavlc/CavlcTables.cs.
+// Not part of the H264Sharp.Decoder solution. Run via: dotnet run --project tools/CavlcGen
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -9,8 +9,8 @@ string here = AppContext.BaseDirectory;
 string repoRoot = Path.GetFullPath(Path.Combine(here, "..", "..", "..", "..", ".."));
 string src = Path.Combine(repoRoot, "tools", "CavlcGen", "reference", "openh264_data_tables.cpp");
 string cabacSrc = Path.Combine(repoRoot, "tools", "CavlcGen", "reference", "openh264_common_tables.cpp");
-string dst = Path.Combine(repoRoot, "src", "H264Decoder", "Cavlc", "CavlcTables.cs");
-string cabacDst = Path.Combine(repoRoot, "src", "H264Decoder", "Cabac", "CabacInitTable.cs");
+string dst = Path.Combine(repoRoot, "src", "H264Sharp.Decoder", "Cavlc", "CavlcTables.cs");
+string cabacDst = Path.Combine(repoRoot, "src", "H264Sharp.Decoder", "Cabac", "CabacInitTable.cs");
 if (!File.Exists(src))
 {
     Console.Error.WriteLine($"Reference file not found: {src}");
@@ -66,7 +66,7 @@ sb.AppendLine("// DAMAGES.");
 sb.AppendLine("// Re-generate with: dotnet run --project tools/CavlcGen");
 sb.AppendLine("// </auto-generated>");
 sb.AppendLine();
-sb.AppendLine("namespace H264Decoder.Cavlc;");
+sb.AppendLine("namespace H264Sharp.Decoder.Cavlc;");
 sb.AppendLine();
 sb.AppendLine("internal static class CavlcTables");
 sb.AppendLine("{");
@@ -132,7 +132,7 @@ static void EmitCabacInit(string src, string dstPath)
     sb2.AppendLine("// Re-generate with: dotnet run --project tools/CavlcGen");
     sb2.AppendLine("// </auto-generated>");
     sb2.AppendLine();
-    sb2.AppendLine("namespace H264Decoder.Cabac;");
+    sb2.AppendLine("namespace H264Sharp.Decoder.Cabac;");
     sb2.AppendLine();
     sb2.AppendLine("internal static class CabacInitTable");
     sb2.AppendLine("{");

@@ -7,7 +7,7 @@ to any reproduction of the table values in this repository.
 The original third-party source files are not compiled into the built artifacts
 of this project; they are present in the repository only as reference inputs to
 the table-generation tooling (`tools/CavlcGen`). The generated tables (e.g.,
-`src/H264Decoder/Cabac/CabacInitTable.cs`) include attribution headers pointing
+`src/H264Sharp.Decoder/Cabac/CabacInitTable.cs`) include attribution headers pointing
 back to the third-party origin.
 
 ---
@@ -19,7 +19,7 @@ back to the third-party origin.
 
 The following data tables in this project are derived from OpenH264:
 
-- `src/H264Decoder/Cabac/CabacInitTable.cs` — generated from OpenH264's
+- `src/H264Sharp.Decoder/Cabac/CabacInitTable.cs` — generated from OpenH264's
   `g_kiCabacGlobalContextIdx` table (CABAC context initialization values per
   ITU-T H.264 Tables 9-12 through 9-24).
 
@@ -68,7 +68,7 @@ development. They are not linked, statically or dynamically, into this
 project's compiled artifacts. License obligations of these tools therefore do
 not propagate to consumers of this project:
 
-- **ffmpeg** — used by the test suite (`tests/H264Decoder.Tests/Fixtures/`)
+- **ffmpeg** — used by the test suite (`tests/H264Sharp.Tests/Fixtures/`)
   to generate H.264 bitstream test fixtures and reference YUV outputs.
   Invoked as `ffmpeg.exe` via `System.Diagnostics.Process`.
 

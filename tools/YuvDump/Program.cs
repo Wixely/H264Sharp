@@ -1,5 +1,5 @@
-using H264Decoder;
-using H264Decoder.Picture;
+using H264Sharp.Decoder;
+using H264Sharp.Decoder.Picture;
 
 // Decode an MP4/AnnexB file and dump all (or selected) decoded frames as
 // concatenated planar YUV 4:2:0 (Y then U then V) cropped to display size.

@@ -1,0 +1,79 @@
+name: Release
+
+# Build standalone, self-contained native AOT binaries of the h264sharp CLI for
+# Linux and Windows, then publish them to a GitHub Release. Triggered by pushing
+# a version tag, e.g. `git tag v1.0.0 && git push origin v1.0.0`.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Publish ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            asset: h264sharp-linux-x64
+            artifact: h264sharp
+          - os: windows-latest
+            rid: win-x64
+            asset: h264sharp-win-x64.exe
+            artifact: h264sharp.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Install AOT prerequisites (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Run tests
+        run: dotnet test H264Sharp.slnx -c Release --verbosity normal
+
+      - name: Publish native AOT CLI
+        run: >
+          dotnet publish src/H264Sharp.Cli/H264Sharp.Cli.csproj
+          -c Release -r ${{ matrix.rid }} -o publish
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "publish/${{ matrix.artifact }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

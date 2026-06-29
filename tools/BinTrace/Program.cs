@@ -1,4 +1,4 @@
-using H264Decoder;
+using H264Sharp.Decoder;
 
 // Drives the decoder with CABAC bin tracing enabled.
 //
@@ -31,7 +31,7 @@ if (!File.Exists(inPath))
 
 Environment.SetEnvironmentVariable("H264_CABAC_TRACE", outPath);
 // Force re-init in case the static was touched.
-H264Decoder.Cabac.CabacTrace.EnsureInitialized();
+H264Sharp.Decoder.Cabac.CabacTrace.EnsureInitialized();
 
 byte[] data = File.ReadAllBytes(inPath);
 var decoder = new H264FrameDecoder();
@@ -39,14 +39,14 @@ try
 {
     var frames = decoder.DecodeAllFrames(data);
     int count = Math.Min(frames.Count, maxFrames);
-    Console.Error.WriteLine($"decoded {frames.Count} frame(s); wrote {H264Decoder.Cabac.CabacTrace.BinCount} bins to {outPath}");
+    Console.Error.WriteLine($"decoded {frames.Count} frame(s); wrote {H264Sharp.Decoder.Cabac.CabacTrace.BinCount} bins to {outPath}");
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"decode threw after {H264Decoder.Cabac.CabacTrace.BinCount} bins: {ex.GetType().Name}: {ex.Message}");
+    Console.Error.WriteLine($"decode threw after {H264Sharp.Decoder.Cabac.CabacTrace.BinCount} bins: {ex.GetType().Name}: {ex.Message}");
 }
 finally
 {
-    H264Decoder.Cabac.CabacTrace.Flush();
+    H264Sharp.Decoder.Cabac.CabacTrace.Flush();
 }
 return 0;
