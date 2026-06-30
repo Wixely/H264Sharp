@@ -179,21 +179,6 @@ dotnet publish src/H264Sharp.Cli/H264Sharp.Cli.csproj -c Release -r linux-x64   
 Native AOT publishing needs a platform toolchain: `clang` + `zlib1g-dev` on Linux, the
 Visual C++ build tools on Windows.
 
-## Releases
-
-Standalone binaries for Linux (`linux-x64`) and Windows (`win-x64`) are attached to each
-[GitHub Release](../../releases). To cut one, push a version tag:
-
-```sh
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-The [Release workflow](.github/workflows/release.yml) runs the test suite, publishes
-native AOT binaries for both platforms, and uploads them to the release. Every push and
-pull request is also built and tested on Linux and Windows by the
-[CI workflow](.github/workflows/ci.yml).
-
 ## Licensing
 
 This project is licensed under the [MIT License](LICENSE). See
