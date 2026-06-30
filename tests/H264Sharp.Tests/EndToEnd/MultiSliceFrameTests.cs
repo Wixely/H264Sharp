@@ -12,6 +12,7 @@ namespace H264Sharp.Tests.EndToEnd;
 /// boundaries). The decoder must recognize first_mb_in_slice == 0 as the start of a new
 /// access unit and treat the next slice as a continuation of the same DecodedPicture, not
 /// allocate a new picture and overwrite the partial MB array.</summary>
+[Trait("Category", "Ffmpeg")]
 public sealed class MultiSliceFrameTests
 {
     [Fact]

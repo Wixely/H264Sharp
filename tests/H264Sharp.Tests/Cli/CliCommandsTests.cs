@@ -6,6 +6,7 @@ using H264Sharp.Tests.Fixtures;
 using H264Sharp.Decoder;
 namespace H264Sharp.Tests.Cli;
 
+[Trait("Category", "Ffmpeg")]
 public class CliCommandsTests
 {
     [Theory]

@@ -40,7 +40,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
 
       - name: Run tests
-        run: dotnet test H264Sharp.slnx -c Release --verbosity normal
+        # ffmpeg-dependent tests are excluded (no ffmpeg binary on the runners).
+        run: dotnet test H264Sharp.slnx -c Release --verbosity normal --filter "Category!=Ffmpeg"
 
       - name: Publish native AOT CLI
         run: >

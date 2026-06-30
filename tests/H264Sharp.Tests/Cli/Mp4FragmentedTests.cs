@@ -5,6 +5,7 @@ using H264Sharp.Tests.Fixtures;
 namespace H264Sharp.Tests.Cli;
 
 /// <summary>End-to-end coverage for fragmented MP4 (moof/traf/trun) parsing.</summary>
+[Trait("Category", "Ffmpeg")]
 public class Mp4FragmentedTests
 {
     [Fact]

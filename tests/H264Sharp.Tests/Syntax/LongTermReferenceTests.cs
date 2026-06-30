@@ -10,6 +10,7 @@ namespace H264Sharp.Tests.Syntax;
 /// MMCO op parsing on the slice header, ref_pic_list_modification capture, DPB marking via
 /// <see cref="H264FrameDecoder"/>'s internal helpers, sliding-window pinning, and ref-list
 /// construction with mixed short/long-term entries.</summary>
+[Trait("Category", "Ffmpeg")]
 public sealed class LongTermReferenceTests
 {
     // -----------------------------------------------------------------

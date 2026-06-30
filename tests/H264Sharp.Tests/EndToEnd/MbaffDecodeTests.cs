@@ -8,6 +8,7 @@ namespace H264Sharp.Tests.EndToEnd;
 /// content, and for static intra-only material it consistently picks frame coding within MB
 /// pairs — so these clips exercise the MBAFF MB-pair iteration / address mapping without
 /// requiring field-coded MB support (which is Stage 3b).</summary>
+[Trait("Category", "Ffmpeg")]
 public sealed class MbaffDecodeTests
 {
     [Theory]

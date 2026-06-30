@@ -13,6 +13,7 @@ namespace H264Sharp.Tests.EndToEnd;
 /// and written to a structured report file. The test asserts only a coarse passage-rate
 /// threshold so failure damage is bounded — the report is the primary deliverable.
 /// </summary>
+[Trait("Category", "Ffmpeg")]
 public sealed class CorpusDecodeTests
 {
     /// <summary>One axis-tuple in the corpus.</summary>

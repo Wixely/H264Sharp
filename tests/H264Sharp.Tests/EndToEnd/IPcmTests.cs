@@ -10,6 +10,7 @@ namespace H264Sharp.Tests.EndToEnd;
 /// MB is I_PCM, paired with the SPS/PPS extracted from the existing 16x16 single-MB
 /// CAVLC fixture (Baseline) or CABAC fixture (Main).
 /// </summary>
+[Trait("Category", "Ffmpeg")]
 public sealed class IPcmTests
 {
     [Fact]

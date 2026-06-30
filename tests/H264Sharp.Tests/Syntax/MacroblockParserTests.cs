@@ -4,6 +4,7 @@ using H264Sharp.Tests.Fixtures;
 
 namespace H264Sharp.Tests.Syntax;
 
+[Trait("Category", "Ffmpeg")]
 public sealed class MacroblockParserTests
 {
     [Fact]

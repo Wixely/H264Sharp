@@ -4,6 +4,7 @@ using H264Sharp.Tests.Fixtures;
 using H264Sharp.Decoder;
 namespace H264Sharp.Tests.EndToEnd;
 
+[Trait("Category", "Ffmpeg")]
 public sealed class BFrameDecodeTests
 {
     [Fact]
