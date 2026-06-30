@@ -51,4 +51,5 @@ and pull request is also built and tested on Linux and Windows by the
 
 ## Licensing
 
-See [LICENSE-3RDPARTY.md](LICENSE-3RDPARTY.md) for third-party attributions.
+This project is licensed under the [MIT License](LICENSE). See
+[LICENSE-3RDPARTY.md](LICENSE-3RDPARTY.md) for third-party attributions.
