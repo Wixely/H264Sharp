@@ -136,8 +136,7 @@ byte[] withCabac = H264FrameEncoder.EncodeAnnexB(
 - Reference management incl. long-term references; multi-slice frames; in-loop deblocking.
 - Interlaced: partial MBAFF (frame-coded I-slice macroblock pairs); PAFF and full
   field decoding are not implemented.
-- Profiles parsed/reported: Baseline, Main, Extended, High, High10/4:2:2/4:4:4
-  (8-bit 4:2:0 decode path).
+- Profiles: Baseline, Main, Extended, and High — 8-bit 4:2:0 only.
 - Output: planar YUV 4:2:0, or RGB/PNG via the built-in PNG encoder (honoring VUI color info).
 
 **Encoder**
@@ -150,6 +149,45 @@ byte[] withCabac = H264FrameEncoder.EncodeAnnexB(
   quarter-pel motion estimation with configurable search range and λ-based mode decision.
 - B-frames: IPBP GOP (CAVLC). See `H264FrameEncoder.Options` for the full toggle list and
   the current limits of the CABAC/B-slice paths.
+
+## Limitations
+
+H264Sharp is a focused, readable implementation — several H.264 features that a
+full decoder/encoder would handle are intentionally out of scope. Encountering one of
+these on the **decode** side raises a `NotSupportedException` with a descriptive message
+(rather than silently producing wrong output).
+
+**Format / profile (decoder):**
+
+- 8-bit, 4:2:0 chroma only — other bit depths (`bit_depth != 8`) and chroma formats
+  (4:2:2 / 4:4:4 / monochrome) are rejected.
+- Profiles beyond Baseline / Main / Extended / High (e.g. High10, High 4:2:2/4:4:4).
+- Custom scaling lists (`seq`/`pic_scaling_matrix_present_flag`).
+- `pic_order_cnt_type = 1`.
+- Flexible Macroblock Ordering (FMO, `num_slice_groups_minus1 > 0`).
+- SI / SP slice types (I/P/B only).
+
+**Interlaced (decoder):**
+
+- PAFF field pictures and field-coded frame pictures are not decoded.
+- MBAFF is partial: only I-slice, CAVLC, frame-coded macroblock pairs. P/B-slice MBAFF,
+  CABAC MBAFF, and field-coded MB pairs are not supported.
+
+**Encoder:**
+
+- Fixed-QP only — there is no rate control / target-bitrate mode.
+- Outputs an Annex-B elementary stream only (no MP4/container muxing, no audio).
+- CABAC covers I- and P-slices; intra-in-P, Intra_4x4 under CABAC, and inter
+  `transform_8x8` are not implemented.
+- B-frames are CAVLC-only and limited to an IPBP GOP with a small set of B-MB modes
+  (no B_Direct / B_Skip / sub-MB partitions / intra-in-B); CABAC B-slices are restricted
+  to Intra_16x16 and the inter modes listed in `H264FrameEncoder.Options`.
+
+**General:**
+
+- Display-order output uses POC sorting rather than the full reference-picture
+  bumping process, so unusual open-GOP / reordering streams may order frames differently.
+- Decoding is not optimized for real-time throughput.
 
 ## Build & test
 
