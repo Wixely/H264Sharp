@@ -296,8 +296,12 @@ public sealed class LongTermReferenceTests
             H264FrameDecoder.ApplyDecRefPicMarking(p, MakeHeader((uint)i, idr: false, ltrFlag: false), dpb, sps, ref maxLt);
         }
 
+        // The long-term ref is pinned and survives sliding-window eviction.
         Assert.Contains(dpb, p => p.IsLongTerm && p.LongTermFrameIdx == 0);
-        Assert.Equal(2, dpb.Count(p => !p.IsLongTerm));
+        // §8.2.5.3: the cap counts short-term + long-term together (Max(max_num_ref_frames,1)=2).
+        // With one long-term ref pinned, only one short-term ref is retained (total = 2).
+        Assert.Equal(1, dpb.Count(p => !p.IsLongTerm));
+        Assert.Equal(2, dpb.Count);
     }
 
     [Fact]

@@ -57,14 +57,15 @@ internal static class CabacSliceB
         mb.CbpLuma = cbpLuma;
         mb.CbpChroma = cbpChroma;
 
-        // transform_size_8x8_flag for B-inter (spec §7.3.5.1).
-        // Eligible when (16x16 / 16x8 / 8x16 / B_Direct_16x16 partition shape) OR
-        // (B_8x8 with noSubMbPartSizeLessThan8x8Flag==true). B_Direct_16x16 (mbTypeCode 0)
-        // is explicitly included — OpenH264 IS_DIRECT branch, ref decode_slice.cpp:1194.
+        // transform_size_8x8_flag for B-inter (spec §7.3.5). Eligible when
+        // noSubMbPartSizeLessThan8x8Flag AND (mb_type != B_Direct_16x16 || direct_8x8_inference_flag).
+        // For B_Direct_16x16 (mbTypeCode 0) that reduces to direct_8x8_inference_flag; reading the
+        // bin without this gate when inference is off desyncs the arithmetic decoder.
         if (transform8x8ModeFlag && cbpLuma > 0)
         {
-            bool eligible = (mbTypeCode >= 0 && mbTypeCode <= 21)
-                            || (mbTypeCode == 22 && mb.NoSubMbPartSizeLessThan8x8Flag);
+            bool eligible = mbTypeCode == 0 ? direct8x8InferenceFlag
+                            : (mbTypeCode >= 1 && mbTypeCode <= 21)
+                              || (mbTypeCode == 22 && mb.NoSubMbPartSizeLessThan8x8Flag);
             if (eligible)
             {
                 int ctxA = (leftMb != null && leftMb.TransformSize8x8) ? 1 : 0;
@@ -329,7 +330,7 @@ internal static class CabacSliceB
         if (rawMb == 0)
         {
             // B_Direct_16x16: no syntax; derive via direct mode.
-            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
             return;
         }
 
@@ -357,7 +358,7 @@ internal static class CabacSliceB
             }
             mb.NoSubMbPartSizeLessThan8x8Flag = noLessThan;
             ParseB8x8RefAndMv(cabac, mb, subTypes, sliceHeader,
-                leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+                leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
             return;
         }
 
@@ -509,7 +510,8 @@ internal static class CabacSliceB
         CabacDecoder cabac, Macroblock mb, BSubMbType[] subTypes, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8InferenceFlag = true)
     {
         uint maxRefL0 = sliceHeader.NumRefIdxL0ActiveMinus1;
         uint maxRefL1 = sliceHeader.NumRefIdxL1ActiveMinus1;
@@ -545,6 +547,15 @@ internal static class CabacSliceB
                 int qx = (q & 1) * 2, qy = (q >> 1) * 2;
                 MacroblockParser.SetPredFlag(mb.PredFlagL1Block, qx, qy, 2, 2, 1);
             }
+        }
+
+        // Derive Direct sub-blocks FIRST so later explicit partitions see their motion in the
+        // MV predictor (spec §8.4.1). Direct uses only external neighbors and reads nothing from
+        // the CABAC engine, so this does not change bin consumption or context derivation.
+        for (int q = 0; q < 4; q++)
+        {
+            if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
+            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
         }
 
         // mvd_l0 per sub-partition.
@@ -610,12 +621,7 @@ internal static class CabacSliceB
                 MacroblockParser.SetPredFlag(mb.PredFlagL1Block, bx, by, bw, bh, 1);
             }
         }
-        // Direct sub-blocks: derive MVs via direct mode per 8x8 quadrant.
-        for (int q = 0; q < 4; q++)
-        {
-            if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
-            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
-        }
+        // (Direct sub-blocks were derived above, before the explicit partitions.)
 
         // Build BInterPartitions.
         for (int q = 0; q < 4; q++)

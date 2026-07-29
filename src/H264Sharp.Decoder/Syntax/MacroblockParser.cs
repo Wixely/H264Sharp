@@ -217,13 +217,15 @@ public static class MacroblockParser
         return true;
     }
 
-    private static bool BInterEligibleFor8x8Transform(int mb_initType, Macroblock mb)
+    private static bool BInterEligibleFor8x8Transform(int mb_initType, Macroblock mb, bool direct8x8InferenceFlag)
     {
-        // Spec §7.3.5.1: B_Direct_16x16 IS eligible (matches OpenH264 IS_DIRECT branch
-        // in decode_slice.cpp:1194). mb_type 0..21 always eligible; mb_type 22 (B_8x8)
-        // requires noSubMbPartSizeLessThan8x8Flag (set during sub_mb_type decoding).
+        // Spec §7.3.5: transform_size_8x8_flag is present when noSubMbPartSizeLessThan8x8Flag
+        // AND (mb_type != B_Direct_16x16 || direct_8x8_inference_flag). For B_Direct_16x16
+        // (mb_initType 0) that reduces to direct_8x8_inference_flag; reading the flag without
+        // this gate when inference is off desyncs the rest of the slice.
+        if (mb_initType == 0) return direct8x8InferenceFlag;
         if (mb_initType == 22) return mb.NoSubMbPartSizeLessThan8x8Flag;
-        return mb_initType >= 0 && mb_initType <= 21;
+        return mb_initType >= 1 && mb_initType <= 21;
     }
 
     private static int Mod52(int v)
@@ -835,7 +837,7 @@ public static class MacroblockParser
         // and CbpLuma>0. For simplicity we check info eligibility via mb_initType / partitions.
         if (pps.Transform8x8ModeFlag && mb.CbpLuma > 0)
         {
-            bool eligible = BInterEligibleFor8x8Transform(mb_initType, mb);
+            bool eligible = BInterEligibleFor8x8Transform(mb_initType, mb, direct8x8InferenceFlag);
             if (eligible)
             {
                 bool flag = reader.ReadBit() == 1;
@@ -871,7 +873,7 @@ public static class MacroblockParser
         if (rawMb == 0)
         {
             // B_Direct_16x16: no per-partition syntax. Derive MVs via direct mode.
-            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+            BDirectMode.ApplyDirect16x16(mb, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
             return;
         }
         if (rawMb == 22)
@@ -899,7 +901,7 @@ public static class MacroblockParser
             }
             mb.NoSubMbPartSizeLessThan8x8Flag = noLessThan;
             BParseB8x8RefAndMv(ref reader, mb, subTypes, sliceHeader,
-                leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+                leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
             return;
         }
         // mb_type 1..21: 1 or 2 partitions, each with a fixed direction.
@@ -1020,7 +1022,8 @@ public static class MacroblockParser
         ref BitReader reader, Macroblock mb, BSubMbType[] subTypes, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8InferenceFlag = true)
     {
         uint maxRefL0 = sliceHeader.NumRefIdxL0ActiveMinus1;
         uint maxRefL1 = sliceHeader.NumRefIdxL1ActiveMinus1;
@@ -1044,6 +1047,16 @@ public static class MacroblockParser
         {
             mb.RefIdxL08x8[q] = refL0[q] < 0 ? 0 : refL0[q];
             mb.RefIdxL18x8[q] = refL1[q] < 0 ? 0 : refL1[q];
+        }
+
+        // Derive Direct sub-blocks FIRST (spec §8.4.1: partitions are processed in mbPartIdx
+        // order, so a later explicit partition must see an earlier direct partition's motion in
+        // its median predictor). Direct derivation itself uses only the MB's external neighbors,
+        // so it does not depend on the explicit partitions parsed below.
+        for (int q = 0; q < 4; q++)
+        {
+            if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
+            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8InferenceFlag);
         }
 
         // mvd_l0 then mvd_l1 per sub-partition.
@@ -1103,12 +1116,7 @@ public static class MacroblockParser
                 SetPredFlag(mb.PredFlagL1Block, bx, by, bw, bh, 1);
             }
         }
-        // For Direct sub-blocks: derive MVs via direct mode per 8x8 quadrant.
-        for (int q = 0; q < 4; q++)
-        {
-            if (BSubMbTypeOps.Dir(subTypes[q]) != BPredDir.Direct) continue;
-            BDirectMode.ApplyDirect8x8(mb, q, sliceHeader, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
-        }
+        // (Direct sub-blocks were derived above, before the explicit partitions.)
 
         // Build BInterPartitions list reflecting sub-partition shapes (each carries direction).
         for (int q = 0; q < 4; q++)

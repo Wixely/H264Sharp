@@ -52,26 +52,41 @@ public sealed class AvccReaderTests
         Assert.Equal(fromAnnexB.V, fromAvcc.V);
     }
 
-    /// <summary>Convert an Annex-B byte stream to AVCC format with 4-byte big-endian length prefixes.</summary>
+    /// <summary>Convert an Annex-B byte stream to AVCC format with 4-byte big-endian length prefixes.
+    /// Per ISO/IEC 14496-15, AVCC payloads are complete NAL units (EBSP with emulation-prevention
+    /// bytes); only the start codes are replaced by length fields — so re-escape the RBSP.</summary>
     private static byte[] AnnexBToAvcc(byte[] annexB)
     {
         List<NalUnit> nals = AnnexBReader.SplitNalUnits(annexB);
-        // Reconstruct the (header + RBSP) bytes for each NAL.
-        // RBSP needs emulation-prevention bytes re-inserted for AVCC payload to be a
-        // valid NAL unit on the wire. But since AVCC is length-prefixed, *no* start
-        // code collisions can occur, so the AVCC payload IS just the raw header+RBSP
-        // without escape bytes (this is the entire point of AVCC).
         using var ms = new MemoryStream();
         foreach (var n in nals)
         {
             byte header = (byte)(((int)n.NalUnitType & 0x1F) | (n.NalRefIdc << 5));
-            int len = 1 + n.Rbsp.Length;
+            byte[] ebsp = InsertEmulationPreventionBytes(n.Rbsp.Span);
+            int len = 1 + ebsp.Length;
             ms.WriteByte((byte)((len >> 24) & 0xFF));
             ms.WriteByte((byte)((len >> 16) & 0xFF));
             ms.WriteByte((byte)((len >> 8) & 0xFF));
             ms.WriteByte((byte)(len & 0xFF));
             ms.WriteByte(header);
-            ms.Write(n.Rbsp.Span);
+            ms.Write(ebsp);
+        }
+        return ms.ToArray();
+    }
+
+    private static byte[] InsertEmulationPreventionBytes(ReadOnlySpan<byte> rbsp)
+    {
+        using var ms = new MemoryStream();
+        int zeros = 0;
+        foreach (byte b in rbsp)
+        {
+            if (zeros >= 2 && b <= 0x03)
+            {
+                ms.WriteByte(0x03);
+                zeros = 0;
+            }
+            ms.WriteByte(b);
+            zeros = (b == 0) ? zeros + 1 : 0;
         }
         return ms.ToArray();
     }

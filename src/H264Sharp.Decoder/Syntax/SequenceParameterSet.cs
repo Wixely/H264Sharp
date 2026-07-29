@@ -107,11 +107,21 @@ public sealed class SequenceParameterSet
         }
 
         uint log2MaxFrameNumMinus4 = ExpGolomb.ReadUe(ref r);
+        // Spec §7.4.2.1.1: range [0, 12]. Larger values would silently corrupt
+        // MaxFrameNum/MaxPicOrderCntLsb downstream via C# shift-count masking.
+        if (log2MaxFrameNumMinus4 > 12)
+        {
+            throw new InvalidDataException($"SPS log2_max_frame_num_minus4 {log2MaxFrameNumMinus4} out of range [0, 12]");
+        }
         uint picOrderCntType = ExpGolomb.ReadUe(ref r);
         uint log2MaxPicOrderCntLsbMinus4 = 0;
         if (picOrderCntType == 0)
         {
             log2MaxPicOrderCntLsbMinus4 = ExpGolomb.ReadUe(ref r);
+            if (log2MaxPicOrderCntLsbMinus4 > 12)
+            {
+                throw new InvalidDataException($"SPS log2_max_pic_order_cnt_lsb_minus4 {log2MaxPicOrderCntLsbMinus4} out of range [0, 12]");
+            }
         }
         else if (picOrderCntType == 1)
         {

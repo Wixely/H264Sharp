@@ -43,15 +43,21 @@ public sealed class H264FrameDecoder
             a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
     }
 
-    /// <summary>Detects Annex-B framing by looking for a leading zero byte (start code).</summary>
+    /// <summary>Detects Annex-B framing: a 3- or 4-byte start code at offset 0 followed by a
+    /// plausible NAL header (forbidden_zero_bit == 0, nal_unit_type in 1..23). The header check
+    /// disambiguates from AVCC, whose first bytes are a length prefix that can alias a start code
+    /// (e.g. a first NAL of 256-511 bytes begins 00 00 01 xx). On mismatch the caller uses AVCC.</summary>
     private static bool LooksLikeAnnexB(ReadOnlySpan<byte> bytes)
     {
-        for (int i = 0; i < Math.Min(4, bytes.Length); i++)
-        {
-            if (bytes[i] == 0) continue;
-            return bytes[i] == 1;
-        }
-        return false;
+        int scLen;
+        if (bytes.Length >= 3 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 1) scLen = 3;
+        else if (bytes.Length >= 4 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 1) scLen = 4;
+        else return false;
+        if (bytes.Length <= scLen) return false;
+        byte nalHeader = bytes[scLen];
+        if ((nalHeader & 0x80) != 0) return false; // forbidden_zero_bit must be 0
+        int nalType = nalHeader & 0x1F;
+        return nalType >= 1 && nalType <= 23;
     }
 
     public DecodedPicture DecodeFirstIFrame(List<NalUnit> nals) =>
@@ -72,6 +78,11 @@ public sealed class H264FrameDecoder
         public required int MbsPerRow { get; init; }
         public required int TotalMbs { get; init; }
         public required bool IsReference { get; init; }
+        /// <summary>The SPS/PPS active for this picture, captured when it began. Finalization
+        /// (deblocking) and marking must use these, not the decoder's current sps/pps variables,
+        /// which a parameter set re-sent before the next AU may already have replaced.</summary>
+        public required SequenceParameterSet Sps { get; init; }
+        public required PictureParameterSet Pps { get; init; }
     }
 
     public List<DecodedPicture> DecodeAllFrames(List<NalUnit> nals)
@@ -86,6 +97,12 @@ public sealed class H264FrameDecoder
         // POC type-0 running state (spec §8.2.1.1).
         int prevPicOrderCntMsb = 0;
         int prevPicOrderCntLsb = 0;
+        // POC type-2 running state (spec §8.2.1.3): FrameNumOffset accumulates across frame_num wraps.
+        int prevFrameNum = 0;
+        int prevFrameNumOffset = 0;
+        // Coded-video-sequence index: bumped at each IDR (and MMCO5). POC restarts per CVS,
+        // so output ordering must group by this before PicOrderCnt.
+        int cvsIndex = 0;
         // MaxLongTermFrameIdx (spec §8.2.5). -1 == "no long-term frame indices" (initial state
         // and after IDR with long_term_reference_flag=0). Raised by MMCO op 4 / IDR LT=1.
         int maxLongTermFrameIdx = -1;
@@ -116,6 +133,9 @@ public sealed class H264FrameDecoder
                     // Parse the full slice header. Cheap and re-used for both AU
                     // boundary detection (first_mb_in_slice) and the actual MB decode.
                     SliceHeader header = SliceHeader.Parse(n.Rbsp.Span, n, sps, pps);
+                    // Redundant coded pictures (§7.4.3) duplicate primary slice data at coarser
+                    // quality; decoding them would overwrite the correct primary output. Skip.
+                    if (header.RedundantPicCnt > 0) break;
                     // Interlaced gate: MBAFF I-slice CAVLC with all-frame-coded MB pairs is
                     // supported (Stage 3a). PAFF (field_pic_flag=1, or PAFF frame pictures) and
                     // MBAFF for P/B slices / CABAC / field-coded pairs are not yet implemented
@@ -139,6 +159,13 @@ public sealed class H264FrameDecoder
                             throw new NotSupportedException(
                                 "MBAFF CABAC decode not yet supported (only CAVLC in stage 3a)");
                     }
+                    // constrained_intra_pred_flag changes intra-prediction neighbor availability
+                    // in P/B slices (inter-coded neighbors become unavailable, §8.3.1.2.1). That
+                    // rule is not implemented; decoding anyway would produce silently wrong pixels.
+                    // I slices are unaffected (every MB is intra).
+                    if (pps.ConstrainedIntraPredFlag && header.SliceType != SliceType.I)
+                        throw new NotSupportedException(
+                            "PPS constrained_intra_pred_flag=1 not supported for P/B slices");
                     // Access-unit boundary rule (spec §7.4.1.2, simplified): a slice
                     // with first_mb_in_slice == 0 starts a new coded picture; any
                     // other slice is a continuation of the current picture.
@@ -146,19 +173,25 @@ public sealed class H264FrameDecoder
                     {
                         if (currentPicture is not null)
                         {
-                            FinalizePicture(currentPicture, pps, dpb, sps,
+                            FinalizePicture(currentPicture, dpb,
                                 ref maxLongTermFrameIdx, outputs, ref decodeOrderCounter);
                         }
                         if (n.NalUnitType == NalUnitType.SliceIdr)
                         {
-                            // IDR clears the DPB (per spec §8.2.5.1) and resets POC state.
+                            // IDR clears the DPB (per spec §8.2.5.1) and resets POC state, and
+                            // starts a new coded video sequence.
                             dpb.Clear();
                             prevPicOrderCntMsb = 0;
                             prevPicOrderCntLsb = 0;
+                            prevFrameNum = 0;
+                            prevFrameNumOffset = 0;
                             maxLongTermFrameIdx = -1;
+                            cvsIndex++;
                         }
                         currentPicture = BeginPicture(n, header, sps, pps, dpb,
-                            ref prevPicOrderCntMsb, ref prevPicOrderCntLsb);
+                            ref prevPicOrderCntMsb, ref prevPicOrderCntLsb,
+                            ref prevFrameNum, ref prevFrameNumOffset);
+                        currentPicture.Picture.CvsIndex = cvsIndex;
                     }
                     else
                     {
@@ -176,14 +209,21 @@ public sealed class H264FrameDecoder
         // Finalize the trailing picture so its slices are emitted.
         if (currentPicture is not null)
         {
-            FinalizePicture(currentPicture, pps!, dpb, sps!,
+            FinalizePicture(currentPicture, dpb,
                 ref maxLongTermFrameIdx, outputs, ref decodeOrderCounter);
         }
 
         if (outputs.Count == 0) throw new InvalidDataException("no slices in bitstream");
-        // Stage 1: sort by POC for display order. TODO: replace with proper §C.2.4 bumping
-        // process once B-frame decoding lands and we need real-time output.
-        outputs.Sort((a, b) => a.PicOrderCnt.CompareTo(b.PicOrderCnt));
+        // Display order: POC is only defined within a coded video sequence and restarts at each
+        // IDR, so group by CvsIndex first (keeping whole GOPs contiguous), then PicOrderCnt, then
+        // decode order to break POC ties deterministically. (Not the full §C.2.4 bumping process.)
+        outputs.Sort((a, b) =>
+        {
+            int c = a.CvsIndex.CompareTo(b.CvsIndex);
+            if (c != 0) return c;
+            c = a.PicOrderCnt.CompareTo(b.PicOrderCnt);
+            return c != 0 ? c : a.DecodeOrderIndex.CompareTo(b.DecodeOrderIndex);
+        });
         return outputs;
     }
 
@@ -194,7 +234,8 @@ public sealed class H264FrameDecoder
         NalUnit nal, SliceHeader header,
         SequenceParameterSet sps, PictureParameterSet pps,
         List<DecodedPicture> dpb,
-        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb)
+        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb,
+        ref int prevFrameNum, ref int prevFrameNumOffset)
     {
         bool isPSlice = header.SliceType == SliceType.P;
         bool isBSlice = header.SliceType == SliceType.B;
@@ -210,7 +251,8 @@ public sealed class H264FrameDecoder
         // Compute POC (spec §8.2.1) for this picture. Only the first slice in an AU
         // computes POC; continuation slices inherit it from the picture context.
         int picOrderCnt = ComputePicOrderCnt(header, sps,
-            ref prevPicOrderCntMsb, ref prevPicOrderCntLsb, nal.NalRefIdc != 0);
+            ref prevPicOrderCntMsb, ref prevPicOrderCntLsb,
+            ref prevFrameNum, ref prevFrameNumOffset, nal.NalRefIdc != 0);
 
         // Update PicNum / LongTermPicNum on each DPB entry relative to the current frame_num
         // (spec §8.2.4.1).
@@ -274,6 +316,10 @@ public sealed class H264FrameDecoder
             PicOrderCnt = picOrderCnt,
             MbsPerRow = mbsPerRow,
             Vui = sps.Vui,
+            // Record ref-list POCs so this picture, when later used as a temporal-direct colocated
+            // reference, can resolve refIdxCol -> referenced POC (§8.4.1.2.3).
+            RefListL0Pocs = refPicListL0.Count > 0 ? refPicListL0.Select(p => p.PicOrderCnt).ToArray() : null,
+            RefListL1Pocs = refPicListL1.Count > 0 ? refPicListL1.Select(p => p.PicOrderCnt).ToArray() : null,
         };
         return new PictureContext
         {
@@ -285,6 +331,8 @@ public sealed class H264FrameDecoder
             MbsPerRow = mbsPerRow,
             TotalMbs = totalMbs,
             IsReference = nal.NalRefIdc != 0,
+            Sps = sps,
+            Pps = pps,
         };
     }
 
@@ -294,11 +342,15 @@ public sealed class H264FrameDecoder
     /// push it into the DPB if it is a reference. Deblocking parameters come from
     /// the first slice's header — multi-slice frames in our subset share these.</summary>
     private void FinalizePicture(
-        PictureContext ctx, PictureParameterSet pps,
-        List<DecodedPicture> dpb, SequenceParameterSet sps,
+        PictureContext ctx,
+        List<DecodedPicture> dpb,
         ref int maxLongTermFrameIdx,
         List<DecodedPicture> outputs, ref int decodeOrderCounter)
     {
+        // Use the parameter sets captured when this picture began, not the decoder's current
+        // sps/pps — a set re-sent before the next access unit may already have replaced them.
+        SequenceParameterSet sps = ctx.Sps;
+        PictureParameterSet pps = ctx.Pps;
         SliceHeader header = ctx.FirstSliceHeader;
         if (header.DisableDeblockingFilterIdc != 1)
         {
@@ -351,12 +403,21 @@ public sealed class H264FrameDecoder
         if (isBSlice && !header.DirectSpatialMvPredFlag && refPicListL1.Count > 0)
         {
             int[] l0Pocs = new int[refPicListL0.Count];
-            for (int i = 0; i < refPicListL0.Count; i++) l0Pocs[i] = refPicListL0[i].PicOrderCnt;
+            bool[] l0Lt = new bool[refPicListL0.Count];
+            for (int i = 0; i < refPicListL0.Count; i++)
+            {
+                l0Pocs[i] = refPicListL0[i].PicOrderCnt;
+                l0Lt[i] = refPicListL0[i].IsLongTerm;
+            }
             tdCtx = new TemporalDirectContext
             {
                 CurrentPoc = picture.PicOrderCnt,
                 Pic1Poc = refPicListL1[0].PicOrderCnt,
                 L0Pocs = l0Pocs,
+                L0IsLongTerm = l0Lt,
+                // The colocated picture's own ref-list POCs, for refIdxCol -> POC resolution.
+                ColRefL0Pocs = refPicListL1[0].RefListL0Pocs,
+                ColRefL1Pocs = refPicListL1[0].RefListL1Pocs,
             };
         }
 
@@ -411,7 +472,7 @@ public sealed class H264FrameDecoder
                 else
                 {
                     Macroblock? colMb = GetColocatedMb(refPicListL1, addr);
-                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx, qpY);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMb, tdCtx, qpY, sps.Direct8x8InferenceFlag);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
@@ -522,7 +583,7 @@ public sealed class H264FrameDecoder
     /// to fill MVs; no residual. QpY inherits the running QP (see SkipPlaceholder).</summary>
     private static Macroblock BSkipPlaceholder(int addr, SliceHeader header,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
-        Macroblock? colocatedMb, TemporalDirectContext? tdCtx, int qpY)
+        Macroblock? colocatedMb, TemporalDirectContext? tdCtx, int qpY, bool direct8x8Inference)
     {
         var mb = new Macroblock
         {
@@ -533,7 +594,7 @@ public sealed class H264FrameDecoder
             IsBInter = true,
             QpY = qpY,
         };
-        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx);
+        BDirectMode.ApplyDirect16x16(mb, header, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, tdCtx, direct8x8Inference);
         return mb;
     }
 
@@ -608,7 +669,7 @@ public sealed class H264FrameDecoder
                 if (isBSlice)
                 {
                     Macroblock? colMbSkip = GetColocatedMb(refPicListL1, addr);
-                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip, tdCtx, qpY);
+                    Macroblock skipMb = BSkipPlaceholder(addr, header, leftMb, topMb, topRightMb, topLeftMb, colMbSkip, tdCtx, qpY, sps.Direct8x8InferenceFlag);
                     mbs[addr] = skipMb;
                     MacroblockReconstructor.Reconstruct(skipMb, picture, mbX, mbY,
                         pps.ChromaQpIndexOffset, leftMb, topMb, topRightMb, refPicListL0, refPicListL1, header.PredWeights,
@@ -778,12 +839,15 @@ public sealed class H264FrameDecoder
     /// reference pictures (NalRefIdc != 0).</summary>
     private static int ComputePicOrderCnt(
         SliceHeader header, SequenceParameterSet sps,
-        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb, bool isReference)
+        ref int prevPicOrderCntMsb, ref int prevPicOrderCntLsb,
+        ref int prevFrameNum, ref int prevFrameNumOffset, bool isReference)
     {
         if (header.IdrPicFlag)
         {
             prevPicOrderCntMsb = 0;
             prevPicOrderCntLsb = 0;
+            prevFrameNum = 0;
+            prevFrameNumOffset = 0;
             return 0;
         }
 
@@ -817,8 +881,16 @@ public sealed class H264FrameDecoder
             return picOrderCnt;
         }
 
-        // pic_order_cnt_type == 2: decode-order = display-order. Use frame_num*2 as POC.
-        return (int)header.FrameNum * 2;
+        // pic_order_cnt_type == 2 (spec §8.2.1.3): decode order == display order. FrameNumOffset
+        // accumulates MaxFrameNum on each frame_num wrap so POC keeps increasing past the wrap;
+        // non-reference pictures subtract 1 so they sort before the same-frame_num ref picture.
+        int maxFrameNum = 1 << ((int)sps.Log2MaxFrameNumMinus4 + 4);
+        int frameNum = (int)header.FrameNum;
+        int frameNumOffset = prevFrameNum > frameNum ? prevFrameNumOffset + maxFrameNum : prevFrameNumOffset;
+        int tempPoc = 2 * (frameNumOffset + frameNum) - (isReference ? 0 : 1);
+        prevFrameNum = frameNum;
+        prevFrameNumOffset = frameNumOffset;
+        return tempPoc;
     }
 
     /// <summary>Walk past a pred_weight_table to keep subsequent slice-header fields aligned
@@ -863,11 +935,18 @@ public sealed class H264FrameDecoder
         var past = shortTerm.Where(p => p.PicOrderCnt < currentPoc).OrderByDescending(p => p.PicOrderCnt);
         var future = shortTerm.Where(p => p.PicOrderCnt > currentPoc).OrderBy(p => p.PicOrderCnt);
         var l0 = past.Concat(future).Concat(longTerm).ToList();
-        if (l0.Count > numActiveL0) l0 = l0.Take(numActiveL0).ToList();
         // L1: future (ascending) + past (descending) + long-term.
         var fut1 = shortTerm.Where(p => p.PicOrderCnt > currentPoc).OrderBy(p => p.PicOrderCnt);
         var past1 = shortTerm.Where(p => p.PicOrderCnt < currentPoc).OrderByDescending(p => p.PicOrderCnt);
         var l1 = fut1.Concat(past1).Concat(longTerm).ToList();
+        // §8.2.4.2.3: when L1 has >1 entry and is identical to L0 (e.g. no future refs — low-delay
+        // B, post-scene-cut, or LT-only), swap L1[0] and L1[1]. Must precede truncation so it
+        // survives numActiveL1 == 1, and it fixes the colocated picture (L1[0]) for B_Direct.
+        if (l1.Count > 1 && l0.SequenceEqual(l1))
+        {
+            (l1[0], l1[1]) = (l1[1], l1[0]);
+        }
+        if (l0.Count > numActiveL0) l0 = l0.Take(numActiveL0).ToList();
         if (l1.Count > numActiveL1) l1 = l1.Take(numActiveL1).ToList();
         return (l0, l1);
     }
@@ -937,16 +1016,26 @@ public sealed class H264FrameDecoder
         if (refList.Count > numActive) refList.RemoveRange(numActive, refList.Count - numActive);
     }
 
-    /// <summary>Insert <paramref name="pic"/> at <paramref name="index"/> in <paramref name="list"/>.
-    /// Any existing occurrence of pic elsewhere in the list is removed first (so it isn't
-    /// duplicated). Per spec §8.2.4.3.1 / §8.2.4.3.2, after insertion the list is implicitly
-    /// truncated to numActive at the call site.</summary>
+    /// <summary>Insert <paramref name="pic"/> at <paramref name="index"/> per spec §8.2.4.3.1 /
+    /// §8.2.4.3.2: shift entries at/after <paramref name="index"/> right, place pic at index, then
+    /// remove any duplicate of pic that now sits AFTER the insertion point. Occurrences BEFORE the
+    /// insertion point are left intact — the same picture legitimately appears twice (e.g. x264
+    /// weightp fades reference one picture at two list positions with different weights). The list
+    /// is truncated to numActive at the call site.</summary>
+    /// <summary>FrameNumWrap (spec §8.2.4.1): a short-term ref's FrameNum mapped to a signed value
+    /// relative to the current picture (negative when it was coded before a frame_num wraparound).</summary>
+    private static int FrameNumWrap(int frameNum, int curFrameNum, int maxFrameNum) =>
+        frameNum > curFrameNum ? frameNum - maxFrameNum : frameNum;
+
     private static void InsertAtIndex(List<DecodedPicture> list, DecodedPicture pic, int index, int numActive)
     {
-        int existing = list.IndexOf(pic);
-        if (existing >= 0) list.RemoveAt(existing);
         if (index > list.Count) index = list.Count;
         list.Insert(index, pic);
+        // Remove the (at most one) later duplicate that the shift pushed down.
+        for (int i = index + 1; i < list.Count; i++)
+        {
+            if (ReferenceEquals(list[i], pic)) { list.RemoveAt(i); break; }
+        }
     }
 
     /// <summary>Apply dec_ref_pic_marking + sliding-window after decoding a ref slice (spec §8.2.5).
@@ -980,7 +1069,10 @@ public sealed class H264FrameDecoder
             return;
         }
 
-        if (header.AdaptiveRefPicMarkingMode && header.MmcoOps.Length > 0)
+        // §8.2.5.1: the marking process is selected by adaptive_ref_pic_marking_mode_flag alone.
+        // With the flag set but an empty MMCO list (immediate op 0), no sliding-window eviction
+        // happens — the encoder keeps all existing refs. Branch on the flag, not the op count.
+        if (header.AdaptiveRefPicMarkingMode)
         {
             // Apply MMCO ops (spec §8.2.5.4). Some ops affect existing DPB entries; op 6 marks
             // the current picture as long-term and replaces sliding-window for this slice.
@@ -995,11 +1087,10 @@ public sealed class H264FrameDecoder
                 {
                     case 1:
                     {
-                        // Mark short-term ref as unused (§8.2.5.4.1).
-                        int picNum = curPicNum - (int)(op.DifferenceOfPicNumsMinus1 + 1);
-                        if (picNum < 0) picNum += maxFrameNum;
-                        int picNumNoWrap = picNum > curPicNum ? picNum - maxFrameNum : picNum;
-                        int idx = dpb.FindIndex(p => !p.IsLongTerm && p.FrameNum == picNumNoWrap);
+                        // Mark short-term ref as unused (§8.2.5.4.1). Match on FrameNumWrap, not the
+                        // raw FrameNum: picNumX is negative for refs coded before a frame_num wrap.
+                        int picNumX = curPicNum - (int)(op.DifferenceOfPicNumsMinus1 + 1);
+                        int idx = dpb.FindIndex(p => !p.IsLongTerm && FrameNumWrap(p.FrameNum, curPicNum, maxFrameNum) == picNumX);
                         if (idx >= 0) dpb.RemoveAt(idx);
                         break;
                     }
@@ -1014,14 +1105,12 @@ public sealed class H264FrameDecoder
                     case 3:
                     {
                         // Mark a short-term ref as long-term (§8.2.5.4.3). Any existing long-term
-                        // with the same idx is first marked unused.
-                        int picNum = curPicNum - (int)(op.DifferenceOfPicNumsMinus1 + 1);
-                        if (picNum < 0) picNum += maxFrameNum;
-                        int picNumNoWrap = picNum > curPicNum ? picNum - maxFrameNum : picNum;
+                        // with the same idx is first marked unused. Match on FrameNumWrap (see op 1).
+                        int picNumX = curPicNum - (int)(op.DifferenceOfPicNumsMinus1 + 1);
                         int ltIdx = (int)op.LongTermFrameIdx;
                         int existing = dpb.FindIndex(p => p.IsLongTerm && p.LongTermFrameIdx == ltIdx);
                         if (existing >= 0) dpb.RemoveAt(existing);
-                        var st = dpb.FirstOrDefault(p => !p.IsLongTerm && p.FrameNum == picNumNoWrap);
+                        var st = dpb.FirstOrDefault(p => !p.IsLongTerm && FrameNumWrap(p.FrameNum, curPicNum, maxFrameNum) == picNumX);
                         if (st is not null)
                         {
                             st.IsLongTerm = true;
@@ -1084,17 +1173,20 @@ public sealed class H264FrameDecoder
             return;
         }
 
-        // No adaptive marking: sliding window (§8.2.5.3) — count short-term entries only,
-        // evict the oldest short-term when the cap is exceeded. Long-term entries are pinned.
+        // No adaptive marking: sliding window (§8.2.5.3). The cap applies to the TOTAL of short-
+        // and long-term entries (Max(max_num_ref_frames, 1)); only short-term refs are evicted,
+        // oldest first (smallest FrameNumWrap == last in dpb, since newest is inserted at front).
         dpb.Insert(0, pic);
         int maxRefs = (int)Math.Max(1u, sps.MaxNumRefFrames);
-        while (dpb.Count(p => !p.IsLongTerm) > maxRefs)
+        while (dpb.Count > maxRefs)
         {
-            // Remove the oldest short-term ref (last short-term in dpb, since newest first).
+            int victim = -1;
             for (int i = dpb.Count - 1; i >= 0; i--)
             {
-                if (!dpb[i].IsLongTerm) { dpb.RemoveAt(i); break; }
+                if (!dpb[i].IsLongTerm) { victim = i; break; }
             }
+            if (victim < 0) break; // only long-term refs remain — nothing to evict (avoid infinite loop)
+            dpb.RemoveAt(victim);
         }
     }
 }

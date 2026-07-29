@@ -96,7 +96,8 @@ public static class Mp4Reader
                 payloadStart = pos + 8;
             }
 
-            if (boxSize < 8 || pos + boxSize > fileLength) break;
+            // Subtraction form: `pos + boxSize` can wrap negative for hostile 64-bit sizes.
+            if (boxSize < (sz32 == 1 ? 16 : 8) || boxSize > fileLength - pos) break;
 
             if (ty == "moov" && moovPayloadStart < 0)
             {
@@ -172,7 +173,8 @@ public static class Mp4Reader
         byte[] cttsBuf = TryReadLeaf(source, stblStart, stblEnd, "ctts", out b) ? b : Array.Empty<byte>();
         byte[] stssBuf = TryReadLeaf(source, stblStart, stblEnd, "stss", out b) ? b : Array.Empty<byte>();
 
-        var sampleOffsets = BuildSampleOffsetTable(stszBuf, stscBuf, hasCo64 ? co64Buf! : stcoBuf!, isCo64: hasCo64);
+        var sampleOffsets = BuildSampleOffsetTable(stszBuf, stscBuf, hasCo64 ? co64Buf! : stcoBuf!, isCo64: hasCo64,
+            fileLength: source.Length);
         int sampleCount = sampleOffsets.Count;
         uint[] sttsDeltas = ReadStts(sttsBuf, sampleCount);
         int[] cttsOffsets = ReadCtts(cttsBuf, sampleCount);
@@ -189,13 +191,16 @@ public static class Mp4Reader
             cumulativeDt += sttsDeltas[i];
         }
 
-        // If fragments exist, prefer them. Some files have a placeholder stbl (sample_count=0)
-        // plus real samples across moof/mdat pairs — others have a small stbl init alongside
-        // real fragment data. In both cases the fragmented data is authoritative.
+        // Movie fragments EXTEND the presentation defined by moov (ISO 14496-12 §8.8.1).
+        // The common case is a placeholder stbl (sample_count=0) with all samples in
+        // moof/mdat pairs, but a hybrid file may carry leading samples in stbl too —
+        // append rather than replace. Fragment decode time continues from the stbl tail
+        // (tfdt, when present, overrides it anyway).
         if (moofRegions.Count > 0)
         {
-            var fragSamples = ParseFragments(source, moofRegions, videoTrackId, trex, lengthSize, tsInv, editMediaTimeOffset);
-            if (fragSamples.Count > 0) samples = fragSamples;
+            var fragSamples = ParseFragments(source, moofRegions, videoTrackId, trex, lengthSize, tsInv,
+                editMediaTimeOffset, initialDt: cumulativeDt);
+            samples.AddRange(fragSamples);
         }
 
         double durationSec = movieTimescale > 0 ? (double)movieDuration / movieTimescale : 0.0;
@@ -251,7 +256,7 @@ public static class Mp4Reader
                 boxSize = sz32;
                 payloadStart = p + 8;
             }
-            if (boxSize < 8 || p + boxSize > parentEnd) break;
+            if (boxSize < (sz32 == 1 ? 16 : 8) || boxSize > parentEnd - p) break;
             if (ty == fourcc)
             {
                 childPayloadStart = payloadStart;
@@ -322,7 +327,7 @@ public static class Mp4Reader
             }
             else if (sz32 == 0) { boxSize = moovEnd - p; payloadStart = p + 8; }
             else { boxSize = sz32; payloadStart = p + 8; }
-            if (boxSize < 8 || p + boxSize > moovEnd) break;
+            if (boxSize < (sz32 == 1 ? 16 : 8) || boxSize > moovEnd - p) break;
             if (ty == "trak")
             {
                 long trakS = payloadStart, trakE = p + boxSize;
@@ -376,7 +381,7 @@ public static class Mp4Reader
             }
             else if (sz32 == 0) { boxSize = mvexE - p; payloadStart = p + 8; }
             else { boxSize = sz32; payloadStart = p + 8; }
-            if (boxSize < 8 || p + boxSize > mvexE) break;
+            if (boxSize < (sz32 == 1 ? 16 : 8) || boxSize > mvexE - p) break;
             if (ty == "trex" && boxSize - (payloadStart - p) >= 24)
             {
                 byte[] trexBuf = ReadLeafPayload(source, payloadStart, p + boxSize);
@@ -399,18 +404,21 @@ public static class Mp4Reader
 
     private static (uint timescale, ulong duration) ReadMvhd(ReadOnlySpan<byte> b)
     {
+        if (b.Length < 20) return (0u, 0ul);
         byte version = b[0];
         if (version == 1)
         {
+            if (b.Length < 32) return (0u, 0ul);
             uint ts = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 8 + 8, 4));
             ulong dur = BinaryPrimitives.ReadUInt64BigEndian(b.Slice(4 + 8 + 8 + 4, 8));
-            return (ts, dur);
+            // All-ones is the spec's "duration unknown" sentinel.
+            return (ts, dur == ulong.MaxValue ? 0ul : dur);
         }
         else
         {
             uint ts = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4, 4));
             uint dur = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4 + 4, 4));
-            return (ts, dur);
+            return (ts, dur == uint.MaxValue ? 0ul : dur);
         }
     }
 
@@ -425,7 +433,7 @@ public static class Mp4Reader
         int entryCount = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         if (entryCount <= 0) return 0;
         int entrySize = version == 1 ? 20 : 12;
-        if (b.Length < 8 + entryCount * entrySize) return 0;
+        if ((long)b.Length < 8 + (long)entryCount * entrySize) return 0;
 
         // Find the first non-empty entry (media_time != -1).
         long firstMediaTime = -1;
@@ -466,13 +474,15 @@ public static class Mp4Reader
 
     private static uint ReadMdhdTimescale(ReadOnlySpan<byte> b)
     {
+        if (b.Length < 16) return 0;
         byte version = b[0];
-        if (version == 1) return BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 8 + 8, 4));
+        if (version == 1) return b.Length >= 24 ? BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 8 + 8, 4)) : 0;
         return BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4 + 4 + 4, 4));
     }
 
     private static (int w, int h) ReadTkhdSize(ReadOnlySpan<byte> b)
     {
+        if (b.Length < 1) return (0, 0);
         byte version = b[0];
         int offToWH = version == 1 ? (4 + 8 + 8 + 4 + 4 + 8 + 8 + 2 + 2 + 2 + 2 + 36) : (4 + 4 + 4 + 4 + 4 + 4 + 8 + 2 + 2 + 2 + 2 + 36);
         if (b.Length < offToWH + 8) return (0, 0);
@@ -484,6 +494,7 @@ public static class Mp4Reader
     // tkhd track_ID lives right after version+flags(4) + creation/modification times.
     private static uint ReadTkhdTrackId(ReadOnlySpan<byte> b)
     {
+        if (b.Length < 1) return 0;
         byte version = b[0];
         int off = version == 1 ? (4 + 8 + 8) : (4 + 4 + 4);
         if (b.Length < off + 4) return 0;
@@ -498,6 +509,7 @@ public static class Mp4Reader
         int idx = 0;
         for (int e = 0; e < entries && idx < sampleCount; e++)
         {
+            if (8 + e * 8 + 8 > b.Length) break;
             int count = BinaryPrimitives.ReadInt32BigEndian(b.Slice(8 + e * 8, 4));
             uint delta = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(8 + e * 8 + 4, 4));
             for (int k = 0; k < count && idx < sampleCount; k++) deltas[idx++] = delta;
@@ -509,12 +521,17 @@ public static class Mp4Reader
     {
         var offsets = new int[sampleCount];
         if (b.Length < 8) return offsets;
+        // Version 0 offsets are unsigned; version 1 signed (ISO 14496-12 §8.6.1.3).
+        byte version = b[0];
         int entries = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         int idx = 0;
         for (int e = 0; e < entries && idx < sampleCount; e++)
         {
+            if (8 + e * 8 + 8 > b.Length) break;
             int count = BinaryPrimitives.ReadInt32BigEndian(b.Slice(8 + e * 8, 4));
-            int off = BinaryPrimitives.ReadInt32BigEndian(b.Slice(8 + e * 8 + 4, 4));
+            int off = version == 0
+                ? (int)Math.Min(BinaryPrimitives.ReadUInt32BigEndian(b.Slice(8 + e * 8 + 4, 4)), int.MaxValue)
+                : BinaryPrimitives.ReadInt32BigEndian(b.Slice(8 + e * 8 + 4, 4));
             for (int k = 0; k < count && idx < sampleCount; k++) offsets[idx++] = off;
         }
         return offsets;
@@ -534,6 +551,7 @@ public static class Mp4Reader
         int entries = BinaryPrimitives.ReadInt32BigEndian(b.Slice(4, 4));
         for (int e = 0; e < entries; e++)
         {
+            if (8 + e * 4 + 4 > b.Length) break;
             int oneBased = BinaryPrimitives.ReadInt32BigEndian(b.Slice(8 + e * 4, 4));
             int zeroBased = oneBased - 1;
             if ((uint)zeroBased < (uint)sampleCount) flags[zeroBased] = true;
@@ -548,11 +566,25 @@ public static class Mp4Reader
         int p = 0;
         while (p + 8 <= parent.Length)
         {
-            int sz = BinaryPrimitives.ReadInt32BigEndian(parent.Slice(p, 4));
+            long sz = BinaryPrimitives.ReadUInt32BigEndian(parent.Slice(p, 4));
             string ty = AsFourcc(parent.Slice(p + 4, 4));
-            if (sz < 8 || p + sz > parent.Length) break;
-            if (ty == fourcc) { dataStart = p + 8; dataLen = sz - 8; return true; }
-            p += sz;
+            int headerLen = 8;
+            if (sz == 1)
+            {
+                // 64-bit largesize; the sibling must still fit the int-sized parent buffer.
+                if (p + 16 > parent.Length) break;
+                ulong sz64 = BinaryPrimitives.ReadUInt64BigEndian(parent.Slice(p + 8, 8));
+                if (sz64 > (ulong)parent.Length) break;
+                sz = (long)sz64;
+                headerLen = 16;
+            }
+            else if (sz == 0)
+            {
+                sz = parent.Length - p; // box extends to end of parent
+            }
+            if (sz < headerLen || sz > parent.Length - p) break;
+            if (ty == fourcc) { dataStart = p + headerLen; dataLen = (int)sz - headerLen; return true; }
+            p += (int)sz;
         }
         dataStart = 0; dataLen = 0; return false;
     }
@@ -591,6 +623,7 @@ public static class Mp4Reader
 
     private static (List<NalUnit> sps, List<NalUnit> pps, int lengthSize) ParseStsdAvcc(ReadOnlySpan<byte> stsd)
     {
+        if (stsd.Length < 8) return (new(), new(), 4);
         int entries = BinaryPrimitives.ReadInt32BigEndian(stsd.Slice(4, 4));
         int p = 8;
         for (int e = 0; e < entries && p + 8 <= stsd.Length; e++)
@@ -623,17 +656,22 @@ public static class Mp4Reader
         var sps = new List<NalUnit>();
         for (int i = 0; i < numSps; i++)
         {
+            if (o + 2 > avcc.Length) throw new InvalidDataException("MP4: truncated avcC (SPS length)");
             int len = BinaryPrimitives.ReadUInt16BigEndian(avcc.Slice(o, 2));
             o += 2;
+            if (len < 1 || len > avcc.Length - o) throw new InvalidDataException("MP4: truncated avcC (SPS data)");
             sps.Add(BuildNalUnit(avcc.Slice(o, len)));
             o += len;
         }
+        if (o >= avcc.Length) throw new InvalidDataException("MP4: truncated avcC (PPS count)");
         int numPps = avcc[o++];
         var pps = new List<NalUnit>();
         for (int i = 0; i < numPps; i++)
         {
+            if (o + 2 > avcc.Length) throw new InvalidDataException("MP4: truncated avcC (PPS length)");
             int len = BinaryPrimitives.ReadUInt16BigEndian(avcc.Slice(o, 2));
             o += 2;
+            if (len < 1 || len > avcc.Length - o) throw new InvalidDataException("MP4: truncated avcC (PPS data)");
             pps.Add(BuildNalUnit(avcc.Slice(o, len)));
             o += len;
         }
@@ -643,10 +681,21 @@ public static class Mp4Reader
     // ---------- sample table ----------
 
     private static List<(long Offset, int Size)> BuildSampleOffsetTable(
-        ReadOnlySpan<byte> stsz, ReadOnlySpan<byte> stsc, ReadOnlySpan<byte> stco, bool isCo64)
+        ReadOnlySpan<byte> stsz, ReadOnlySpan<byte> stsc, ReadOnlySpan<byte> stco, bool isCo64, long fileLength)
     {
+        if (stsz.Length < 12 || stsc.Length < 8 || stco.Length < 8)
+            throw new InvalidDataException("MP4: truncated stsz/stsc/stco");
         int defaultSize = BinaryPrimitives.ReadInt32BigEndian(stsz.Slice(4, 4));
         int sampleCount = BinaryPrimitives.ReadInt32BigEndian(stsz.Slice(8, 4));
+        // Bound counts by the bytes actually present so a lying header can't force a
+        // multi-GiB allocation. With a fixed sample size the per-sample table is absent;
+        // bound by the file instead (every sample must at least fit in the file once).
+        if (sampleCount < 0
+            || (defaultSize == 0 && 12 + (long)sampleCount * 4 > stsz.Length)
+            || (defaultSize != 0 && (long)sampleCount * (uint)defaultSize > fileLength))
+        {
+            throw new InvalidDataException($"MP4: stsz sample_count {sampleCount} inconsistent with file");
+        }
         int[] sampleSizes = new int[sampleCount];
         if (defaultSize != 0)
         {
@@ -659,11 +708,16 @@ public static class Mp4Reader
         }
 
         int chunkCount = BinaryPrimitives.ReadInt32BigEndian(stco.Slice(4, 4));
+        if (chunkCount < 0 || 8 + (long)chunkCount * (isCo64 ? 8 : 4) > stco.Length)
+            throw new InvalidDataException($"MP4: stco/co64 entry_count {chunkCount} exceeds box");
         long[] chunkOffsets = new long[chunkCount];
         if (isCo64)
         {
             for (int i = 0; i < chunkCount; i++)
+            {
                 chunkOffsets[i] = BinaryPrimitives.ReadInt64BigEndian(stco.Slice(8 + i * 8, 8));
+                if (chunkOffsets[i] < 0) throw new InvalidDataException("MP4: negative co64 chunk offset");
+            }
         }
         else
         {
@@ -673,6 +727,8 @@ public static class Mp4Reader
         }
 
         int stscCount = BinaryPrimitives.ReadInt32BigEndian(stsc.Slice(4, 4));
+        if (stscCount < 0 || 8 + (long)stscCount * 12 > stsc.Length)
+            throw new InvalidDataException($"MP4: stsc entry_count {stscCount} exceeds box");
         var stscEntries = new (int FirstChunk, int SamplesPerChunk)[stscCount];
         for (int i = 0; i < stscCount; i++)
         {
@@ -685,9 +741,12 @@ public static class Mp4Reader
         int sampleIdx = 0;
         for (int e = 0; e < stscCount && sampleIdx < sampleCount; e++)
         {
-            int firstChunk = stscEntries[e].FirstChunk;
+            // Clamp each run to the chunks stco actually describes (first_chunk is 1-based);
+            // truncated/badly muxed files otherwise index chunkOffsets out of bounds.
+            int firstChunk = Math.Max(stscEntries[e].FirstChunk, 1);
             int samplesPerChunk = stscEntries[e].SamplesPerChunk;
             int lastChunk = (e + 1 < stscCount) ? stscEntries[e + 1].FirstChunk - 1 : chunkCount;
+            lastChunk = Math.Min(lastChunk, chunkCount);
             for (int chunk = firstChunk; chunk <= lastChunk && sampleIdx < sampleCount; chunk++)
             {
                 long pos = chunkOffsets[chunk - 1];
@@ -785,11 +844,12 @@ public static class Mp4Reader
     // Iterate every moof region, parse traf/trun for the video track, and accumulate samples.
     private static List<Mp4Sample> ParseFragments(
         Stream source, List<(long Start, long PayloadStart, long PayloadEnd)> moofRegions,
-        uint videoTrackId, TrexDefaults trex, int lengthSize, double tsInv, long editMediaTimeOffset)
+        uint videoTrackId, TrexDefaults trex, int lengthSize, double tsInv, long editMediaTimeOffset,
+        long initialDt)
     {
         var samples = new List<Mp4Sample>();
         // Cumulative decode time across all fragments (in media timescale units). tfdt resets this.
-        long cumulativeDt = 0;
+        long cumulativeDt = initialDt;
         foreach (var region in moofRegions)
         {
             long payloadLen = region.PayloadEnd - region.PayloadStart;
@@ -817,7 +877,7 @@ public static class Mp4Reader
         {
             int sz = BinaryPrimitives.ReadInt32BigEndian(moof.Slice(p, 4));
             string ty = AsFourcc(moof.Slice(p + 4, 4));
-            if (sz < 8 || p + sz > moof.Length) break;
+            if (sz < 8 || sz > moof.Length - p) break;
             if (ty == "traf")
             {
                 ParseTraf(moof.Slice(p + 8, sz - 8), moofStart, videoTrackId, trex, lengthSize, tsInv,
@@ -845,7 +905,10 @@ public static class Mp4Reader
         bool baseIsMoof = (tfhdFlags & 0x020000) != 0;
         if ((tfhdFlags & 0x000001) != 0)
         {
-            baseDataOffset = (long)BinaryPrimitives.ReadUInt64BigEndian(tfhd.Slice(o, 8));
+            if (o + 8 > tfhd.Length) return;
+            ulong bdo = BinaryPrimitives.ReadUInt64BigEndian(tfhd.Slice(o, 8));
+            if (bdo > long.MaxValue) throw new InvalidDataException("MP4: tfhd base_data_offset out of range");
+            baseDataOffset = (long)bdo;
             o += 8;
         }
         else if (baseIsMoof)
@@ -861,38 +924,50 @@ public static class Mp4Reader
         uint defDur = trex.SampleDuration;
         uint defSize = trex.SampleSize;
         uint defFlags = trex.SampleFlags;
-        if ((tfhdFlags & 0x000008) != 0) { defDur = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
-        if ((tfhdFlags & 0x000010) != 0) { defSize = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
-        if ((tfhdFlags & 0x000020) != 0) { defFlags = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
+        if ((tfhdFlags & 0x000008) != 0) { if (o + 4 > tfhd.Length) return; defDur = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
+        if ((tfhdFlags & 0x000010) != 0) { if (o + 4 > tfhd.Length) return; defSize = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
+        if ((tfhdFlags & 0x000020) != 0) { if (o + 4 > tfhd.Length) return; defFlags = BinaryPrimitives.ReadUInt32BigEndian(tfhd.Slice(o, 4)); o += 4; }
 
         // tfdt overrides cumulative decode time for this fragment.
         if (TryFindChildBox(traf, "tfdt", out int tfdtS, out int tfdtL) && tfdtL >= 8)
         {
             var b = traf.Slice(tfdtS, tfdtL);
             byte ver = b[0];
-            if (ver == 1 && b.Length >= 4 + 8)
-                cumulativeDt = (long)BinaryPrimitives.ReadUInt64BigEndian(b.Slice(4, 8));
-            else if (b.Length >= 4 + 4)
+            if (ver == 1)
+            {
+                // Truncated v1 must not fall through to a v0 read of the high half.
+                if (b.Length >= 4 + 8)
+                {
+                    ulong dt = BinaryPrimitives.ReadUInt64BigEndian(b.Slice(4, 8));
+                    if (dt <= long.MaxValue) cumulativeDt = (long)dt;
+                }
+            }
+            else
+            {
                 cumulativeDt = BinaryPrimitives.ReadUInt32BigEndian(b.Slice(4, 4));
+            }
         }
 
         // Iterate all trun atoms (typically one per traf, but the spec allows several).
+        // §8.8.8: a trun without an explicit data_offset starts immediately after the
+        // previous run's data; the base offset applies only to the first run.
+        long nextRunOffset = baseDataOffset;
         int tp = 0;
         while (tp + 8 <= traf.Length)
         {
             int sz = BinaryPrimitives.ReadInt32BigEndian(traf.Slice(tp, 4));
             string ty = AsFourcc(traf.Slice(tp + 4, 4));
-            if (sz < 8 || tp + sz > traf.Length) break;
+            if (sz < 8 || sz > traf.Length - tp) break;
             if (ty == "trun")
             {
-                ParseTrun(traf.Slice(tp + 8, sz - 8), baseDataOffset, defDur, defSize, defFlags,
+                ParseTrun(traf.Slice(tp + 8, sz - 8), baseDataOffset, ref nextRunOffset, defDur, defSize, defFlags,
                     lengthSize, tsInv, samples, ref cumulativeDt, editMediaTimeOffset);
             }
             tp += sz;
         }
     }
 
-    private static void ParseTrun(ReadOnlySpan<byte> trun, long baseDataOffset,
+    private static void ParseTrun(ReadOnlySpan<byte> trun, long baseDataOffset, ref long nextRunOffset,
         uint defDur, uint defSize, uint defFlags,
         int lengthSize, double tsInv,
         List<Mp4Sample> samples, ref long cumulativeDt, long editMediaTimeOffset)
@@ -901,11 +976,14 @@ public static class Mp4Reader
         byte version = trun[0];
         uint flags = (uint)((trun[1] << 16) | (trun[2] << 8) | trun[3]);
         int sampleCount = BinaryPrimitives.ReadInt32BigEndian(trun.Slice(4, 4));
+        if (sampleCount < 0) return;
         int o = 8;
 
+        bool hasDataOffset = (flags & 0x000001) != 0;
         int dataOffset = 0;
-        if ((flags & 0x000001) != 0)
+        if (hasDataOffset)
         {
+            if (o + 4 > trun.Length) return;
             dataOffset = BinaryPrimitives.ReadInt32BigEndian(trun.Slice(o, 4));
             o += 4;
         }
@@ -913,6 +991,7 @@ public static class Mp4Reader
         bool hasFirstSampleFlags = (flags & 0x000004) != 0;
         if (hasFirstSampleFlags)
         {
+            if (o + 4 > trun.Length) return;
             firstSampleFlags = BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4));
             o += 4;
         }
@@ -921,28 +1000,39 @@ public static class Mp4Reader
         bool hasFlags = (flags & 0x000400) != 0;
         bool hasCtts = (flags & 0x000800) != 0;
 
-        long runOffset = baseDataOffset + dataOffset;
+        // Bound sample_count by the per-sample bytes actually present; with no per-sample
+        // fields at all, cap it — a single run of >16M defaulted samples is not a real file.
+        int perSample = (hasDur ? 4 : 0) + (hasSize ? 4 : 0) + (hasFlags ? 4 : 0) + (hasCtts ? 4 : 0);
+        if (perSample > 0 && o + (long)sampleCount * perSample > trun.Length)
+            throw new InvalidDataException($"MP4: trun sample_count {sampleCount} exceeds box");
+        if (perSample == 0 && sampleCount > 16_777_216)
+            throw new InvalidDataException($"MP4: implausible trun sample_count {sampleCount}");
+
+        // §8.8.8: without data_offset the run continues where the previous run ended.
+        long runOffset = hasDataOffset ? baseDataOffset + dataOffset : nextRunOffset;
         for (int i = 0; i < sampleCount; i++)
         {
             uint dur = hasDur ? BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4)) : defDur; if (hasDur) o += 4;
             uint size = hasSize ? BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4)) : defSize; if (hasSize) o += 4;
+            if (size > int.MaxValue)
+                throw new InvalidDataException($"MP4: trun sample size {size} out of range");
             uint sflags = hasFlags ? BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4))
                 : (i == 0 ? firstSampleFlags : defFlags);
             if (hasFlags) o += 4;
             int ctts = 0;
             if (hasCtts)
             {
-                // Version 1 -> signed; version 0 -> unsigned (cast to int, may saturate but rare in practice).
+                // Version 1 -> signed; version 0 -> unsigned (clamped; huge v0 offsets are bogus anyway).
                 if (version == 1) ctts = BinaryPrimitives.ReadInt32BigEndian(trun.Slice(o, 4));
-                else ctts = (int)BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4));
+                else ctts = (int)Math.Min(BinaryPrimitives.ReadUInt32BigEndian(trun.Slice(o, 4)), int.MaxValue);
                 o += 4;
             }
 
             // sample_is_non_sync_sample lives in bit 16 of the lower half (= 0x00010000).
-            // Equivalently sample_depends_on==2 ("does not depend") marks a sync sample.
+            // Do NOT infer sync from sample_depends_on==2: muxers mark open-GOP recovery
+            // I-frames as depends_on=2 + non-sync=1 — independently decodable but not a
+            // random-access point. The explicit non-sync bit wins.
             bool isSync = (sflags & 0x00010000) == 0;
-            int sampleDependsOn = (int)((sflags >> 24) & 0x3);
-            if (sampleDependsOn == 2) isSync = true;
 
             double dtSec = (cumulativeDt - editMediaTimeOffset) * tsInv;
             double ctSec = (cumulativeDt + ctts - editMediaTimeOffset) * tsInv;
@@ -950,6 +1040,7 @@ public static class Mp4Reader
             runOffset += size;
             cumulativeDt += dur;
         }
+        nextRunOffset = runOffset;
     }
 }
 
@@ -1025,6 +1116,9 @@ public sealed class Mp4Sample
         ArgumentNullException.ThrowIfNull(source);
         if (!source.CanSeek) throw new ArgumentException("source stream must be seekable", nameof(source));
         if (Size <= 0) return Array.Empty<NalUnit>();
+        if (FileOffset < 0 || FileOffset > source.Length - Size)
+            throw new InvalidDataException(
+                $"MP4: sample at offset {FileOffset} (size {Size}) lies outside the file");
 
         byte[] buffer = new byte[Size];
         source.Position = FileOffset;
@@ -1044,7 +1138,8 @@ public sealed class Mp4Sample
         {
             int nalLen = Mp4Reader.ReadBE(sample, pos, _lengthSize);
             pos += _lengthSize;
-            if (nalLen < 1 || pos + nalLen > sample.Length)
+            // Subtraction form: `pos + nalLen` can overflow int for hostile 4-byte lengths.
+            if (nalLen < 1 || nalLen > sample.Length - pos)
                 throw new InvalidDataException($"MP4: NAL length {nalLen} overflows sample at offset {FileOffset}");
             nals.Add(Mp4Reader.BuildNalUnit(sample.Slice(pos, nalLen)));
             pos += nalLen;

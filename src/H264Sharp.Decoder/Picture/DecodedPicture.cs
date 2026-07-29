@@ -35,6 +35,11 @@ public sealed class DecodedPicture
     /// <summary>Picture Order Count (spec §8.2.1) — display order key. Lower POC = earlier display.</summary>
     public int PicOrderCnt { get; set; }
 
+    /// <summary>Coded-video-sequence index: incremented at each IDR (and MMCO5 reset). POC is only
+    /// defined within a CVS and restarts at 0 across IDRs, so display-order sorting must group by
+    /// this first, then PicOrderCnt. Otherwise frames from different GOPs interleave.</summary>
+    public int CvsIndex { get; set; }
+
     /// <summary>0-based index of this picture in the bitstream's decode order (assigned per
     /// <see cref="H264Sharp.Decoder.H264FrameDecoder.DecodeAllFrames(System.Collections.Generic.List{H264Sharp.Decoder.Bitstream.NalUnit})"/> call).
     /// Lets callers map an MP4 sample-table index to the right entry of the POC-sorted output list.</summary>
@@ -64,6 +69,14 @@ public sealed class DecodedPicture
     /// video_full_range_flag (yuvj420p / Apple-encoded content uses Y in [0,255])
     /// and matrix_coefficients.</summary>
     public Syntax.VuiParameters? Vui { get; set; }
+
+    /// <summary>POCs of this picture's L0 / L1 reference lists, in list order, captured when the
+    /// picture was decoded. Used by temporal direct (§8.4.1.2.3) when this picture is the colocated
+    /// (L1[0]) reference: the colocated block's refIdxCol indexes these to find the referenced
+    /// picture's POC, which is then matched into the current picture's L0. Null for I pictures.</summary>
+    public int[]? RefListL0Pocs { get; set; }
+    /// <summary>See <see cref="RefListL0Pocs"/>.</summary>
+    public int[]? RefListL1Pocs { get; set; }
 
     public DecodedPicture(int width, int height)
         : this(width, height, width, height, 0, 0) { }

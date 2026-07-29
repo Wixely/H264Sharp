@@ -12,9 +12,12 @@ public static class ExpGolomb
         while (r.ReadBit() == 0)
         {
             leadingZeros++;
-            if (leadingZeros > 32)
+            // Spec §9.1: max representable codeNum is 2^32-2 (31 leading zeros). 32 zeros
+            // would need (1<<32)-1+suffix, which C#'s shift masking silently aliases to
+            // small values — reject as malformed instead.
+            if (leadingZeros > 31)
             {
-                throw new InvalidDataException("ue(v) overflow: more than 32 leading zero bits");
+                throw new InvalidDataException("ue(v) overflow: more than 31 leading zero bits");
             }
         }
         if (leadingZeros == 0)

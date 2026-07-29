@@ -10,6 +10,12 @@ public ref struct BitReader
 
     public BitReader(ReadOnlySpan<byte> data)
     {
+        // Bit positions are tracked in int; data.Length * 8 must not overflow. No real
+        // H.264 NAL approaches 256 MiB, so reject rather than track positions in long.
+        if (data.Length > int.MaxValue / 8)
+        {
+            throw new ArgumentException("RBSP too large for BitReader (>= 256 MiB)", nameof(data));
+        }
         _data = data;
         _bitPos = 0;
     }

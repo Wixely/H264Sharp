@@ -73,6 +73,10 @@ public sealed class SliceHeader
     public required bool LongTermReferenceFlag { get; init; }
 
     public required int SliceQpDelta { get; init; }
+
+    /// <summary>redundant_pic_cnt (spec §7.4.3). &gt;0 marks a redundant coded picture whose slice
+    /// data duplicates a primary picture; such slices must not overwrite the primary output.</summary>
+    public int RedundantPicCnt { get; init; }
     public required uint DisableDeblockingFilterIdc { get; init; }
     public required int SliceAlphaC0OffsetDiv2 { get; init; }
     public required int SliceBetaOffsetDiv2 { get; init; }
@@ -214,9 +218,10 @@ public sealed class SliceHeader
         // pic_order_cnt_type==1 already rejected in SPS parser.
         // pic_order_cnt_type==2: no extra fields.
 
+        uint redundantPicCnt = 0;
         if (pps.RedundantPicCntPresentFlag)
         {
-            _ = ExpGolomb.ReadUe(ref r); // redundant_pic_cnt
+            redundantPicCnt = ExpGolomb.ReadUe(ref r);
         }
 
         // B-slice: direct_spatial_mv_pred_flag (spec §7.3.3).
@@ -356,6 +361,7 @@ public sealed class SliceHeader
             NoOutputOfPriorPicsFlag = noOutputPriorPics,
             LongTermReferenceFlag = longTermRef,
             SliceQpDelta = sliceQpDelta,
+            RedundantPicCnt = (int)redundantPicCnt,
             DisableDeblockingFilterIdc = disableDeblockingIdc,
             SliceAlphaC0OffsetDiv2 = alphaOffset / 2,
             SliceBetaOffsetDiv2 = betaOffset / 2,

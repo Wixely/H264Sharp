@@ -3,8 +3,9 @@ namespace H264Sharp.Decoder.Bitstream;
 /// <summary>
 /// Reads AVCC-framed NAL units: each NAL is prefixed by an unsigned big-endian
 /// length field. Length size is 1, 2, or 4 bytes (4 is the MP4 default and
-/// what `lengthSizeMinusOne` typically encodes as 3). No start codes, no
-/// emulation-prevention bytes.
+/// what `lengthSizeMinusOne` typically encodes as 3). The length prefix replaces
+/// the Annex-B start code only — the NAL payload is still EBSP and carries
+/// emulation-prevention bytes (ISO/IEC 14496-15 §5.3.4.2).
 /// </summary>
 public static class AvccReader
 {
@@ -21,7 +22,8 @@ public static class AvccReader
         {
             int len = ReadLen(stream, pos, lengthSize);
             pos += lengthSize;
-            if (len < 1 || pos + len > stream.Length)
+            // Subtraction form: `pos + len` can overflow int for hostile 4-byte lengths.
+            if (len < 1 || len > stream.Length - pos)
             {
                 throw new InvalidDataException($"AVCC: NAL length {len} at offset {pos} exceeds stream");
             }
@@ -34,9 +36,7 @@ public static class AvccReader
             byte nalRefIdc = (byte)((header >> 5) & 0x03);
             var nalUnitType = (NalUnitType)(header & 0x1F);
 
-            // AVCC payloads are RBSP-clean (no emulation prevention bytes).
-            byte[] rbsp = new byte[len - 1];
-            stream.Slice(pos + 1, len - 1).CopyTo(rbsp);
+            byte[] rbsp = AnnexBReader.StripEmulationPreventionBytes(stream.Slice(pos + 1, len - 1));
             results.Add(new NalUnit(nalRefIdc, nalUnitType, rbsp));
 
             pos += len;

@@ -998,10 +998,27 @@ internal static class MacroblockReconstructor
             else if (useL0)
             {
                 p0[..n].CopyTo(outBuf);
+                // §8.4.2.3.2: uni-directional predictions in an explicit-weighted slice are weighted too.
+                if (explicitWeights is not null)
+                {
+                    int ri = part.RefIdxL0 < 0 ? 0 : part.RefIdxL0;
+                    int wd = explicitWeights.LumaLog2WeightDenom;
+                    int w = ri < explicitWeights.LumaWeightL0.Length ? explicitWeights.LumaWeightL0[ri] : (1 << wd);
+                    int o = ri < explicitWeights.LumaOffsetL0.Length ? explicitWeights.LumaOffsetL0[ri] : 0;
+                    ApplyExplicitWeightL0(outBuf[..n], w, o, wd);
+                }
             }
             else
             {
                 p1[..n].CopyTo(outBuf);
+                if (explicitWeights is not null && explicitWeights.LumaWeightL1 is not null)
+                {
+                    int ri = part.RefIdxL1 < 0 ? 0 : part.RefIdxL1;
+                    int wd = explicitWeights.LumaLog2WeightDenom;
+                    int w = ri < explicitWeights.LumaWeightL1.Length ? explicitWeights.LumaWeightL1[ri] : (1 << wd);
+                    int o = explicitWeights.LumaOffsetL1 != null && ri < explicitWeights.LumaOffsetL1.Length ? explicitWeights.LumaOffsetL1[ri] : 0;
+                    ApplyExplicitWeightL0(outBuf[..n], w, o, wd);
+                }
             }
 
             for (int yy = 0; yy < part.Height; yy++)
@@ -1118,10 +1135,27 @@ internal static class MacroblockReconstructor
                 else if (useL0)
                 {
                     p0[..n].CopyTo(outBuf);
+                    // §8.4.2.3.2: uni-directional predictions in an explicit-weighted slice are weighted.
+                    if (explicitWeights is not null)
+                    {
+                        int ri = part.RefIdxL0 < 0 ? 0 : part.RefIdxL0;
+                        int wd = explicitWeights.ChromaLog2WeightDenom;
+                        int w = ri < explicitWeights.ChromaWeightL0.GetLength(0) ? explicitWeights.ChromaWeightL0[ri, comp] : (1 << wd);
+                        int o = ri < explicitWeights.ChromaOffsetL0.GetLength(0) ? explicitWeights.ChromaOffsetL0[ri, comp] : 0;
+                        ApplyExplicitWeightL0(outBuf[..n], w, o, wd);
+                    }
                 }
                 else
                 {
                     p1[..n].CopyTo(outBuf);
+                    if (explicitWeights is not null && explicitWeights.ChromaWeightL1 is not null)
+                    {
+                        int ri = part.RefIdxL1 < 0 ? 0 : part.RefIdxL1;
+                        int wd = explicitWeights.ChromaLog2WeightDenom;
+                        int w = ri < explicitWeights.ChromaWeightL1.GetLength(0) ? explicitWeights.ChromaWeightL1[ri, comp] : (1 << wd);
+                        int o = explicitWeights.ChromaOffsetL1 != null && ri < explicitWeights.ChromaOffsetL1.GetLength(0) ? explicitWeights.ChromaOffsetL1[ri, comp] : 0;
+                        ApplyExplicitWeightL0(outBuf[..n], w, o, wd);
+                    }
                 }
                 for (int yy = 0; yy < ch; yy++)
                     for (int xx = 0; xx < cw; xx++)

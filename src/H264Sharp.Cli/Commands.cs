@@ -419,7 +419,7 @@ public static class Commands
         if (!File.Exists(inPath)) { stderr.WriteLine($"input not found: {inPath}"); return 2; }
         if (!FileLooksLikeMp4(inPath))
         {
-            // Annex-B / AVCC raw: parse SPS for resolution + profile, count slices for frames.
+            // Annex-B / AVCC raw: parse SPS for resolution + profile, count pictures for frames.
             byte[] bytes = File.ReadAllBytes(inPath);
             return InfoAnnexB(bytes, stdout, stderr);
         }
@@ -463,12 +463,22 @@ public static class Commands
         catch (Exception ex) { PrintException("parse failed", ex, stderr); return 3; }
 
         SequenceParameterSet? sps = null;
-        int slices = 0;
+        int frames = 0;
         foreach (var n in nals)
         {
             if (n.NalUnitType == NalUnitType.Sps && sps is null)
                 sps = SequenceParameterSet.Parse(n.Rbsp.Span);
-            if (n.NalUnitType is NalUnitType.SliceIdr or NalUnitType.SliceNonIdr) slices++;
+            if (n.NalUnitType is NalUnitType.SliceIdr or NalUnitType.SliceNonIdr)
+            {
+                // Count coded pictures, not slice NALs: a frame may be split across several
+                // slices; only one with first_mb_in_slice == 0 starts a new picture.
+                try
+                {
+                    var sr = new BitReader(n.Rbsp.Span);
+                    if (ExpGolomb.ReadUe(ref sr) == 0) frames++;
+                }
+                catch (InvalidDataException) { frames++; }
+            }
         }
         if (sps is null) { stderr.WriteLine("no SPS found"); return 3; }
 
@@ -479,12 +489,12 @@ public static class Commands
         {
             double frameRate = vui.TimeScale / (2.0 * vui.NumUnitsInTick);
             fps = frameRate;
-            if (frameRate > 0) duration = slices / frameRate;
+            if (frameRate > 0) duration = frames / frameRate;
         }
 
         stdout.WriteLine(duration.HasValue ? $"duration: {duration.Value:F3} s" : "duration: unknown (no timing info)");
         stdout.WriteLine($"resolution: {sps.CroppedWidth}x{sps.CroppedHeight}");
-        stdout.WriteLine(fps.HasValue ? $"frames: {slices} ({fps.Value:F2} fps)" : $"frames: {slices}");
+        stdout.WriteLine(fps.HasValue ? $"frames: {frames} ({fps.Value:F2} fps)" : $"frames: {frames}");
         stdout.WriteLine($"profile: {ProfileName(sps.ProfileIdc)}");
         return 0;
     }
@@ -583,11 +593,16 @@ public static class Commands
 
     private static bool LooksLikeAnnexBHeader(ReadOnlySpan<byte> bytes)
     {
-        for (int i = 0; i < Math.Min(4, bytes.Length); i++)
-        {
-            if (bytes[i] == 0) continue;
-            return bytes[i] == 1;
-        }
-        return false;
+        // Start code (3- or 4-byte) at offset 0 followed by a plausible NAL header — the header
+        // check disambiguates from AVCC length prefixes that can alias a start code.
+        int scLen;
+        if (bytes.Length >= 3 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 1) scLen = 3;
+        else if (bytes.Length >= 4 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 1) scLen = 4;
+        else return false;
+        if (bytes.Length <= scLen) return false;
+        byte nalHeader = bytes[scLen];
+        if ((nalHeader & 0x80) != 0) return false;
+        int nalType = nalHeader & 0x1F;
+        return nalType >= 1 && nalType <= 23;
     }
 }

@@ -13,6 +13,14 @@ public sealed class TemporalDirectContext
     public required int Pic1Poc { get; init; }
     /// <summary>POCs of all L0 reference pictures, indexed by ref_idx_l0.</summary>
     public required int[] L0Pocs { get; init; }
+    /// <summary>The colocated (L1[0]) picture's own L0 / L1 reference POCs, indexed by that
+    /// picture's ref_idx. Used to map a colocated block's refIdxCol to the referenced picture's
+    /// POC, which is then matched into the current L0 (§8.4.1.2.3). Null falls back to identity.</summary>
+    public int[]? ColRefL0Pocs { get; init; }
+    public int[]? ColRefL1Pocs { get; init; }
+    /// <summary>Whether each current L0 reference is a long-term picture (parallel to L0Pocs).
+    /// §8.4.1.2.3: when the L0 target is long-term, the colocated MV is used unscaled (mvL1 = 0).</summary>
+    public bool[]? L0IsLongTerm { get; init; }
 }
 
 /// <summary>
@@ -27,17 +35,18 @@ internal static class BDirectMode
         Macroblock mb, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8Inference = true)
     {
         // Mark every 4x4 block as direct (B_Skip / B_Direct_16x16) for neighbor context use.
         for (int i = 0; i < 16; i++) mb.IsDirectBlock[i] = 1;
         if (sliceHeader.DirectSpatialMvPredFlag)
         {
-            DeriveSpatialDirect(mb, 0, 0, 4, 4, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+            DeriveSpatialDirect(mb, 0, 0, 4, 4, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, direct8x8Inference);
         }
         else
         {
-            DeriveTemporalDirect(mb, 0, 0, 4, 4, colocatedMb, tdCtx);
+            DeriveTemporalDirect(mb, 0, 0, 4, 4, colocatedMb, tdCtx, direct8x8Inference);
         }
     }
 
@@ -46,7 +55,8 @@ internal static class BDirectMode
         Macroblock mb, int quadrant, SliceHeader sliceHeader,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
         Macroblock? colocatedMb = null,
-        TemporalDirectContext? tdCtx = null)
+        TemporalDirectContext? tdCtx = null,
+        bool direct8x8Inference = true)
     {
         int qx = (quadrant & 1) * 2, qy = (quadrant >> 1) * 2;
         // Mark the four 4x4 blocks in this quadrant as direct (B_Direct_8x8 sub-MB).
@@ -55,18 +65,28 @@ internal static class BDirectMode
                 mb.IsDirectBlock[MacroblockParser.SpatialToRaster(xx, yy)] = 1;
         if (sliceHeader.DirectSpatialMvPredFlag)
         {
-            DeriveSpatialDirect(mb, qx, qy, 2, 2, leftMb, topMb, topRightMb, topLeftMb, colocatedMb);
+            DeriveSpatialDirect(mb, qx, qy, 2, 2, leftMb, topMb, topRightMb, topLeftMb, colocatedMb, direct8x8Inference);
         }
         else
         {
-            DeriveTemporalDirect(mb, qx, qy, 2, 2, colocatedMb, tdCtx);
+            DeriveTemporalDirect(mb, qx, qy, 2, 2, colocatedMb, tdCtx, direct8x8Inference);
         }
+    }
+
+    /// <summary>The colocated 4x4 block used for a given (bx, by) under direct_8x8_inference: the
+    /// outer-corner 4x4 of the containing 8x8 quadrant (§8.4.1.2.1). Returns (bx, by) unchanged
+    /// when inference is off (per-4x4 colocated sampling).</summary>
+    private static (int bx, int by) ColocatedSample(int bx, int by, bool direct8x8Inference)
+    {
+        if (!direct8x8Inference) return (bx, by);
+        int q = MacroblockParser.QuadrantOf(bx, by);
+        return ((q & 1) * 3, (q >> 1) * 3);
     }
 
     /// <summary>Temporal direct derivation (spec §8.4.1.2.3) for a rectangle of 4x4 blocks.</summary>
     private static void DeriveTemporalDirect(
         Macroblock mb, int bx0, int by0, int bw, int bh,
-        Macroblock? colocatedMb, TemporalDirectContext? tdCtx)
+        Macroblock? colocatedMb, TemporalDirectContext? tdCtx, bool direct8x8Inference)
     {
         if (tdCtx is null)
             throw new InvalidOperationException("Temporal direct mode requires TemporalDirectContext");
@@ -83,8 +103,14 @@ internal static class BDirectMode
             {
                 int idx = MacroblockParser.SpatialToRaster(bx, by);
                 int q = MacroblockParser.QuadrantOf(bx, by);
+                // §8.4.1.2.1: under direct_8x8_inference the colocated motion for a whole 8x8 is
+                // taken from that 8x8's outer-corner 4x4, not each 4x4's own colocated block.
+                var (cbx, cby) = ColocatedSample(bx, by, direct8x8Inference);
+                int colIdx = MacroblockParser.SpatialToRaster(cbx, cby);
+                int colQ = MacroblockParser.QuadrantOf(cbx, cby);
 
                 int colRefIdx, colMvX, colMvY;
+                bool colFromL1 = false; // colRefIdx indexes the colocated pic's L1 (not L0)
                 bool colIsRef0; // colocated block's ref points at a valid (non-intra) entry
                 if (colIsIntra)
                 {
@@ -96,18 +122,19 @@ internal static class BDirectMode
                 else if (colocatedMb!.IsBInter || colocatedMb.IsBSkip)
                 {
                     // B-slice colocated MB: pick L0 motion if available, else L1.
-                    bool colHasL0 = colocatedMb.PredFlagL0Block[idx] != 0;
+                    bool colHasL0 = colocatedMb.PredFlagL0Block[colIdx] != 0;
                     if (colHasL0)
                     {
-                        colRefIdx = colocatedMb.RefIdxL08x8[q];
-                        colMvX = colocatedMb.MvL0XBlock[idx];
-                        colMvY = colocatedMb.MvL0YBlock[idx];
+                        colRefIdx = colocatedMb.RefIdxL08x8[colQ];
+                        colMvX = colocatedMb.MvL0XBlock[colIdx];
+                        colMvY = colocatedMb.MvL0YBlock[colIdx];
                     }
-                    else if (colocatedMb.PredFlagL1Block[idx] != 0)
+                    else if (colocatedMb.PredFlagL1Block[colIdx] != 0)
                     {
-                        colRefIdx = colocatedMb.RefIdxL18x8[q];
-                        colMvX = colocatedMb.MvL1XBlock[idx];
-                        colMvY = colocatedMb.MvL1YBlock[idx];
+                        colRefIdx = colocatedMb.RefIdxL18x8[colQ];
+                        colMvX = colocatedMb.MvL1XBlock[colIdx];
+                        colMvY = colocatedMb.MvL1YBlock[colIdx];
+                        colFromL1 = true;
                     }
                     else
                     {
@@ -120,13 +147,15 @@ internal static class BDirectMode
                 else
                 {
                     // P-slice colocated MB (including P_Skip): L0 is implicit.
-                    colRefIdx = colocatedMb.RefIdxL08x8[q];
-                    colMvX = colocatedMb.MvL0XBlock[idx];
-                    colMvY = colocatedMb.MvL0YBlock[idx];
+                    colRefIdx = colocatedMb.RefIdxL08x8[colQ];
+                    colMvX = colocatedMb.MvL0XBlock[colIdx];
+                    colMvY = colocatedMb.MvL0YBlock[colIdx];
                     colIsRef0 = true;
                 }
 
-                // refIdxL0: derived by POC matching the colocated block's reference picture.
+                // refIdxL0 (§8.4.1.2.3): the lowest current-L0 index that references the picture
+                // the colocated block referenced. Resolve refIdxCol -> that picture's POC via the
+                // colocated picture's own ref-list POCs, then match into the current L0.
                 int refL0Idx;
                 if (!colIsRef0)
                 {
@@ -134,11 +163,18 @@ internal static class BDirectMode
                 }
                 else
                 {
-                    // Spec: find first L0 entry whose POC matches the colocated block's reference picture.
-                    // Without explicit reference-picture tracking on the colocated block we use the
-                    // simple "ref index of the colocated block" mapping (refIdxCol on L0 maps to
-                    // refIdxL0Col on current L0). This is the common case (refs=1 — only one entry).
-                    refL0Idx = colRefIdx < tdCtx.L0Pocs.Length ? colRefIdx : 0;
+                    int[]? colPocs = colFromL1 ? tdCtx.ColRefL1Pocs : tdCtx.ColRefL0Pocs;
+                    if (colPocs is not null && colRefIdx < colPocs.Length)
+                    {
+                        int refPoc = colPocs[colRefIdx];
+                        int found = System.Array.IndexOf(tdCtx.L0Pocs, refPoc);
+                        refL0Idx = found >= 0 ? found : 0;
+                    }
+                    else
+                    {
+                        // No ref-POC info — fall back to identity (correct for the single-ref case).
+                        refL0Idx = colRefIdx < tdCtx.L0Pocs.Length ? colRefIdx : 0;
+                    }
                 }
                 int refL1Idx = 0;
 
@@ -155,9 +191,11 @@ internal static class BDirectMode
                     int currPoc = tdCtx.CurrentPoc;
                     int tb = Clip3(-128, 127, currPoc - pic0Poc);
                     int td = Clip3(-128, 127, pic1Poc - pic0Poc);
-                    if (td == 0)
+                    bool l0IsLongTerm = tdCtx.L0IsLongTerm is not null
+                        && refL0Idx < tdCtx.L0IsLongTerm.Length && tdCtx.L0IsLongTerm[refL0Idx];
+                    if (td == 0 || l0IsLongTerm)
                     {
-                        // Degenerate (equal-POC) or long-term case — copy colMv onto L0, L1 = 0.
+                        // §8.4.1.2.3: equal-POC or long-term L0 target — copy colMv onto L0, L1 = 0.
                         mvL0X = colMvX; mvL0Y = colMvY;
                         mvL1X = 0; mvL1Y = 0;
                     }
@@ -207,12 +245,15 @@ internal static class BDirectMode
     private static void DeriveSpatialDirect(
         Macroblock mb, int bx0, int by0, int bw, int bh,
         Macroblock? leftMb, Macroblock? topMb, Macroblock? topRightMb, Macroblock? topLeftMb,
-        Macroblock? colocatedMb)
+        Macroblock? colocatedMb, bool direct8x8Inference)
     {
-        // refIdxLX derivation: minimum positive ref over neighbors A, B, C at the
-        // partition's top-left position (spec §8.4.1.2.1).
-        int refL0 = MinPositiveRef(mb, bx0, by0, bw, leftMb, topMb, topRightMb, topLeftMb, listX: 0);
-        int refL1 = MinPositiveRef(mb, bx0, by0, bw, leftMb, topMb, topRightMb, topLeftMb, listX: 1);
+        // §8.4.1.2.2: refIdxL0/L1 and the base mvL0/mvL1 are derived ONCE for the whole macroblock
+        // using its 16x16-partition neighbors A=(-1,0), B=(0,-1), C=(4,-1) — the SAME values for
+        // every 4x4 block, regardless of whether this is B_Direct_16x16 or a B_Direct_8x8 quadrant.
+        // (bx0/by0/bw/bh below select only which blocks this call fills.) Block-level variation
+        // comes solely from the per-4x4 colZeroFlag override further down.
+        int refL0 = MinPositiveRef(mb, 0, 0, 4, leftMb, topMb, topRightMb, topLeftMb, listX: 0);
+        int refL1 = MinPositiveRef(mb, 0, 0, 4, leftMb, topMb, topRightMb, topLeftMb, listX: 1);
 
         // If neither L0 nor L1 has a valid reference, both MVs are zero with refIdx=0.
         bool noRefs = refL0 < 0 && refL1 < 0;
@@ -225,13 +266,13 @@ internal static class BDirectMode
         if (refL0 >= 0 && !noRefs)
         {
             (mvL0X, mvL0Y) = MacroblockParser.PredictMvForPartitionListB(
-                mb, 0, 0, bx0, by0, bw, bh, refL0, listX: 0,
+                mb, 0, 0, 0, 0, 4, 4, refL0, listX: 0,
                 leftMb, topMb, topRightMb, topLeftMb);
         }
         if (refL1 >= 0 && !noRefs)
         {
             (mvL1X, mvL1Y) = MacroblockParser.PredictMvForPartitionListB(
-                mb, 0, 0, bx0, by0, bw, bh, refL1, listX: 1,
+                mb, 0, 0, 0, 0, 4, 4, refL1, listX: 1,
                 leftMb, topMb, topRightMb, topLeftMb);
         }
 
@@ -267,32 +308,36 @@ internal static class BDirectMode
                 for (int bx = bx0; bx < bx0 + bw; bx++)
                 {
                     int idx = MacroblockParser.SpatialToRaster(bx, by);
-                    int q = MacroblockParser.QuadrantOf(bx, by);
+                    // §8.4.1.2.1: under direct_8x8_inference sample the colocated block at the 8x8's
+                    // outer corner rather than per-4x4.
+                    var (cbx, cby) = ColocatedSample(bx, by, direct8x8Inference);
+                    int colIdx = MacroblockParser.SpatialToRaster(cbx, cby);
+                    int colQ = MacroblockParser.QuadrantOf(cbx, cby);
                     // Choose the L0 motion of the colocated MB (or its L1 if the colocated
                     // MB has no L0 — i.e., L1-only inter partition).
                     int colRefIdx, colMvX, colMvY;
                     if (colocatedMb.IsBInter || colocatedMb.IsBSkip)
                     {
-                        bool colHasL0 = colocatedMb.PredFlagL0Block[idx] != 0;
+                        bool colHasL0 = colocatedMb.PredFlagL0Block[colIdx] != 0;
                         if (colHasL0)
                         {
-                            colRefIdx = colocatedMb.RefIdxL08x8[q];
-                            colMvX = colocatedMb.MvL0XBlock[idx];
-                            colMvY = colocatedMb.MvL0YBlock[idx];
+                            colRefIdx = colocatedMb.RefIdxL08x8[colQ];
+                            colMvX = colocatedMb.MvL0XBlock[colIdx];
+                            colMvY = colocatedMb.MvL0YBlock[colIdx];
                         }
                         else
                         {
-                            colRefIdx = colocatedMb.RefIdxL18x8[q];
-                            colMvX = colocatedMb.MvL1XBlock[idx];
-                            colMvY = colocatedMb.MvL1YBlock[idx];
+                            colRefIdx = colocatedMb.RefIdxL18x8[colQ];
+                            colMvX = colocatedMb.MvL1XBlock[colIdx];
+                            colMvY = colocatedMb.MvL1YBlock[colIdx];
                         }
                     }
                     else
                     {
                         // P-slice colocated MB (including P_Skip).
-                        colRefIdx = colocatedMb.RefIdxL08x8[q];
-                        colMvX = colocatedMb.MvL0XBlock[idx];
-                        colMvY = colocatedMb.MvL0YBlock[idx];
+                        colRefIdx = colocatedMb.RefIdxL08x8[colQ];
+                        colMvX = colocatedMb.MvL0XBlock[colIdx];
+                        colMvY = colocatedMb.MvL0YBlock[colIdx];
                     }
                     bool colSmall = colRefIdx == 0
                         && Math.Abs(colMvX) <= 1 && Math.Abs(colMvY) <= 1;

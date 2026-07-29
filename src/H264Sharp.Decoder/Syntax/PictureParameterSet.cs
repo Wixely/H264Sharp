@@ -66,6 +66,11 @@ public sealed class PictureParameterSet
                 throw new NotSupportedException("PPS pic_scaling_matrix_present_flag=1 not supported (custom scaling lists)");
             }
             secondChromaQpOffset = ExpGolomb.ReadSe(ref r);
+            // The dequant/deblocking paths apply ChromaQpIndexOffset to both chroma planes;
+            // a differing Cr offset would silently dequantize Cr wrongly. Reject instead.
+            if (secondChromaQpOffset != chromaQpOffset)
+                throw new NotSupportedException(
+                    "PPS second_chroma_qp_index_offset differing from chroma_qp_index_offset not supported");
         }
 
         return new PictureParameterSet
