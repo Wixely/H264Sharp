@@ -146,6 +146,12 @@ public static class CavlcEncoder
                     int escVal = levelCode - (15 << suffixLength);
                     suffixSize = 12;
                     suffixBits = escVal;
+                    // The 12-bit suffix caps escVal at 4095; larger levels need the level_prefix>=16
+                    // escape (which the decoder handles). Emitting them here would truncate silently,
+                    // so fail loudly instead — only reachable at extreme QP/residual magnitudes.
+                    if (escVal >= 4096)
+                        throw new NotSupportedException(
+                            $"CAVLC encode: coefficient level too large for the 12-bit escape (escVal={escVal})");
                 }
             }
             else
@@ -168,6 +174,9 @@ public static class CavlcEncoder
                     levelPrefix = 15;
                     suffixSize = 12;
                     suffixBits = levelCode - 30;
+                    if (suffixBits >= 4096)
+                        throw new NotSupportedException(
+                            $"CAVLC encode: coefficient level too large for the 12-bit escape (suffix={suffixBits})");
                 }
             }
 

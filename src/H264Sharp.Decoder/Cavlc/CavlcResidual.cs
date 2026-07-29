@@ -34,10 +34,10 @@ internal static class CavlcResidual
         {
             return 0;
         }
-        if (trailingOnes > 3 || totalCoeff > 16)
+        if (trailingOnes > 3 || totalCoeff > maxNumCoeff)
         {
             throw new InvalidDataException(
-                $"CAVLC: invalid (TotalCoeff={totalCoeff}, TrailingOnes={trailingOnes})");
+                $"CAVLC: invalid (TotalCoeff={totalCoeff}, TrailingOnes={trailingOnes}, maxNumCoeff={maxNumCoeff})");
         }
 
         Span<int> levels = stackalloc int[16];
@@ -59,6 +59,13 @@ internal static class CavlcResidual
         for (int i = totalCoeff - 1; i >= 0; i--)
         {
             coeffNum += runs[i] + 1;
+            // Guard against a malformed stream placing a coefficient past the block end
+            // (conformant streams never do; this yields a clean error instead of a crash).
+            if ((uint)coeffNum >= (uint)maxNumCoeff)
+            {
+                throw new InvalidDataException(
+                    $"CAVLC: coefficient position {coeffNum} out of range [0, {maxNumCoeff - 1}]");
+            }
             coeffs[coeffNum] = levels[i];
         }
         return totalCoeff;
@@ -239,35 +246,35 @@ internal static class CavlcResidual
 
         for (int i = trailingOnes; i < totalCoeff; i++)
         {
-            int prefixBits = ReadLevelPrefix(ref reader);
-            if (prefixBits > MaxLevelPrefix)
+            // level_prefix is 0..25 (spec §9.2.2.1). Prefix >= 16 is the large-magnitude escape.
+            int levelPrefix = ReadLevelPrefix(ref reader);
+
+            int levelSuffixSize;
+            if (levelPrefix == 14 && suffixLength == 0)
             {
-                throw new InvalidDataException("CAVLC: level_prefix overflow");
+                levelSuffixSize = 4;
             }
-            int levelPrefix = prefixBits;
-
-            int suffixLengthSize = suffixLength;
-            int levelCode = levelPrefix << suffixLength;
-
-            if (levelPrefix >= 14)
+            else if (levelPrefix >= 15)
             {
-                if (levelPrefix == 14 && suffixLength == 0)
-                {
-                    suffixLengthSize = 4;
-                }
-                else if (levelPrefix == 15)
-                {
-                    suffixLengthSize = 12;
-                    if (suffixLength == 0)
-                    {
-                        levelCode += 15;
-                    }
-                }
+                levelSuffixSize = levelPrefix - 3;
+            }
+            else
+            {
+                levelSuffixSize = suffixLength;
             }
 
-            if (suffixLengthSize > 0)
+            int levelCode = Math.Min(15, levelPrefix) << suffixLength;
+            if (levelSuffixSize > 0)
             {
-                levelCode += (int)reader.ReadBits(suffixLengthSize);
+                levelCode += (int)reader.ReadBits(levelSuffixSize);
+            }
+            if (levelPrefix >= 15 && suffixLength == 0)
+            {
+                levelCode += 15;
+            }
+            if (levelPrefix >= 16)
+            {
+                levelCode += (1 << (levelPrefix - 3)) - 4096;
             }
 
             if (i == trailingOnes && trailingOnes < 3)
@@ -389,6 +396,12 @@ internal static class CavlcResidual
                 if (consumed == 0)
                 {
                     throw new InvalidDataException("CAVLC: invalid run_before");
+                }
+                if (run > zerosLeft)
+                {
+                    // Guards a malformed stream from driving zerosLeft negative (which would
+                    // corrupt later coefficient positions); conformant streams never exceed it.
+                    throw new InvalidDataException("CAVLC: run_before > zerosLeft");
                 }
                 reader.Skip(consumed);
             }

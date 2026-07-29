@@ -84,7 +84,10 @@ public static class MacroblockParser
             for (int i = 0; i < 256; i++) pcmMb.PcmLuma[i] = (byte)reader.ReadBits(8);
             for (int i = 0; i < 64; i++)  pcmMb.PcmCb[i]   = (byte)reader.ReadBits(8);
             for (int i = 0; i < 64; i++)  pcmMb.PcmCr[i]   = (byte)reader.ReadBits(8);
-            // Spec rule: neighbor NZC / cbf values for an I_PCM MB are treated as maximum.
+            // Spec rule: neighbor NZC / cbf values for an I_PCM MB are treated as maximum, and
+            // CodedBlockPatternLuma/Chroma are inferred as 15/2 (§7.4.5).
+            pcmMb.CbpLuma = 15;
+            pcmMb.CbpChroma = 2;
             for (int i = 0; i < 16; i++) { pcmMb.NonZeroCountLuma[i] = 16; pcmMb.LumaAcCbf[i] = true; }
             pcmMb.LumaDcCbf = true;
             for (int c = 0; c < 2; c++)

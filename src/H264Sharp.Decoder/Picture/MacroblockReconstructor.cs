@@ -649,29 +649,20 @@ internal static class MacroblockReconstructor
     }
 
     /// <summary>Apply explicit weighted bipred sample combination (spec §8.4.2.3.2):
-    /// pred = Clip1( ((p0*w0 + p1*w1 + (1&lt;&lt;wd)) >> (wd+1)) + ((o0 + o1 + 1) >> 1) ) when wd>=1,
-    /// else Clip1(p0*w0 + p1*w1 + ((o0 + o1 + 1) >> 1)).</summary>
+    /// pred = Clip1( ((p0*w0 + p1*w1 + (1&lt;&lt;wd)) >> (wd+1)) + ((o0 + o1 + 1) >> 1) ).
+    /// The shift is (wd+1) >= 1 for every valid wd >= 0 — including wd == 0, where round=1,
+    /// shift=1 (a plain rounded average). There is no unshifted case here (that applies only to
+    /// the uni-directional path, which shifts by wd, not wd+1).</summary>
     private static void ApplyExplicitBipredWeights(
         Span<byte> p0, Span<byte> p1, Span<byte> dst, int w0, int w1, int o0, int o1, int wd)
     {
         int offsetCombined = (o0 + o1 + 1) >> 1;
-        if (wd >= 1)
+        int round = 1 << wd;
+        int shift = wd + 1;
+        for (int i = 0; i < dst.Length; i++)
         {
-            int round = 1 << wd;
-            int shift = wd + 1;
-            for (int i = 0; i < dst.Length; i++)
-            {
-                int v = ((p0[i] * w0 + p1[i] * w1 + round) >> shift) + offsetCombined;
-                dst[i] = ClipByte(v);
-            }
-        }
-        else
-        {
-            for (int i = 0; i < dst.Length; i++)
-            {
-                int v = p0[i] * w0 + p1[i] * w1 + offsetCombined;
-                dst[i] = ClipByte(v);
-            }
+            int v = ((p0[i] * w0 + p1[i] * w1 + round) >> shift) + offsetCombined;
+            dst[i] = ClipByte(v);
         }
     }
 

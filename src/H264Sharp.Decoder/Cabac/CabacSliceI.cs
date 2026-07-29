@@ -47,7 +47,11 @@ internal static class CabacSliceI
         for (int i = 0; i < 64; i++)  mb.PcmCr[i]   = cabac.ReadAlignedByte();
         cabac.Reinitialize();
 
-        // Neighbor context: all NZC/cbf treated as maximum for I_PCM MBs.
+        // Neighbor context: all NZC/cbf treated as maximum for I_PCM MBs. Per spec §7.4.5 an
+        // I_PCM MB infers CodedBlockPatternLuma=15 and CodedBlockPatternChroma=2 — required so a
+        // later MB's CABAC coded_block_pattern context (§9.3.3.1.1.4) sees the neighbor as coded.
+        mb.CbpLuma = 15;
+        mb.CbpChroma = 2;
         for (int i = 0; i < 16; i++) { mb.NonZeroCountLuma[i] = 16; mb.LumaAcCbf[i] = true; }
         mb.LumaDcCbf = true;
         for (int c = 0; c < 2; c++)

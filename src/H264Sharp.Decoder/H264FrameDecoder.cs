@@ -83,6 +83,9 @@ public sealed class H264FrameDecoder
         /// which a parameter set re-sent before the next AU may already have replaced.</summary>
         public required SequenceParameterSet Sps { get; init; }
         public required PictureParameterSet Pps { get; init; }
+        /// <summary>True once a continuation slice (first_mb_in_slice > 0) has been added. Lets
+        /// finalize distinguish single- from multi-slice pictures for disable_deblocking_filter_idc==2.</summary>
+        public bool IsMultiSlice { get; set; }
     }
 
     public List<DecodedPicture> DecodeAllFrames(List<NalUnit> nals)
@@ -200,6 +203,7 @@ public sealed class H264FrameDecoder
                             throw new InvalidDataException(
                                 "continuation slice (first_mb_in_slice > 0) without a current picture");
                         }
+                        currentPicture.IsMultiSlice = true;
                     }
                     DecodeSliceMacroblocks(n, sps, pps, header, currentPicture);
                     break;
@@ -354,7 +358,11 @@ public sealed class H264FrameDecoder
         SliceHeader header = ctx.FirstSliceHeader;
         if (header.DisableDeblockingFilterIdc != 1)
         {
-            bool filterMbEdges = header.DisableDeblockingFilterIdc != 2;
+            // idc==2 suppresses filtering only across SLICE boundaries (spec §8.7); internal
+            // MB edges within one slice must still be filtered. For a single-slice picture that
+            // means it behaves exactly like idc==0. We don't track per-MB slice ids, so a
+            // multi-slice picture with idc==2 conservatively skips MB edges (documented limit).
+            bool filterMbEdges = header.DisableDeblockingFilterIdc != 2 || !ctx.IsMultiSlice;
             bool mbaff = !sps.FrameMbsOnlyFlag && sps.MbAdaptiveFrameFieldFlag && !header.FieldPicFlag;
             DeblockingFilter.Apply(ctx.Picture, ctx.Mbs, ctx.MbsPerRow,
                 pps.ChromaQpIndexOffset,
