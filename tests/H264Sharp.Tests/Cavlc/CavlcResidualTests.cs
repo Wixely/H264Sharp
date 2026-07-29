@@ -100,6 +100,26 @@ public sealed class CavlcResidualTests
         Assert.Equal(7, r.BitPosition);
     }
 
+    // (TotalCoeff=1, TrailingOnes=0), then a level using the level_prefix >= 16 escape (spec
+    // §9.2.2.1) for a large-magnitude coefficient. With suffixLength=0 and a zero 13-bit suffix:
+    //   levelCode = 15 + 15 (prefix>=15 && sl==0) + ((1<<13)-4096) + 2 (first-level bias) = 4128
+    //   level = (4128 + 2) >> 1 = 2065.
+    // Bitstream: coeff_token "000101" + level_prefix (16 zeros + "1") + 13-bit suffix (zeros).
+    [Fact]
+    public void LevelPrefix16Escape_DecodesLargeLevel()
+    {
+        // 000101 0000000000000000 1 0000000000000  (36 bits)
+        byte[] data = [0x14, 0x00, 0x02, 0x00, 0x00];
+        var r = new BitReader(data);
+        Span<int> coeffs = stackalloc int[1];
+
+        int totalCoeff = CavlcResidual.ReadResidualBlock(ref r, coeffs, maxNumCoeff: 1, nC: 0, chromaDc: false);
+
+        Assert.Equal(1, totalCoeff);
+        Assert.Equal(2065, coeffs[0]);
+        Assert.Equal(36, r.BitPosition);
+    }
+
     [Fact]
     public void ReadResidualBlock8x8_AllFourSubBlocksEmpty_ConsumesFourZeroTokens()
     {

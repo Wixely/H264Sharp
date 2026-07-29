@@ -62,6 +62,26 @@ public sealed class ExpGolombTests
     }
 
     [Fact]
+    public void ReadUe_31LeadingZeros_DecodesMaxRepresentable()
+    {
+        // 31 leading zeros is the largest legal ue(v) (codeNum up to 2^32-2). With a zero suffix
+        // the value is (1<<31) - 1. This must decode, not be rejected.
+        string bits = new string('0', 31) + "1" + new string('0', 31);
+        var r = new BitReader(BitsToBytes(bits));
+        Assert.Equal((1u << 31) - 1u, ExpGolomb.ReadUe(ref r));
+    }
+
+    [Fact]
+    public void ReadUe_32LeadingZeros_Throws()
+    {
+        // 32 leading zeros would need codeNum >= 2^32-1, which is not representable; C# shift
+        // masking would otherwise alias it to a small value, so it must be rejected.
+        byte[] data = BitsToBytes(new string('0', 32) + "1");
+        // BitReader is a ref struct (can't be captured), so construct it inside the delegate.
+        Assert.Throws<InvalidDataException>(() => { var r = new BitReader(data); ExpGolomb.ReadUe(ref r); });
+    }
+
+    [Fact]
     public void ConsecutiveUeCallsAdvancePosition()
     {
         // "1" "010" "00101" -> codeNums 0, 1, 4
