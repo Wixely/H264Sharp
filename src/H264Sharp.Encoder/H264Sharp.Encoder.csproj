@@ -10,6 +10,11 @@
     <IsTrimmable>true</IsTrimmable>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <RootNamespace>H264Sharp.Encoder</RootNamespace>
+
+    <IsPackable>true</IsPackable>
+    <PackageId>H264Sharp.Encoder</PackageId>
+    <Title>H264Sharp.Encoder</Title>
+    <Description>Pure-C# H.264 (AVC) encoder: encodes planar YUV 4:2:0 to Annex-B H.264 (Baseline/Main), CAVLC or CABAC, intra + inter (P and B) with motion estimation. Depends on H264Sharp.Decoder for shared transform/syntax types. No native dependencies.</Description>
   </PropertyGroup>
 
   <ItemGroup>

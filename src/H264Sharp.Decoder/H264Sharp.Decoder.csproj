@@ -9,6 +9,11 @@
     <IsAotCompatible>true</IsAotCompatible>
     <IsTrimmable>true</IsTrimmable>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <IsPackable>true</IsPackable>
+    <PackageId>H264Sharp.Decoder</PackageId>
+    <Title>H264Sharp.Decoder</Title>
+    <Description>Pure-C# H.264 (AVC) decoder: Annex-B / AVCC / MP4 input, CAVLC and CABAC, intra/inter (P and B) prediction, deblocking, output to planar YUV 4:2:0 or RGB. No native dependencies; AOT- and trim-compatible.</Description>
   </PropertyGroup>
 
 </Project>

@@ -124,6 +124,20 @@ byte[] withCabac = H264FrameEncoder.EncodeAnnexB(
     new H264FrameEncoder.Options { EnableCabac = true, EnableBFrames = true });
 ```
 
+### NuGet packages
+
+The libraries are published to **GitHub Packages** (`H264Sharp.Decoder` and `H264Sharp.Encoder`;
+the encoder depends on the decoder) on each version tag. GitHub Packages requires
+authentication even for public repos — add the source with a personal access token that has
+`read:packages`:
+
+```sh
+dotnet nuget add source https://nuget.pkg.github.com/Wixely/index.json \
+  --name github-wixely --username <you> --password <TOKEN> --store-password-in-clear-text
+dotnet add package H264Sharp.Decoder
+dotnet add package H264Sharp.Encoder
+```
+
 ## Feature support
 
 **Decoder**

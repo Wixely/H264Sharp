@@ -1,0 +1,27 @@
+<Project>
+
+  <!-- Shared NuGet metadata. Projects are NOT packaged unless they set IsPackable=true
+       (the two library projects opt in); tools, the CLI, and tests stay unpackaged. -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <Version>1.0.1</Version>
+
+    <Authors>Wixely</Authors>
+    <Company>Wixely</Company>
+    <Product>H264Sharp</Product>
+    <Copyright>Copyright (c) 2026 Wixely</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/Wixely/H264Sharp</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Wixely/H264Sharp</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>h264;avc;video;codec;decoder;encoder</PackageTags>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+  </PropertyGroup>
+
+  <!-- Pack the repo README into any packable project (Pack="true" is a no-op when not packing). -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+</Project>

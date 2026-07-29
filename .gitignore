@@ -7,3 +7,6 @@ tests/H264Sharp.Tests/Fixtures/Samples/
 *.h264
 !tests/**/Samples/.gitkeep
 tmp_v/
+pkgout/
+*.nupkg
+*.snupkg

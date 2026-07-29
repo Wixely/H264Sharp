@@ -1,0 +1,54 @@
+name: Publish NuGet packages
+
+# Packs the H264Sharp.Decoder and H264Sharp.Encoder libraries and publishes them to
+# GitHub Packages (the repo's NuGet registry). Runs on a version tag, e.g.
+# `git tag v1.0.2 && git push origin v1.0.2`, or manually via "Run workflow".
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version for a manual run (e.g. 1.0.2-preview)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Determine version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test (excluding ffmpeg-dependent tests)
+        run: dotnet test H264Sharp.slnx -c Release --verbosity normal --filter "Category!=Ffmpeg"
+
+      - name: Pack
+        # -p:Version sets the assembly and package version together (a prerelease suffix,
+        # e.g. 0.0.0-dev, is kept for the package and stripped for the numeric assembly version).
+        run: dotnet pack H264Sharp.slnx -c Release -p:Version=${{ steps.ver.outputs.version }} -o pkgout
+
+      - name: Push to GitHub Packages
+        run: >
+          dotnet nuget push "pkgout/*.nupkg"
+          --source https://nuget.pkg.github.com/Wixely/index.json
+          --api-key ${{ secrets.GITHUB_TOKEN }}
+          --skip-duplicate
